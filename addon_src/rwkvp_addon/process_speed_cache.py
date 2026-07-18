@@ -6,15 +6,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .checkpoint_storage import UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE
 from .profile_store import atomic_write_json, read_json
-from .rwkv_performance_modes import PROCESS_MANY_MODES
+from .rwkv_performance_modes import PROCESS_MANY_FAST_MODE, PROCESS_MANY_MODES
 from .speed_test import ProcessManySpeedMeasurement, ProcessManySpeedTestResult
 
 if TYPE_CHECKING:
     from .setup_wizard_benchmarks import SetupProcessModeBenchmarkResult
+    from .speed_test import ProcessManyCurveSpeedTestResult
 
 PROCESS_MANY_SPEED_CACHE_FILENAME = "process_many_speed_test.json"
 PROCESS_MANY_SPEED_CACHE_SCHEMA_VERSION = 1
+CHECKPOINT_CURVE_SPEED_FACTOR = 0.75
+
+CHECKPOINT_SPEED_MATCHING_MEASUREMENT = "matching_measurement"
+CHECKPOINT_SPEED_CPU_MEASUREMENT = "cpu_measurement"
+CHECKPOINT_SPEED_WITHOUT_CURVES = "without_curves"
+CHECKPOINT_SPEED_UNMEASURED = "unmeasured"
 
 
 @dataclass(frozen=True)
@@ -26,6 +34,20 @@ class CachedProcessManySpeed:
     reviews_per_minute: float
     measured_at: float = 0.0
     source: str = "speed_test"
+
+
+@dataclass(frozen=True)
+class CheckpointBuildSpeedEstimate:
+    """Throughput and provenance used by the checkpoint confirmation.
+
+    ``measurement`` is retained when the estimate derives from a cache entry.
+    The no-curve fallback deliberately changes only ``reviews_per_minute``;
+    callers can still explain exactly which real measurement it came from.
+    """
+
+    reviews_per_minute: float
+    basis: str
+    measurement: CachedProcessManySpeed | None = None
 
 
 def process_many_speed_cache_path(cache_dir: Path) -> Path:
@@ -58,6 +80,39 @@ def cache_process_many_speed_test(
                 reviews_per_minute=rate,
                 measured_at=measurement_time,
                 source="speed_test",
+            )
+        )
+
+    _cache_entries(path, new_entries)
+
+
+def cache_process_many_curve_speed_test(
+    path: Path,
+    result: ProcessManyCurveSpeedTestResult,
+    *,
+    measured_at: float | None = None,
+) -> None:
+    """Remember both exact rates from the curve on/off comparison."""
+
+    mode = str(result.mode)
+    if mode not in PROCESS_MANY_MODES:
+        return
+    measurement_time = _measurement_time(measured_at)
+    new_entries: list[CachedProcessManySpeed] = []
+    for measurement in result.measurements:
+        review_count = int(measurement.review_count)
+        rate = float(measurement.reviews_per_minute)
+        if review_count <= 0 or not math.isfinite(rate) or rate <= 0:
+            continue
+        new_entries.append(
+            CachedProcessManySpeed(
+                model_id=str(result.model_id),
+                return_curves=bool(measurement.return_curves),
+                mode=mode,
+                review_count=review_count,
+                reviews_per_minute=rate,
+                measured_at=measurement_time,
+                source="curve_speed_test",
             )
         )
 
@@ -181,11 +236,112 @@ def cached_process_many_speed(
     return_curves: bool,
     mode: str,
 ) -> CachedProcessManySpeed | None:
+    return _matching_cached_speed(
+        _read_entries(path),
+        model_id=model_id,
+        return_curves=return_curves,
+        mode=mode,
+    )
+
+
+def checkpoint_build_speed_estimate(
+    path: Path,
+    *,
+    model_id: str,
+    return_curves: bool,
+    mode: str,
+) -> CheckpointBuildSpeedEstimate:
+    """Choose the best defensible checkpoint-build throughput estimate.
+
+    Prefer an exact selected-mode measurement. If that is absent, a measured
+    no-curve result for that same mode is reduced by 25% before considering
+    another executor. A requested GPU build can then fall back to measured CPU
+    Fast curve throughput, followed by CPU Fast without curves at the same 25%
+    discount. With no applicable evidence, use the explicitly unmeasured 150k
+    reviews/minute fallback.
+    """
+
+    entries = _read_entries(Path(path))
+    wanted_model = str(model_id)
+    wanted_curves = bool(return_curves)
+    wanted_mode = str(mode)
+
+    matching = _matching_cached_speed(
+        entries,
+        model_id=wanted_model,
+        return_curves=wanted_curves,
+        mode=wanted_mode,
+    )
+    if matching is not None:
+        return CheckpointBuildSpeedEstimate(
+            reviews_per_minute=matching.reviews_per_minute,
+            basis=CHECKPOINT_SPEED_MATCHING_MEASUREMENT,
+            measurement=matching,
+        )
+
+    if wanted_curves:
+        selected_without_curves = _matching_cached_speed(
+            entries,
+            model_id=wanted_model,
+            return_curves=False,
+            mode=wanted_mode,
+        )
+        if selected_without_curves is not None:
+            return CheckpointBuildSpeedEstimate(
+                reviews_per_minute=(
+                    selected_without_curves.reviews_per_minute
+                    * CHECKPOINT_CURVE_SPEED_FACTOR
+                ),
+                basis=CHECKPOINT_SPEED_WITHOUT_CURVES,
+                measurement=selected_without_curves,
+            )
+
+    if wanted_mode != PROCESS_MANY_FAST_MODE:
+        cpu_matching = _matching_cached_speed(
+            entries,
+            model_id=wanted_model,
+            return_curves=wanted_curves,
+            mode=PROCESS_MANY_FAST_MODE,
+        )
+        if cpu_matching is not None:
+            return CheckpointBuildSpeedEstimate(
+                reviews_per_minute=cpu_matching.reviews_per_minute,
+                basis=CHECKPOINT_SPEED_CPU_MEASUREMENT,
+                measurement=cpu_matching,
+            )
+
+        if wanted_curves:
+            cpu_without_curves = _matching_cached_speed(
+                entries,
+                model_id=wanted_model,
+                return_curves=False,
+                mode=PROCESS_MANY_FAST_MODE,
+            )
+            if cpu_without_curves is not None:
+                return CheckpointBuildSpeedEstimate(
+                    reviews_per_minute=(
+                        cpu_without_curves.reviews_per_minute
+                        * CHECKPOINT_CURVE_SPEED_FACTOR
+                    ),
+                    basis=CHECKPOINT_SPEED_WITHOUT_CURVES,
+                    measurement=cpu_without_curves,
+                )
+
+    return CheckpointBuildSpeedEstimate(
+        reviews_per_minute=float(UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE),
+        basis=CHECKPOINT_SPEED_UNMEASURED,
+    )
+
+
+def _matching_cached_speed(
+    entries: tuple[CachedProcessManySpeed, ...],
+    *,
+    model_id: object,
+    return_curves: object,
+    mode: object,
+) -> CachedProcessManySpeed | None:
     wanted = (str(model_id), bool(return_curves), str(mode))
-    for entry in _read_entries(path):
-        if _entry_key(entry) == wanted:
-            return entry
-    return None
+    return next((entry for entry in entries if _entry_key(entry) == wanted), None)
 
 
 def _read_entries(path: Path) -> tuple[CachedProcessManySpeed, ...]:

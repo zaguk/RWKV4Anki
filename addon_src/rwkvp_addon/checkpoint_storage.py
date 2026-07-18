@@ -15,7 +15,12 @@ RUST_CHECKPOINT_DECK_BYTES = 70_100
 RUST_CHECKPOINT_PRESET_BYTES = 52_600
 RUST_CHECKPOINT_GLOBAL_BYTES = 70_000
 RUST_CHECKPOINT_SAFETY_MARGIN = 0.30
-RUST_PROCESS_MANY_REVIEWS_PER_MINUTE = 33_000
+# Used only when this profile has no usable State Building measurement. Oracle
+# processing is no longer exposed by the add-on, so the old 33,000 reviews/min
+# fallback substantially overstated expected build time on current CPU Fast
+# builds. Keep this deliberately conservative while making its unmeasured
+# provenance explicit in the confirmation UI.
+UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE = 150_000
 RUST_PROCESS_MANY_TIME_TOLERANCE = 0.15
 BENCHMARK_PROCESS_MANY_SPEED_TOLERANCE = 0.10
 
@@ -158,7 +163,7 @@ def estimate_rust_checkpoint_storage_from_counts(
 def estimate_rust_checkpoint_processing_time(
     review_count: int,
     *,
-    reviews_per_minute: int = RUST_PROCESS_MANY_REVIEWS_PER_MINUTE,
+    reviews_per_minute: int = UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE,
     tolerance: float = RUST_PROCESS_MANY_TIME_TOLERANCE,
 ) -> RustCheckpointProcessingTimeEstimate:
     """Estimate Rust process_many() time for checkpoint initialization.

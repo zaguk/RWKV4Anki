@@ -33,6 +33,7 @@ from ..anki_api import (
 from ..checkpoint_manager import InconsistentCheckpointError
 from ..checkpoint_storage import (
     BENCHMARK_PROCESS_MANY_SPEED_TOLERANCE,
+    UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE,
     RustCheckpointStorageEstimate,
     estimate_checkpoint_processing_time_from_benchmark,
     estimate_rust_checkpoint_processing_time,
@@ -46,9 +47,13 @@ from ..dataset_export import (
 )
 from ..initial_setup import initial_setup_seen_for_mw
 from ..process_speed_cache import (
-    CachedProcessManySpeed,
+    CHECKPOINT_SPEED_CPU_MEASUREMENT,
+    CHECKPOINT_SPEED_MATCHING_MEASUREMENT,
+    CHECKPOINT_SPEED_UNMEASURED,
+    CHECKPOINT_SPEED_WITHOUT_CURVES,
+    CheckpointBuildSpeedEstimate,
     cache_completed_checkpoint_build,
-    cached_process_many_speed,
+    checkpoint_build_speed_estimate,
     process_many_speed_cache_path,
 )
 from ..runtime import manager_for_mw, reset_runtime, store_for_mw
@@ -940,7 +945,7 @@ def _run_checkpoint_build_workflow(
         _confirm_checkpoint_build_estimate(
             plan.review_load.review_data,
             workflow,
-            cached_speed=_selected_cached_process_many_speed(store, manager),
+            processing_speed=_selected_checkpoint_build_speed(store, manager),
             rebuild=rebuild,
             storage_estimate=plan.storage_estimate,
             on_show_rebuild_confirmation_changed=(
@@ -1049,7 +1054,7 @@ def _confirm_checkpoint_build_estimate(
     review_data,
     parent,
     *,
-    cached_speed: CachedProcessManySpeed | None = None,
+    processing_speed: CheckpointBuildSpeedEstimate | None = None,
     rebuild: bool = False,
     storage_estimate: RustCheckpointStorageEstimate | None = None,
     on_show_rebuild_confirmation_changed: Callable[[bool], None] | None = None,
@@ -1059,7 +1064,7 @@ def _confirm_checkpoint_build_estimate(
     message = _checkpoint_build_estimate_html(
         estimate,
         review_count=len(review_data.rows),
-        cached_speed=cached_speed,
+        processing_speed=processing_speed or _unmeasured_checkpoint_build_speed(),
     )
     ask_web_confirmation(
         parent=parent,
@@ -1088,13 +1093,14 @@ def _checkpoint_build_estimate_html(
     estimate,
     *,
     review_count: int,
-    cached_speed: CachedProcessManySpeed | None,
+    processing_speed: CheckpointBuildSpeedEstimate,
 ) -> str:
     checkpoint_size = format_storage_bytes(estimate.estimated_checkpoint_bytes)
     processing_time = _checkpoint_processing_time_text(
         review_count,
-        cached_speed=cached_speed,
+        processing_speed=processing_speed,
     )
+    processing_note = _checkpoint_processing_speed_note(processing_speed)
     return (
         '<div class="rwkv-checkpoint-estimate">'
         '<div class="rwkv-checkpoint-estimate__row">'
@@ -1105,6 +1111,7 @@ def _checkpoint_build_estimate_html(
         "<span>Estimated Processing Time:</span>"
         f"<b>{processing_time}</b>"
         "</div>"
+        f"{processing_note}"
         '<p class="rwkv-checkpoint-estimate__note">'
         "The checkpoint uses approximately this much disk space and roughly the "
         "same amount of RAM while loaded."
@@ -1116,23 +1123,66 @@ def _checkpoint_build_estimate_html(
 def _checkpoint_processing_time_text(
     review_count: int,
     *,
-    cached_speed: CachedProcessManySpeed | None,
+    processing_speed: CheckpointBuildSpeedEstimate,
 ) -> str:
-    if cached_speed is None:
-        estimate = estimate_rust_checkpoint_processing_time(review_count)
+    if processing_speed.basis == CHECKPOINT_SPEED_UNMEASURED:
+        estimate = estimate_rust_checkpoint_processing_time(
+            review_count,
+            reviews_per_minute=int(processing_speed.reviews_per_minute),
+        )
     else:
         estimate = estimate_checkpoint_processing_time_from_benchmark(
             review_count,
-            cached_speed.reviews_per_minute,
+            processing_speed.reviews_per_minute,
             speed_tolerance=BENCHMARK_PROCESS_MANY_SPEED_TOLERANCE,
         )
     return format_processing_time_range(estimate)
 
 
-def _selected_cached_process_many_speed(store, manager) -> CachedProcessManySpeed | None:
+def _checkpoint_processing_speed_note(speed: CheckpointBuildSpeedEstimate) -> str:
+    if speed.basis == CHECKPOINT_SPEED_MATCHING_MEASUREMENT:
+        return ""
+    if speed.basis == CHECKPOINT_SPEED_CPU_MEASUREMENT:
+        return (
+            '<p class="rwkv-checkpoint-estimate__note">No GPU speed measurement is '
+            "available for this build, so the estimate uses measured CPU Fast "
+            "speed instead.</p>"
+        )
+    if speed.basis == CHECKPOINT_SPEED_WITHOUT_CURVES:
+        measurement = speed.measurement
+        mode_label = (
+            "GPU"
+            if measurement is not None and measurement.mode == "gpu"
+            else "CPU Fast"
+        )
+        return (
+            f'<p class="rwkv-checkpoint-estimate__note">No {mode_label} speed '
+            "measurement with Forgetting Curves is available. This estimate uses "
+            f"measured {mode_label} speed without curves, reduced by 25%.</p>"
+        )
+    if speed.basis == CHECKPOINT_SPEED_UNMEASURED:
+        return (
+            '<p class="rwkv-checkpoint-estimate__note"><strong>No State Building '
+            "speed measurement is available.</strong> This conservative estimate "
+            f"assumes <strong>{speed.reviews_per_minute:,.0f} reviews/minute</strong>; "
+            "it is not based on a test of this computer. For a measured estimate, "
+            "<strong>run Compare Modes under RWKV Settings → General → State "
+            "Building Mode.</strong></p>"
+        )
+    raise ValueError(f"Unsupported checkpoint speed-estimate basis: {speed.basis!r}")
+
+
+def _unmeasured_checkpoint_build_speed() -> CheckpointBuildSpeedEstimate:
+    return CheckpointBuildSpeedEstimate(
+        reviews_per_minute=float(UNMEASURED_PROCESS_MANY_REVIEWS_PER_MINUTE),
+        basis=CHECKPOINT_SPEED_UNMEASURED,
+    )
+
+
+def _selected_checkpoint_build_speed(store, manager) -> CheckpointBuildSpeedEstimate:
     cache_dir = getattr(store, "cache_dir", None)
     if cache_dir is None:
-        return None
+        return _unmeasured_checkpoint_build_speed()
     config = addon_config_for_mw(mw)
     model_id = getattr(manager, "model_id", None)
     if model_id is None:
@@ -1143,7 +1193,7 @@ def _selected_cached_process_many_speed(store, manager) -> CachedProcessManySpee
     return_curves = getattr(manager, "calculate_curves", None)
     if return_curves is None:
         return_curves = calculate_forgetting_curves(config)
-    return cached_process_many_speed(
+    return checkpoint_build_speed_estimate(
         process_many_speed_cache_path(cache_dir),
         model_id=str(model_id),
         return_curves=bool(return_curves),

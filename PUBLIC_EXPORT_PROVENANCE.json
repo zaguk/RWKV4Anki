@@ -152,8 +152,8 @@
     },
     "addon_src/rwkvp_addon/checkpoint_storage.py": {
       "mode": "100644",
-      "sha256": "ff47a46173b40c27a9621218677268f43410ffa81387ac59d8183df5df23d93d",
-      "size": 11197,
+      "sha256": "6b9eecb7a60d3f6421dbde5a876d3d5000b97326d7548c3f338bf6092f3d6a8b",
+      "size": 11564,
       "source_path": "addon_src/rwkvp_addon/checkpoint_storage.py"
     },
     "addon_src/rwkvp_addon/compact_review_data.py": {
@@ -356,8 +356,8 @@
     },
     "addon_src/rwkvp_addon/gui/menu.py": {
       "mode": "100644",
-      "sha256": "f414b696d092b0f5ec0103509d44a2c135d8cbd39072777302d512150e7ee78f",
-      "size": 48914,
+      "sha256": "b280dd0bad4964d63516a5137b3a4609a9b93693d0bf8546fe1bcc00363daf2e",
+      "size": 51297,
       "source_path": "addon_src/rwkvp_addon/gui/menu.py"
     },
     "addon_src/rwkvp_addon/gui/progress_action.py": {
@@ -380,8 +380,8 @@
     },
     "addon_src/rwkvp_addon/gui/speed_test_dialog.py": {
       "mode": "100644",
-      "sha256": "269ae6df5164f0866985b17af98f092b080b71aa2ebc08b06fa65cd2a74f4c56",
-      "size": 19148,
+      "sha256": "c1b08098022f54030509bc855626e3df05bbc527cdd7e1ce4c7947568b99c552",
+      "size": 19656,
       "source_path": "addon_src/rwkvp_addon/gui/speed_test_dialog.py"
     },
     "addon_src/rwkvp_addon/gui/state_comparison_dialog.py": {
@@ -530,8 +530,8 @@
     },
     "addon_src/rwkvp_addon/process_speed_cache.py": {
       "mode": "100644",
-      "sha256": "ab86ed45a39ec3e09d0ef421b4f9883c3727f423b2cc46f65a1e11ac90c6de8f",
-      "size": 8740,
+      "sha256": "86bbd045421bd21ef5c835cc1e2e690f0851992b6b2c363189ef5e37d2f6b2b0",
+      "size": 14140,
       "source_path": "addon_src/rwkvp_addon/process_speed_cache.py"
     },
     "addon_src/rwkvp_addon/profile_store.py": {
@@ -789,6 +789,6 @@
   },
   "policy_sha256": "04079460f80401438651e8e245b10f62b1d5221cba1887e8eab8973f8b70044d",
   "schema_version": 1,
-  "source_commit": "48b8e2b175d3f15f42e269165708a31586e39400",
+  "source_commit": "2cab101bc00b7567b32ecb45bf8285b13adec546",
   "source_repository": "rwkv4anki-private"
 }

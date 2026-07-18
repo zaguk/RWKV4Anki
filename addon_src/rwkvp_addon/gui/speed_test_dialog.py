@@ -20,6 +20,7 @@ from ..dataset_export import (
 from ..live_prediction_benchmark import open_live_prediction_benchmark_session
 from ..process_many_benchmark import benchmark_process_many_rows
 from ..process_speed_cache import (
+    cache_process_many_curve_speed_test,
     cache_process_many_speed_test,
     process_many_speed_cache_path,
 )
@@ -383,7 +384,7 @@ def show_curve_calculation_speed_test(
         input_data = previous
         slot = manager.reserve_runtime_slot(progress)
         try:
-            return run_process_many_curve_speed_test(
+            result = run_process_many_curve_speed_test(
                 review_count=len(input_data.rows),
                 available_review_count=input_data.available_review_count,
                 model_id=manager.model_id,
@@ -398,6 +399,15 @@ def show_curve_calculation_speed_test(
             )
         finally:
             slot.close()
+        # Retain the exact on/off measurements so a later checkpoint estimate
+        # does not substitute a generic curve-overhead assumption for data the
+        # user has already measured. Cache failure must not fail the benchmark.
+        with suppress(OSError, TypeError, ValueError):
+            cache_process_many_curve_speed_test(
+                process_many_speed_cache_path(store.cache_dir),
+                result,
+            )
+        return result
 
     def success(result) -> None:
         is_dark = _is_dark_widget(parent)
