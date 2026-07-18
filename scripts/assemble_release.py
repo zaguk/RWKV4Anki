@@ -102,7 +102,9 @@ def main() -> int:
             export_provenance_path=args.export_provenance,
         )
     except (OSError, ReleaseAssemblyError, zipfile.BadZipFile, ValueError) as error:
-        raise SystemExit(f"release assembly failed: {error}") from error
+        message = f"release assembly failed: {error}"
+        _report_github_error(message)
+        raise SystemExit(message) from error
     print(result["checksums"])
     print(result["provenance"])
     return 0
@@ -455,6 +457,14 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _report_github_error(message: str) -> None:
+    """Expose release failures through the public GitHub Checks API."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error title=RWKV4Anki release assembly::{escaped}")
 
 
 if __name__ == "__main__":

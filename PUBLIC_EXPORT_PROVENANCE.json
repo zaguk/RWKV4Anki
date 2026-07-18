@@ -764,8 +764,8 @@
     },
     "scripts/assemble_release.py": {
       "mode": "100644",
-      "sha256": "798dfe65266c75bfc5789ab10156c24e901c5f0a89e0245620ec5e556352296d",
-      "size": 18238,
+      "sha256": "2483375112f5f77289c3a41f528496444962e1ee575ff23bbfeaaecf4605c00c",
+      "size": 18640,
       "source_path": "scripts/assemble_release.py"
     },
     "scripts/package_addon.py": {
@@ -783,6 +783,6 @@
   },
   "policy_sha256": "c70e50ecb1260fbbccc79aa53ecf467c5ea264d6099882d72ef4d6a3a35e4011",
   "schema_version": 1,
-  "source_commit": "e3548ade3c82a45a480632cf508325b3fdbec73f",
+  "source_commit": "b046327f5f3a12a0a498a2a34d093089b73c19a2",
   "source_repository": "rwkv4anki-private"
 }
