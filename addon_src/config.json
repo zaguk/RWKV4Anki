@@ -1,0 +1,30 @@
+{
+  "model": "RWKV_trained_on_101_4999",
+  "save_checkpoint_every_reviews": 1000,
+  "show_checkpoint_rebuild_confirmation": true,
+  "predict_many_mode": "fast",
+  "predict_many_batch_sizes": {
+    "oracle": 0,
+    "fast": 0,
+    "gpu": 0
+  },
+  "process_many_mode": "fast",
+  "enable_rwkv_immediate": true,
+  "calculate_forgetting_curves": true,
+  "exclude_deleted_card_revlogs": true,
+  "enable_card_info_retrievability": true,
+  "auto_refresh_card_info_retrievability": false,
+  "enable_card_info_rwkv_intervals": true,
+  "enable_card_info_rwkv_forgetting_curve_graph": false,
+  "card_info_rwkv_forgetting_curve_graph_lower_bound": 60,
+  "live_review_prediction_refresh_limit": 247,
+  "live_review_sameday_prediction_limit": 50,
+  "live_review_quiet_refresh_attempts": 5,
+  "live_review_sameday_reentry_delay_reviews": 2,
+  "minimum_review_widening_extra_percent": 2,
+  "experimental_enable_active_review_prototype": true,
+  "experimental_enable_behavior_lab": false,
+  "experimental_enable_adaptive_desired_retention": false,
+  "experimental_enable_curve_rescheduling": false,
+  "experimental_enable_short_term_rescheduling": false
+}

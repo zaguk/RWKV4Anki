@@ -1,0 +1,788 @@
+{
+  "files": {
+    ".github/workflows/release.yml": {
+      "mode": "100644",
+      "sha256": "8f0e0028639f969c620aa7b58d487e8e989e893696afce27863b0108018dec5b",
+      "size": 5019,
+      "source_path": "release/public/release.yml"
+    },
+    ".gitignore": {
+      "mode": "100644",
+      "sha256": "252ba90879c51c5d32a403ae6bc15505d3a8c29c72994d89aa212524327eeace",
+      "size": 962,
+      "source_path": ".gitignore"
+    },
+    "README.md": {
+      "mode": "100644",
+      "sha256": "0e5117623a4e6b4da2a411d93b278633779eef9bed0bc9f406bd12b558d04e30",
+      "size": 8709,
+      "source_path": "release/public/README.md"
+    },
+    "addon_src/__init__.py": {
+      "mode": "100644",
+      "sha256": "14e04243862af51f9fee2d19e3729e9df4fe3cc0c7d7b326b026121f2db20c2a",
+      "size": 1119,
+      "source_path": "addon_src/__init__.py"
+    },
+    "addon_src/config.json": {
+      "mode": "100644",
+      "sha256": "486af6eddbed49a015e7c441d00e857cd59244770116dc39d58ec0b2f5b35bda",
+      "size": 1137,
+      "source_path": "addon_src/config.json"
+    },
+    "addon_src/manifest.json": {
+      "mode": "100644",
+      "sha256": "5aa17b91347832370701b3afb19d510887a43292694955ab697a842adccb966d",
+      "size": 192,
+      "source_path": "addon_src/manifest.json"
+    },
+    "addon_src/rwkvp_addon/__init__.py": {
+      "mode": "100644",
+      "sha256": "57c0cb549a0e0525acbc557ed015fadef3e1dba5392865b33353a83735802630",
+      "size": 166,
+      "source_path": "addon_src/rwkvp_addon/__init__.py"
+    },
+    "addon_src/rwkvp_addon/adaptive_retention.py": {
+      "mode": "100644",
+      "sha256": "b45d3379b6b6ac5cff5a903c834719c0d8fff4aaeae7d4dbafdf94c868ef99fc",
+      "size": 4584,
+      "source_path": "addon_src/rwkvp_addon/adaptive_retention.py"
+    },
+    "addon_src/rwkvp_addon/addon_config.py": {
+      "mode": "100644",
+      "sha256": "70c965133d9f8d9ea36daa3d3ad5c0337409186a2dd8c099d4b671c0a499e8f4",
+      "size": 20282,
+      "source_path": "addon_src/rwkvp_addon/addon_config.py"
+    },
+    "addon_src/rwkvp_addon/analysis_workflow.py": {
+      "mode": "100644",
+      "sha256": "5dd551ab8b2d31ad5c3c0021b7036ee0924f53e940494b291bb280e01af801f4",
+      "size": 7907,
+      "source_path": "addon_src/rwkvp_addon/analysis_workflow.py"
+    },
+    "addon_src/rwkvp_addon/anki_api.py": {
+      "mode": "100644",
+      "sha256": "ce9bad4e51b4b5edec833278ee9c0b0f33f6bd870300adaec25840cee88dd525",
+      "size": 26995,
+      "source_path": "addon_src/rwkvp_addon/anki_api.py"
+    },
+    "addon_src/rwkvp_addon/behavior_lab.py": {
+      "mode": "100644",
+      "sha256": "0e33435286d554f2cd2ec607b47e117ef87a2840cb5544d07d352a02b3a0d204",
+      "size": 51317,
+      "source_path": "addon_src/rwkvp_addon/behavior_lab.py"
+    },
+    "addon_src/rwkvp_addon/behavior_lab_controller.py": {
+      "mode": "100644",
+      "sha256": "1fae041cda557cb77cf4d042485fd6ff13bec6da5eef8551d2ed4ec668e94581",
+      "size": 9456,
+      "source_path": "addon_src/rwkvp_addon/behavior_lab_controller.py"
+    },
+    "addon_src/rwkvp_addon/behavior_lab_html.py": {
+      "mode": "100644",
+      "sha256": "68f2e4dd8a01633752e5bc70299f12d5abf627ef1dd4f4975ce7df275d1c7e7d",
+      "size": 40896,
+      "source_path": "addon_src/rwkvp_addon/behavior_lab_html.py"
+    },
+    "addon_src/rwkvp_addon/behavior_lab_store.py": {
+      "mode": "100644",
+      "sha256": "950cfb0c335cdd2556209397583a11371ae7def2ea86cff60420f648283414da",
+      "size": 3331,
+      "source_path": "addon_src/rwkvp_addon/behavior_lab_store.py"
+    },
+    "addon_src/rwkvp_addon/browser_card_info_runtime.py": {
+      "mode": "100644",
+      "sha256": "4550e46052576017e5ba6eeecfe412608b4bf3ca2089c8acd9fd276ce1325f8e",
+      "size": 3897,
+      "source_path": "addon_src/rwkvp_addon/browser_card_info_runtime.py"
+    },
+    "addon_src/rwkvp_addon/calibration.py": {
+      "mode": "100644",
+      "sha256": "ae2fe63c76a81d6d456f2fb7db3cdb77a3bcc00aaea7888d173e1c7237b6c762",
+      "size": 8755,
+      "source_path": "addon_src/rwkvp_addon/calibration.py"
+    },
+    "addon_src/rwkvp_addon/calibration_controller.py": {
+      "mode": "100644",
+      "sha256": "e5ea01ac16cb5283b7a0658fbf4253531e9dfbb695f7acdbd0e467d5c9f96bc0",
+      "size": 13181,
+      "source_path": "addon_src/rwkvp_addon/calibration_controller.py"
+    },
+    "addon_src/rwkvp_addon/calibration_graph.py": {
+      "mode": "100644",
+      "sha256": "cb4e6439da0e4f2730a144aaebf7feb7e07e9b45cde38f51a36baa05d2babfe7",
+      "size": 9467,
+      "source_path": "addon_src/rwkvp_addon/calibration_graph.py"
+    },
+    "addon_src/rwkvp_addon/calibration_html.py": {
+      "mode": "100644",
+      "sha256": "89aa66c3dbc183f6e6946324aaac1c7c9af79d428bd16a79e0296b6ba1343f90",
+      "size": 5781,
+      "source_path": "addon_src/rwkvp_addon/calibration_html.py"
+    },
+    "addon_src/rwkvp_addon/card_info_retrievability.py": {
+      "mode": "100644",
+      "sha256": "6fdd2ccb365f094999ddadd540451f2837f89d4b4c9e3ca8391d42bd04f0c385",
+      "size": 14934,
+      "source_path": "addon_src/rwkvp_addon/card_info_retrievability.py"
+    },
+    "addon_src/rwkvp_addon/checkpoint_history.py": {
+      "mode": "100644",
+      "sha256": "a91f67d3929217aa3854c734d8b2502057852b686f1bc97126bd59933b33d87c",
+      "size": 8793,
+      "source_path": "addon_src/rwkvp_addon/checkpoint_history.py"
+    },
+    "addon_src/rwkvp_addon/checkpoint_manager.py": {
+      "mode": "100644",
+      "sha256": "8e3659b216bbadc76f17df9c88af313bdabd9f3b85b76a5c1658139449accd66",
+      "size": 140813,
+      "source_path": "addon_src/rwkvp_addon/checkpoint_manager.py"
+    },
+    "addon_src/rwkvp_addon/checkpoint_progress.py": {
+      "mode": "100644",
+      "sha256": "67441856ba25234fc380c7c89de0f1e57e8c407d32031900eb7099ce03bfdd46",
+      "size": 1052,
+      "source_path": "addon_src/rwkvp_addon/checkpoint_progress.py"
+    },
+    "addon_src/rwkvp_addon/checkpoint_storage.py": {
+      "mode": "100644",
+      "sha256": "ff47a46173b40c27a9621218677268f43410ffa81387ac59d8183df5df23d93d",
+      "size": 11197,
+      "source_path": "addon_src/rwkvp_addon/checkpoint_storage.py"
+    },
+    "addon_src/rwkvp_addon/compact_review_data.py": {
+      "mode": "100644",
+      "sha256": "127dc9066d7dce9f714140082b8884794dfe0f5c4c41c0125de8956a736e13b4",
+      "size": 30719,
+      "source_path": "addon_src/rwkvp_addon/compact_review_data.py"
+    },
+    "addon_src/rwkvp_addon/config_html.py": {
+      "mode": "100644",
+      "sha256": "d3cb162173ab39f79fe8b71e00917c033384ac201679f557ac5d3b5653c2dec0",
+      "size": 41586,
+      "source_path": "addon_src/rwkvp_addon/config_html.py"
+    },
+    "addon_src/rwkvp_addon/config_options.py": {
+      "mode": "100644",
+      "sha256": "fb72acfeb61f7ab53084109cda28dc9684b516ebc88c6896273613184c8941ae",
+      "size": 20061,
+      "source_path": "addon_src/rwkvp_addon/config_options.py"
+    },
+    "addon_src/rwkvp_addon/constants.py": {
+      "mode": "100644",
+      "sha256": "35cab76ea92d77fd384ae54cc806237254df610aed801f4e5eace26c36d2dcb0",
+      "size": 878,
+      "source_path": "addon_src/rwkvp_addon/constants.py"
+    },
+    "addon_src/rwkvp_addon/curve_reschedule.py": {
+      "mode": "100644",
+      "sha256": "bc931194518cd2317c57b00afd836102a06544d0f33c4b33a2bd1bfa652c3a57",
+      "size": 15520,
+      "source_path": "addon_src/rwkvp_addon/curve_reschedule.py"
+    },
+    "addon_src/rwkvp_addon/dataset_export.py": {
+      "mode": "100644",
+      "sha256": "32ca2d5c74a63d0926389df7ef1df6d7990ef94c924599687d0a97f1a8d696b4",
+      "size": 37728,
+      "source_path": "addon_src/rwkvp_addon/dataset_export.py"
+    },
+    "addon_src/rwkvp_addon/evaluate_controller.py": {
+      "mode": "100644",
+      "sha256": "0123958e7393d7203d293681d8edcbe1152689e19935c31fb46938f283b355ee",
+      "size": 21312,
+      "source_path": "addon_src/rwkvp_addon/evaluate_controller.py"
+    },
+    "addon_src/rwkvp_addon/evaluate_html.py": {
+      "mode": "100644",
+      "sha256": "07698ff0549b8cdd69a376385e3e146aa147a6e7f2ddfaa3fd58f96d4897f40b",
+      "size": 16236,
+      "source_path": "addon_src/rwkvp_addon/evaluate_html.py"
+    },
+    "addon_src/rwkvp_addon/evaluation_date_range.py": {
+      "mode": "100644",
+      "sha256": "d49d2e1df140b2f931597593204249f48b3956a7bd916e887f8dab210c94660d",
+      "size": 2971,
+      "source_path": "addon_src/rwkvp_addon/evaluation_date_range.py"
+    },
+    "addon_src/rwkvp_addon/evaluation_predictions.py": {
+      "mode": "100644",
+      "sha256": "dd5ad8509e7d3b662634f4036241da44c381304d1562dded604b9f87295ea3e6",
+      "size": 6201,
+      "source_path": "addon_src/rwkvp_addon/evaluation_predictions.py"
+    },
+    "addon_src/rwkvp_addon/evaluation_table.py": {
+      "mode": "100644",
+      "sha256": "9e8f04fe20b3184be5d5775520b651e57ae1cb07c6d8aaf4482a0d587dd875cc",
+      "size": 3286,
+      "source_path": "addon_src/rwkvp_addon/evaluation_table.py"
+    },
+    "addon_src/rwkvp_addon/filtered_deck.py": {
+      "mode": "100644",
+      "sha256": "b365cac060316b144f63903d81417363bd68de1f4951021b02e2953affde86cd",
+      "size": 11104,
+      "source_path": "addon_src/rwkvp_addon/filtered_deck.py"
+    },
+    "addon_src/rwkvp_addon/filtered_deck_predictors.py": {
+      "mode": "100644",
+      "sha256": "8d26995c75862046554c4bf36334db595569f17c19b9ff027b7feeddb898c1ea",
+      "size": 1408,
+      "source_path": "addon_src/rwkvp_addon/filtered_deck_predictors.py"
+    },
+    "addon_src/rwkvp_addon/filtered_deck_sort.py": {
+      "mode": "100644",
+      "sha256": "77ae172827a76aad36568186399f8a6ed0177c8e2ae1f5a1decd43aa0130fc98",
+      "size": 3425,
+      "source_path": "addon_src/rwkvp_addon/filtered_deck_sort.py"
+    },
+    "addon_src/rwkvp_addon/fsrs_targets.py": {
+      "mode": "100644",
+      "sha256": "36afb38ca89fb1513cf1366272f79f1f97a872920b28e3a0f6ad1a17f46608a5",
+      "size": 10247,
+      "source_path": "addon_src/rwkvp_addon/fsrs_targets.py"
+    },
+    "addon_src/rwkvp_addon/glossary.py": {
+      "mode": "100644",
+      "sha256": "a52aef3d1f6e5a1508918cd954982bbebb99016a80d92d6b1690b6f9d09f5c9f",
+      "size": 6303,
+      "source_path": "addon_src/rwkvp_addon/glossary.py"
+    },
+    "addon_src/rwkvp_addon/gui/__init__.py": {
+      "mode": "100644",
+      "sha256": "3c78788ea0fb8b468bf16f215d385ccca713e31b0d6625da9c1c4e1f920e5b92",
+      "size": 36,
+      "source_path": "addon_src/rwkvp_addon/gui/__init__.py"
+    },
+    "addon_src/rwkvp_addon/gui/_standalone_overlay.py": {
+      "mode": "100644",
+      "sha256": "6e7810ae5017f1c0151b1290481eaf6920558b725d778ee44f3f687f64122aee",
+      "size": 2862,
+      "source_path": "addon_src/rwkvp_addon/gui/_standalone_overlay.py"
+    },
+    "addon_src/rwkvp_addon/gui/background_stages.py": {
+      "mode": "100644",
+      "sha256": "8e275d36db1d3ecc5dbcb63e030209838cb9282a35d7f1fc3d0da0df5a51727e",
+      "size": 3868,
+      "source_path": "addon_src/rwkvp_addon/gui/background_stages.py"
+    },
+    "addon_src/rwkvp_addon/gui/behavior_lab_dialog.py": {
+      "mode": "100644",
+      "sha256": "2fdc380120c87e658674b2db531e81ad4480eca0ecbb261648bc549804162d1b",
+      "size": 11182,
+      "source_path": "addon_src/rwkvp_addon/gui/behavior_lab_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/browser_card_info.py": {
+      "mode": "100644",
+      "sha256": "5aaf41afa9b757219451026bfb965d3a9f7758ced62cb6d6648cf06480d2e1d9",
+      "size": 11512,
+      "source_path": "addon_src/rwkvp_addon/gui/browser_card_info.py"
+    },
+    "addon_src/rwkvp_addon/gui/calibration_dialog.py": {
+      "mode": "100644",
+      "sha256": "b2919af78586f498aedce03e21ad45ccf913a03eb8a41c172bed177af84abf1a",
+      "size": 5533,
+      "source_path": "addon_src/rwkvp_addon/gui/calibration_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/card_info.py": {
+      "mode": "100644",
+      "sha256": "6ffbb47fe5db601aecdda8615954a6436fef6d596318f48666f587661945687e",
+      "size": 43188,
+      "source_path": "addon_src/rwkvp_addon/gui/card_info.py"
+    },
+    "addon_src/rwkvp_addon/gui/checkpoint_failure.py": {
+      "mode": "100644",
+      "sha256": "5fac494d85ba64b855b68a5c8242fac53cad0b085bebf8267eeb90a1c4888751",
+      "size": 4849,
+      "source_path": "addon_src/rwkvp_addon/gui/checkpoint_failure.py"
+    },
+    "addon_src/rwkvp_addon/gui/common.py": {
+      "mode": "100644",
+      "sha256": "763c188a4c58eb06d682d07f3a62c56c6d11672f9dc7d1285e436e75fbd3e9d6",
+      "size": 5952,
+      "source_path": "addon_src/rwkvp_addon/gui/common.py"
+    },
+    "addon_src/rwkvp_addon/gui/config_dialog.py": {
+      "mode": "100644",
+      "sha256": "f275e91fb20d98f099cfa238ee4ce150fd0eb42c982803225835690969a5e4d8",
+      "size": 37984,
+      "source_path": "addon_src/rwkvp_addon/gui/config_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/curve_reschedule.py": {
+      "mode": "100644",
+      "sha256": "d9acad6b63c6f1ab9ba6964a4b1feeb8e2554fd86a64ccfaa22e11957e3c662f",
+      "size": 9982,
+      "source_path": "addon_src/rwkvp_addon/gui/curve_reschedule.py"
+    },
+    "addon_src/rwkvp_addon/gui/evaluate_dialog.py": {
+      "mode": "100644",
+      "sha256": "0ce9e1fa3ab4ea116967dddaa205f1a64a46d9eee0254dbba0489c81eb89d694",
+      "size": 10291,
+      "source_path": "addon_src/rwkvp_addon/gui/evaluate_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/filtered_deck_dialog.py": {
+      "mode": "100644",
+      "sha256": "b93676338d15213cc661a141ffed40150c9055aa2458d619fe04d7a593381390",
+      "size": 17916,
+      "source_path": "addon_src/rwkvp_addon/gui/filtered_deck_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/live_review_bridge.py": {
+      "mode": "100644",
+      "sha256": "d3be575a28d9e3cbd64790403decb92b8fa95ebce782334a3cdeb56e2b96dc80",
+      "size": 52577,
+      "source_path": "addon_src/rwkvp_addon/gui/live_review_bridge.py"
+    },
+    "addon_src/rwkvp_addon/gui/live_review_dialog.py": {
+      "mode": "100644",
+      "sha256": "08d025d53be0a1ea2e617c627efb0abda906fb1a8ed39e7ea77b583ab7d4032a",
+      "size": 7464,
+      "source_path": "addon_src/rwkvp_addon/gui/live_review_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/live_review_history_dialog.py": {
+      "mode": "100644",
+      "sha256": "139d3dd9114866554a18f9e0d07c0a1373b8ece1f78ad6ae65c071f8a156d64f",
+      "size": 1864,
+      "source_path": "addon_src/rwkvp_addon/gui/live_review_history_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/live_review_retention_dialog.py": {
+      "mode": "100644",
+      "sha256": "9fe1621d99f05080a3599dbfed9a3c1e041c1452f3e6130465aa48776d366b5c",
+      "size": 1264,
+      "source_path": "addon_src/rwkvp_addon/gui/live_review_retention_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/menu.py": {
+      "mode": "100644",
+      "sha256": "f414b696d092b0f5ec0103509d44a2c135d8cbd39072777302d512150e7ee78f",
+      "size": 48914,
+      "source_path": "addon_src/rwkvp_addon/gui/menu.py"
+    },
+    "addon_src/rwkvp_addon/gui/progress_action.py": {
+      "mode": "100644",
+      "sha256": "132515d14ad40fe9bd1db1909109f0105d027de979f9e02bbd33b4c1c9b90afc",
+      "size": 1844,
+      "source_path": "addon_src/rwkvp_addon/gui/progress_action.py"
+    },
+    "addon_src/rwkvp_addon/gui/retrievability_dialog.py": {
+      "mode": "100644",
+      "sha256": "94b4fa08dbca6fd2e6da1d57cb5ea4579e844ef1c6ceeb2e1d415f86b54a264c",
+      "size": 10019,
+      "source_path": "addon_src/rwkvp_addon/gui/retrievability_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/setup_wizard_controller.py": {
+      "mode": "100644",
+      "sha256": "963a63e3b6356fb8e3b86ca26abcd5a3ecdb6c3b0f1fc40b75c18fe34adc1aa3",
+      "size": 114544,
+      "source_path": "addon_src/rwkvp_addon/gui/setup_wizard_controller.py"
+    },
+    "addon_src/rwkvp_addon/gui/speed_test_dialog.py": {
+      "mode": "100644",
+      "sha256": "269ae6df5164f0866985b17af98f092b080b71aa2ebc08b06fa65cd2a74f4c56",
+      "size": 19148,
+      "source_path": "addon_src/rwkvp_addon/gui/speed_test_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/state_comparison_dialog.py": {
+      "mode": "100644",
+      "sha256": "c1a078e3b93d26d444fa71a4df275181aa052e4ce14f7c180f3b5efb91416a52",
+      "size": 9358,
+      "source_path": "addon_src/rwkvp_addon/gui/state_comparison_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/web_dialog.py": {
+      "mode": "100644",
+      "sha256": "c04a7f534f2acfa330cef1274ecc959b201010da2216381685aab18ca016a9aa",
+      "size": 16792,
+      "source_path": "addon_src/rwkvp_addon/gui/web_dialog.py"
+    },
+    "addon_src/rwkvp_addon/gui/web_message.py": {
+      "mode": "100644",
+      "sha256": "7185354c7e892210799996761b9c3ee44deb73b3f7f9343d157e04a7e89b9f66",
+      "size": 16987,
+      "source_path": "addon_src/rwkvp_addon/gui/web_message.py"
+    },
+    "addon_src/rwkvp_addon/gui/web_progress.py": {
+      "mode": "100644",
+      "sha256": "f2874d34c58a2e58f42af066efb1ea80d327312fcd4ec532af81ad1ff239d2ae",
+      "size": 10421,
+      "source_path": "addon_src/rwkvp_addon/gui/web_progress.py"
+    },
+    "addon_src/rwkvp_addon/initial_setup.py": {
+      "mode": "100644",
+      "sha256": "114a0dc4e1b0dc31862ff894efffb6eb86b2f89e3d47e601ff73c6f81fe19268",
+      "size": 1126,
+      "source_path": "addon_src/rwkvp_addon/initial_setup.py"
+    },
+    "addon_src/rwkvp_addon/live_prediction_benchmark.py": {
+      "mode": "100644",
+      "sha256": "e28015c1d42fd83956cad27cabc72023fd369371102acfa97d5fc3f6321b7442",
+      "size": 8832,
+      "source_path": "addon_src/rwkvp_addon/live_prediction_benchmark.py"
+    },
+    "addon_src/rwkvp_addon/live_retention_table_html.py": {
+      "mode": "100644",
+      "sha256": "3b7e820a6d51e16461a6d323db3f1359b7e93ca740e31cf79aaba898d1e8557f",
+      "size": 7019,
+      "source_path": "addon_src/rwkvp_addon/live_retention_table_html.py"
+    },
+    "addon_src/rwkvp_addon/live_review_bridge.py": {
+      "mode": "100644",
+      "sha256": "da7993dabd16c6b8696430a6e52204210999c820e0ed5ea82fbf566da526b1fb",
+      "size": 43919,
+      "source_path": "addon_src/rwkvp_addon/live_review_bridge.py"
+    },
+    "addon_src/rwkvp_addon/live_review_candidates.py": {
+      "mode": "100644",
+      "sha256": "70a8d8c17dbbaf5f5312933a041d05b65073581022445d260063b591f479dad4",
+      "size": 8006,
+      "source_path": "addon_src/rwkvp_addon/live_review_candidates.py"
+    },
+    "addon_src/rwkvp_addon/live_review_engine.py": {
+      "mode": "100644",
+      "sha256": "65bffe2b219f762f8cea5409e7f2c57a26b9979ca62af57f095e3ed80ecec1fb",
+      "size": 71118,
+      "source_path": "addon_src/rwkvp_addon/live_review_engine.py"
+    },
+    "addon_src/rwkvp_addon/live_review_history.py": {
+      "mode": "100644",
+      "sha256": "db292a71d4d7a4d4f903811514140af926a4863cd60e23937a00b60b65cecd8c",
+      "size": 15244,
+      "source_path": "addon_src/rwkvp_addon/live_review_history.py"
+    },
+    "addon_src/rwkvp_addon/live_review_history_controller.py": {
+      "mode": "100644",
+      "sha256": "ce736902da078217ffa6825594faa7cbf4a939d72a69c431de9a983ba3d9a15e",
+      "size": 20451,
+      "source_path": "addon_src/rwkvp_addon/live_review_history_controller.py"
+    },
+    "addon_src/rwkvp_addon/live_review_history_html.py": {
+      "mode": "100644",
+      "sha256": "2649dab99171e9c5ac1a1411635ba7d24220ab8713716d9bedb6204a26ed3746",
+      "size": 21186,
+      "source_path": "addon_src/rwkvp_addon/live_review_history_html.py"
+    },
+    "addon_src/rwkvp_addon/live_review_predictions.py": {
+      "mode": "100644",
+      "sha256": "8cc0578b91cda022218477586782395f95dd944c5fa0fb811019b856923c4a1c",
+      "size": 51254,
+      "source_path": "addon_src/rwkvp_addon/live_review_predictions.py"
+    },
+    "addon_src/rwkvp_addon/live_review_retention_html.py": {
+      "mode": "100644",
+      "sha256": "88ede22a5863f1308748c4d1958ef5cadcd411bd141f835d27a2ee399222e695",
+      "size": 1311,
+      "source_path": "addon_src/rwkvp_addon/live_review_retention_html.py"
+    },
+    "addon_src/rwkvp_addon/live_review_startup.py": {
+      "mode": "100644",
+      "sha256": "757e2b6ff5927ac6d2b94def7c9fba92318724caf38b3e7ea1084f25c1fd4564",
+      "size": 6643,
+      "source_path": "addon_src/rwkvp_addon/live_review_startup.py"
+    },
+    "addon_src/rwkvp_addon/live_review_stats.py": {
+      "mode": "100644",
+      "sha256": "c601ef5799755a895632c2c320b036517b615e120a66b2b3c89f1ea034bfa6d2",
+      "size": 7205,
+      "source_path": "addon_src/rwkvp_addon/live_review_stats.py"
+    },
+    "addon_src/rwkvp_addon/metrics.py": {
+      "mode": "100644",
+      "sha256": "32ca01aad8a1c7a4152d01ba43729ce4c6818e9a273a5c98bbd68495eaf1d0b1",
+      "size": 14656,
+      "source_path": "addon_src/rwkvp_addon/metrics.py"
+    },
+    "addon_src/rwkvp_addon/modal_components.js": {
+      "mode": "100644",
+      "sha256": "f3ede71ee5d0b7e3b0277c3a1d5d070c8f3b52b939a4b1da1d9d6fbd766430c1",
+      "size": 81256,
+      "source_path": "addon_src/rwkvp_addon/modal_components.js"
+    },
+    "addon_src/rwkvp_addon/modal_html.py": {
+      "mode": "100644",
+      "sha256": "7e5116ba40a638ad328e2a1d3173b6ed0393d430831ced816d6d83ef8e1eb77c",
+      "size": 38914,
+      "source_path": "addon_src/rwkvp_addon/modal_html.py"
+    },
+    "addon_src/rwkvp_addon/modal_style.py": {
+      "mode": "100644",
+      "sha256": "fbf53fb5af7c9bf06dd6298180043bd8eba4519d09048d01ff72dba4102ab6c0",
+      "size": 923,
+      "source_path": "addon_src/rwkvp_addon/modal_style.py"
+    },
+    "addon_src/rwkvp_addon/modal_styles.css": {
+      "mode": "100644",
+      "sha256": "defba18f215f9810a74dc966776a6383e8ef2f89c6603ae18de7225957f09265",
+      "size": 62943,
+      "source_path": "addon_src/rwkvp_addon/modal_styles.css"
+    },
+    "addon_src/rwkvp_addon/prediction_cache.py": {
+      "mode": "100644",
+      "sha256": "edcdc570ea9e49616aee6597901f793b04d03ca6087d6e346ab2d351f0bc0e26",
+      "size": 60214,
+      "source_path": "addon_src/rwkvp_addon/prediction_cache.py"
+    },
+    "addon_src/rwkvp_addon/process_many_benchmark.py": {
+      "mode": "100644",
+      "sha256": "9be8f76b39cfde3ad0c2859fac2bc65188b76f2defab60eb0d8afd1b94d7eec5",
+      "size": 3006,
+      "source_path": "addon_src/rwkvp_addon/process_many_benchmark.py"
+    },
+    "addon_src/rwkvp_addon/process_speed_cache.py": {
+      "mode": "100644",
+      "sha256": "ab86ed45a39ec3e09d0ef421b4f9883c3727f423b2cc46f65a1e11ac90c6de8f",
+      "size": 8740,
+      "source_path": "addon_src/rwkvp_addon/process_speed_cache.py"
+    },
+    "addon_src/rwkvp_addon/profile_store.py": {
+      "mode": "100644",
+      "sha256": "3a1f6ad557d5e30682da80803e7b5b797395764a3f21523f337db4250167b21a",
+      "size": 7621,
+      "source_path": "addon_src/rwkvp_addon/profile_store.py"
+    },
+    "addon_src/rwkvp_addon/progress.py": {
+      "mode": "100644",
+      "sha256": "a6695d593673e25127dbfe509713f65ae5cd4d3421f79c8c2e5e8460c765dcd8",
+      "size": 2250,
+      "source_path": "addon_src/rwkvp_addon/progress.py"
+    },
+    "addon_src/rwkvp_addon/report_html.py": {
+      "mode": "100644",
+      "sha256": "a2ffd57903ab81b8b164890c00dc1d847adad888e877347e1a6d096a1da843fc",
+      "size": 12284,
+      "source_path": "addon_src/rwkvp_addon/report_html.py"
+    },
+    "addon_src/rwkvp_addon/retrievability.py": {
+      "mode": "100644",
+      "sha256": "42539f5dc26241ac0507765745789dd2ddb7596f47990383b5ee56d111887906",
+      "size": 5530,
+      "source_path": "addon_src/rwkvp_addon/retrievability.py"
+    },
+    "addon_src/rwkvp_addon/retrievability_controller.py": {
+      "mode": "100644",
+      "sha256": "3cc29dbb1f9d9adde9df89345d82b77f6f3a26663490bd7bcd5b7cec02d848e4",
+      "size": 16131,
+      "source_path": "addon_src/rwkvp_addon/retrievability_controller.py"
+    },
+    "addon_src/rwkvp_addon/retrievability_graph.py": {
+      "mode": "100644",
+      "sha256": "afb2f65474e456ec753d34615d53261f00f924ad8f03d10063d91019043b0ce1",
+      "size": 8014,
+      "source_path": "addon_src/rwkvp_addon/retrievability_graph.py"
+    },
+    "addon_src/rwkvp_addon/retrievability_html.py": {
+      "mode": "100644",
+      "sha256": "187700237b82f814c17665399e710a4f7e540109fc9d1541baf81abb02e328ce",
+      "size": 5273,
+      "source_path": "addon_src/rwkvp_addon/retrievability_html.py"
+    },
+    "addon_src/rwkvp_addon/review_load_policy.py": {
+      "mode": "100644",
+      "sha256": "bb8caeff2561880d6b097653abcb71c84ffc109ef19a3928b752cf461b9341ce",
+      "size": 6961,
+      "source_path": "addon_src/rwkvp_addon/review_load_policy.py"
+    },
+    "addon_src/rwkvp_addon/review_rows.py": {
+      "mode": "100644",
+      "sha256": "528299f2b90e5a594ddda61bbcdad870e5c169e0252ea0e5d2da6e3d42f23747",
+      "size": 44741,
+      "source_path": "addon_src/rwkvp_addon/review_rows.py"
+    },
+    "addon_src/rwkvp_addon/review_schema.py": {
+      "mode": "100644",
+      "sha256": "082690f8b52f7499fb3970d01178af44838c0419120025f02a9277ef3256878d",
+      "size": 5159,
+      "source_path": "addon_src/rwkvp_addon/review_schema.py"
+    },
+    "addon_src/rwkvp_addon/review_tail_context.py": {
+      "mode": "100644",
+      "sha256": "06b74ab9bffc65ad6cbbe5c6bd8c940b847995935dfa9c5e79e52b8e2dfc5f51",
+      "size": 20776,
+      "source_path": "addon_src/rwkvp_addon/review_tail_context.py"
+    },
+    "addon_src/rwkvp_addon/review_type_normalization.py": {
+      "mode": "100644",
+      "sha256": "e85b31ec5f8b54a833d9d693ac514baad61fdd77b27ed6ca8fdd19e121e29735",
+      "size": 9734,
+      "source_path": "addon_src/rwkvp_addon/review_type_normalization.py"
+    },
+    "addon_src/rwkvp_addon/runtime.py": {
+      "mode": "100644",
+      "sha256": "a0d7c548379ee213099fd7a1b7be5fbc75419a94ed7cc8aa08e1904a9fc5ce75",
+      "size": 4849,
+      "source_path": "addon_src/rwkvp_addon/runtime.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_backend.py": {
+      "mode": "100644",
+      "sha256": "11715569cd4f10d36905b6b41e1346ee4ce5de8281d5350b2d76948b57f521da",
+      "size": 1937,
+      "source_path": "addon_src/rwkvp_addon/rwkv_backend.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_curve_predictions.py": {
+      "mode": "100644",
+      "sha256": "aa52010224e455e69d969d897a5ce818e62e6afecdf55071a79917ffa10424a0",
+      "size": 680,
+      "source_path": "addon_src/rwkvp_addon/rwkv_curve_predictions.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_modes.py": {
+      "mode": "100644",
+      "sha256": "246fe7db3627bf9ddd6812828c57223d73625d57e28e75ffe3eb18c41bf302bf",
+      "size": 4131,
+      "source_path": "addon_src/rwkvp_addon/rwkv_modes.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_performance_modes.py": {
+      "mode": "100644",
+      "sha256": "a4a2f59f7fc9c8dc3372e9c5768be7e55945041ee040af63276ff18fa92d4148",
+      "size": 3889,
+      "source_path": "addon_src/rwkvp_addon/rwkv_performance_modes.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_processing.py": {
+      "mode": "100644",
+      "sha256": "06bd8ffa2872ad8fd692c78c17f2da8494ba7e62594ba76f085846e8ddb90535",
+      "size": 11543,
+      "source_path": "addon_src/rwkvp_addon/rwkv_processing.py"
+    },
+    "addon_src/rwkvp_addon/rwkv_runtime_resources.py": {
+      "mode": "100644",
+      "sha256": "b69e8beac5f4976c555703fae38053a28c3f66c9068fc5f288c2b9748b1847ce",
+      "size": 3562,
+      "source_path": "addon_src/rwkvp_addon/rwkv_runtime_resources.py"
+    },
+    "addon_src/rwkvp_addon/search_filters.py": {
+      "mode": "100644",
+      "sha256": "fab5b841c43b368ed0b5fc81da955933e5dca30cbb4a430f64801bd59d837443",
+      "size": 673,
+      "source_path": "addon_src/rwkvp_addon/search_filters.py"
+    },
+    "addon_src/rwkvp_addon/setup_faq_html.py": {
+      "mode": "100644",
+      "sha256": "9d8e57824c6a1dee5c300c80e76aecc7b70c1cabbf27d25254c3b1f4ba985cc8",
+      "size": 13103,
+      "source_path": "addon_src/rwkvp_addon/setup_faq_html.py"
+    },
+    "addon_src/rwkvp_addon/setup_wizard.py": {
+      "mode": "100644",
+      "sha256": "e6975d5c740ba8a89648e7c7aba406f9834f84b6b7aca5426e83ac3b9fb916da",
+      "size": 18473,
+      "source_path": "addon_src/rwkvp_addon/setup_wizard.py"
+    },
+    "addon_src/rwkvp_addon/setup_wizard_benchmarks.py": {
+      "mode": "100644",
+      "sha256": "ddd7f21514ab64af9ab3503d0853fb5cd46ccc4ea0d65fdb0beb671eaa0d1349",
+      "size": 21124,
+      "source_path": "addon_src/rwkvp_addon/setup_wizard_benchmarks.py"
+    },
+    "addon_src/rwkvp_addon/setup_wizard_html.py": {
+      "mode": "100644",
+      "sha256": "6ab43932ba6b1db1c60ef71907c2a77a7d3a79803d267b1dd69ec5446b854019",
+      "size": 16820,
+      "source_path": "addon_src/rwkvp_addon/setup_wizard_html.py"
+    },
+    "addon_src/rwkvp_addon/speed_test.py": {
+      "mode": "100644",
+      "sha256": "f88e2963994e790301eeca7674e7f6382ac847cb8f70fbbce4bcb213bea33973",
+      "size": 18781,
+      "source_path": "addon_src/rwkvp_addon/speed_test.py"
+    },
+    "addon_src/rwkvp_addon/speed_test_html.py": {
+      "mode": "100644",
+      "sha256": "7d7e8ac635ef3c31af6b97827331b23c8b280914e3b3d494557de5680709ef2f",
+      "size": 17081,
+      "source_path": "addon_src/rwkvp_addon/speed_test_html.py"
+    },
+    "addon_src/rwkvp_addon/state_comparison.py": {
+      "mode": "100644",
+      "sha256": "ee4967c08b03ed9f4c00ac9e54a033d9489e6249c79c964774568d715a5f50d0",
+      "size": 18413,
+      "source_path": "addon_src/rwkvp_addon/state_comparison.py"
+    },
+    "addon_src/rwkvp_addon/state_comparison_html.py": {
+      "mode": "100644",
+      "sha256": "acd6043ed32970c87a9eff721a3b0f2ed1475874864f98aca9a0a922f8f229a7",
+      "size": 6134,
+      "source_path": "addon_src/rwkvp_addon/state_comparison_html.py"
+    },
+    "addon_src/rwkvp_addon/study_session_controller.py": {
+      "mode": "100644",
+      "sha256": "9f6e0a632424ea680ffc5d4458fd3071d1b25f62cb3acc64ad2dde7d147708d6",
+      "size": 23148,
+      "source_path": "addon_src/rwkvp_addon/study_session_controller.py"
+    },
+    "addon_src/rwkvp_addon/study_session_html.py": {
+      "mode": "100644",
+      "sha256": "0fa417d93cef2aceabfe97ea1632e2e49235cb872e757d6087bbfe09b61a0ad6",
+      "size": 17510,
+      "source_path": "addon_src/rwkvp_addon/study_session_html.py"
+    },
+    "addon_src/rwkvp_addon/svg_chart.py": {
+      "mode": "100644",
+      "sha256": "63d50df00a534c208334fbacfa66f8442aabd94447bf9724783c19c10097a99c",
+      "size": 13832,
+      "source_path": "addon_src/rwkvp_addon/svg_chart.py"
+    },
+    "addon_src/rwkvp_addon/threading_utils.py": {
+      "mode": "100644",
+      "sha256": "c24d280c4b599b3ecfdc43e0b1c1d0edfd1e60f794935e9ad9272f1a8ff6b543",
+      "size": 424,
+      "source_path": "addon_src/rwkvp_addon/threading_utils.py"
+    },
+    "addon_src/rwkvp_addon/vendor_bootstrap.py": {
+      "mode": "100644",
+      "sha256": "10699737c929d6e556c4cd6962dd8aa1e77f372b7408a2c0d6d12760dffd5d36",
+      "size": 6081,
+      "source_path": "addon_src/rwkvp_addon/vendor_bootstrap.py"
+    },
+    "addon_src/rwkvp_addon/web_dialog_bridge.py": {
+      "mode": "100644",
+      "sha256": "babdb8e8c91b498a0e28dcd42f59271615e6205d178ee6304130cf9241409eb1",
+      "size": 7486,
+      "source_path": "addon_src/rwkvp_addon/web_dialog_bridge.py"
+    },
+    "addon_src/rwkvp_addon/web_dialog_controller.py": {
+      "mode": "100644",
+      "sha256": "02b8d1f1e43a2cbd3b203b702d8122c548a0f6bad22100aa0ddc73f11d96a142",
+      "size": 2206,
+      "source_path": "addon_src/rwkvp_addon/web_dialog_controller.py"
+    },
+    "addon_src/rwkvp_addon/windows_native_cache.py": {
+      "mode": "100644",
+      "sha256": "ba326dcb9841435e7938242e5f052caa3cb0fa2059874009e7115c674a9eb2d1",
+      "size": 19593,
+      "source_path": "addon_src/rwkvp_addon/windows_native_cache.py"
+    },
+    "addon_src/user_files/README.txt": {
+      "mode": "100644",
+      "sha256": "1657015fbd10ff1072ce3495c007c69d716afb08a385075209b1d393ff4bbe09",
+      "size": 186,
+      "source_path": "addon_src/user_files/README.txt"
+    },
+    "rwkv-models.lock.json": {
+      "mode": "100644",
+      "sha256": "39a8a7f66268be5fc74fb30082604a650981b64f649b475840a584619bbf9859",
+      "size": 606,
+      "source_path": "rwkv-models.lock.json"
+    },
+    "rwkv-srs.lock.json": {
+      "mode": "100644",
+      "sha256": "00f9092578bd4f183c97a0c25527ff8a6e770bdd9f92340da649f1169c289e92",
+      "size": 1341,
+      "source_path": "rwkv-srs.lock.json"
+    },
+    "scripts/assemble_release.py": {
+      "mode": "100644",
+      "sha256": "798dfe65266c75bfc5789ab10156c24e901c5f0a89e0245620ec5e556352296d",
+      "size": 18238,
+      "source_path": "scripts/assemble_release.py"
+    },
+    "scripts/package_addon.py": {
+      "mode": "100644",
+      "sha256": "60174c95fbafeea1dc9d31978e218e5e07d72af55a8969b84c718ab3d6bc5aaf",
+      "size": 42480,
+      "source_path": "scripts/package_addon.py"
+    },
+    "scripts/validate_addon_bundle.py": {
+      "mode": "100644",
+      "sha256": "a5ec5916ac30926312a75a9678673546b562809859f86cb5e7644c4b5c2ab6b9",
+      "size": 14614,
+      "source_path": "scripts/validate_addon_bundle.py"
+    }
+  },
+  "policy_sha256": "c70e50ecb1260fbbccc79aa53ecf467c5ea264d6099882d72ef4d6a3a35e4011",
+  "schema_version": 1,
+  "source_commit": "e3548ade3c82a45a480632cf508325b3fdbec73f",
+  "source_repository": "rwkv4anki-private"
+}

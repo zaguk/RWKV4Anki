@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Local/build outputs
+build/
+dist/
+artifacts/
+layout.txt
+*.ankiaddon
+
+# Local developer state
+.local/
+.uv-cache/
+.venv/
+venv/
+
+# Generated vendored release contents
+vendor/
+vendor_runtime/
+addon_src/vendor
+addon_src/vendor_runtime
+
+# Anki user/local config/state
+meta.json
+user_files/*
+!user_files/README.txt
+addon_src/user_files/*
+!addon_src/user_files/README.txt
+
+# Runtime profile data
+**/profiles/
+**/evaluation_cache/
+**/logs/
+**/cache/
+
+# Native/generated binaries
+*.so
+*.pyd
+*.dll
+*.dylib
+
+# Generated checkpoints/caches/databases
+*.pth
+*.bin
+*.sqlite
+*.db
+*.pt
+*.pt.gz
+
+# Allow intentional test fixtures only
+!tests/fixtures/**/*.pt
+!tests/fixtures/**/*.pt.gz
+!tests/fixtures/**/*.json
+!tests/fixtures/**/*.jsonl
+!tests/fixtures/**/*.jsonl.gz
+!tests/fixtures/**/*.tsv.gz
+!tests/fixtures/**/*.parquet
+!tests/fixtures/**/*.pb
+!tests/fixtures/**/*.safetensors

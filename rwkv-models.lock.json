@@ -1,0 +1,15 @@
+{
+  "models": [
+    {
+      "name": "RWKV_trained_on_101_4999.safetensors",
+      "sha256": "fa35cd87ee3589ad7457d54f844c90cb94d19d56e5104df04aa5fb0dcf28c4e9",
+      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/main/tests/fixtures/models/RWKV_trained_on_101_4999.safetensors"
+    },
+    {
+      "name": "RWKV_trained_on_5000_10000.safetensors",
+      "sha256": "0b1566d8159464fc512c8cb49525aefd3f84c9baaacdf0ea2e8d7a398729d91a",
+      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/main/tests/fixtures/models/RWKV_trained_on_5000_10000.safetensors"
+    }
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,159 @@
+name: Build RWKV4Anki release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version label used in dry-run artifact filenames
+        required: true
+        default: dev
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rwkv4anki-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RWKV4ANKI_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            python_architecture: x64
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            python_architecture: arm64
+          - target: macos-x86_64
+            runner: macos-15-intel
+            python_architecture: x64
+          - target: macos-aarch64
+            runner: macos-15
+            python_architecture: arm64
+          - target: windows-x86_64
+            runner: windows-2025
+            python_architecture: x64
+          - target: windows-aarch64
+            runner: windows-11-arm
+            python_architecture: arm64
+    steps:
+      - name: Check out the exported source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up target-native Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.python_architecture }}
+
+      - name: Package the target-native add-on
+        run: >-
+          python scripts/package_addon.py
+          --release
+          --version "${{ env.RWKV4ANKI_VERSION }}"
+          --platform "${{ matrix.target }}"
+
+      - name: Validate the retained add-on stage
+        run: >-
+          python scripts/validate_addon_bundle.py
+          "build/stage/${{ matrix.target }}/addon"
+          --require-vendor
+
+      - name: Upload the target bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rwkv4anki-${{ matrix.target }}
+          path: dist/rwkv4anki-${{ env.RWKV4ANKI_VERSION }}-${{ matrix.target }}.ankiaddon
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  assemble:
+    name: Validate and assemble release
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exported source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Download all target bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rwkv4anki-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate the complete release set
+        run: >-
+          python scripts/assemble_release.py
+          --assets-dir release-assets
+          --output-dir assembled
+          --version "${{ env.RWKV4ANKI_VERSION }}"
+          --public-commit "${{ github.sha }}"
+
+      - name: Upload the qualified release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rwkv4anki-release-${{ env.RWKV4ANKI_VERSION }}
+          path: |
+            release-assets/*.ankiaddon
+            assembled/SHA256SUMS
+            assembled/RELEASE_PROVENANCE.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the qualified release set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rwkv4anki-release-${{ env.RWKV4ANKI_VERSION }}
+          path: qualified-release
+
+      - name: Verify downloaded bundle checksums
+        working-directory: qualified-release/release-assets
+        run: sha256sum --check ../assembled/SHA256SUMS
+
+      - name: Publish the immutable tag's assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          qualified-release/release-assets/*.ankiaddon
+          qualified-release/assembled/SHA256SUMS
+          qualified-release/assembled/RELEASE_PROVENANCE.json
+          --repo "${{ github.repository }}"
+          --verify-tag
+          --generate-notes
+          --title "RWKV4Anki ${{ github.ref_name }}"

@@ -1,0 +1,36 @@
+{
+  "release_manifest": {
+    "asset": "RELEASE_PROVENANCE.json",
+    "sha256": "935865b71552ca22315204a01a798637370cbdec8157c7176c64584af9a24ec4"
+  },
+  "release_tag": "v0.1.0",
+  "repository": "zaguk/rwkv-srs",
+  "schema_version": 1,
+  "status": "ready",
+  "targets": {
+    "linux-aarch64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-manylinux_2_38_aarch64.whl",
+      "sha256": "558d61c4bf55a5863564b8e07c1b3aa5f8f94d3344f273437a029ddf0efe25d9"
+    },
+    "linux-x86_64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-manylinux_2_38_x86_64.whl",
+      "sha256": "badcc006def9aa3936cb44c2eee03ffdc3722079a6d8a5a09443f87fde74020a"
+    },
+    "macos-aarch64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-macosx_11_0_arm64.whl",
+      "sha256": "8a39b81a3feb35709667cec37e7f886c63d48d0a9e6444cb528e05a45cd77514"
+    },
+    "macos-x86_64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-macosx_10_12_x86_64.whl",
+      "sha256": "dec772a7eb67d4621899b4b7f2afd1013ddb840b3908716b236a9c722569bc34"
+    },
+    "windows-aarch64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-win_arm64.whl",
+      "sha256": "c25478e25664b348c6f34a644e9fd94dedba2921aeda89666d85986592a540d3"
+    },
+    "windows-x86_64": {
+      "asset": "rwkv_srs-0.1.0-cp39-abi3-win_amd64.whl",
+      "sha256": "d4a7fbb32f59ef779b6d193b5a7c7cdc819017dd89a00bb5e911abdfa40f4f32"
+    }
+  }
+}
