@@ -1,0 +1,6 @@
+# Release metadata is hashed byte-for-byte across target-native runners.
+# Keep its checkout representation identical on Windows, macOS, and Linux.
+rwkv-models.lock.json text eol=lf
+rwkv-srs.lock.json text eol=lf
+release/public/release.yml text eol=lf
+

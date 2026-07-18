@@ -1,5 +1,11 @@
 {
   "files": {
+    ".gitattributes": {
+      "mode": "100644",
+      "sha256": "1dc6ee5837f76edc69ce88f8464ee7f692f3a860caf17d18df99bb06c53d9a99",
+      "size": 253,
+      "source_path": ".gitattributes"
+    },
     ".github/workflows/release.yml": {
       "mode": "100644",
       "sha256": "8f0e0028639f969c620aa7b58d487e8e989e893696afce27863b0108018dec5b",
@@ -781,8 +787,8 @@
       "source_path": "scripts/validate_addon_bundle.py"
     }
   },
-  "policy_sha256": "c70e50ecb1260fbbccc79aa53ecf467c5ea264d6099882d72ef4d6a3a35e4011",
+  "policy_sha256": "04079460f80401438651e8e245b10f62b1d5221cba1887e8eab8973f8b70044d",
   "schema_version": 1,
-  "source_commit": "b046327f5f3a12a0a498a2a34d093089b73c19a2",
+  "source_commit": "48b8e2b175d3f15f42e269165708a31586e39400",
   "source_repository": "rwkv4anki-private"
 }
