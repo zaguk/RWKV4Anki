@@ -93,20 +93,28 @@ def add_browser_card_info_menu(browser) -> None:
         load_selection_action.setVisible(config_enabled)
         behavior_lab_separator.setVisible(config_enabled and behavior_lab_visible)
         behavior_lab_action.setVisible(behavior_lab_visible)
+        if (
+            not (config_enabled or behavior_lab_visible)
+            or not mw.col
+            or not is_fsrs_enabled(mw.col)
+        ):
+            # Browser menu hooks remain installed while these features are off.
+            # Do not create a manager or stat checkpoint files for inert menus.
+            load_all_action.setEnabled(False)
+            load_selection_action.setEnabled(False)
+            behavior_lab_action.setEnabled(False)
+            return
         manager = manager_for_mw(mw)
         checkpoint_status = manager.status()
+        has_checkpoint = manager.has_checkpoint
         card_info_enabled = bool(
             config_enabled
-            and mw.col
-            and is_fsrs_enabled(mw.col)
-            and manager.has_checkpoint
+            and has_checkpoint
             and checkpoint_status != "legacy"
         )
         behavior_lab_action_enabled = bool(
             behavior_lab_visible
-            and mw.col
-            and is_fsrs_enabled(mw.col)
-            and manager.has_checkpoint
+            and has_checkpoint
             and checkpoint_status not in {"legacy", "invalid", "stale_cache"}
         )
         load_all_action.setEnabled(card_info_enabled)
@@ -192,8 +200,16 @@ def load_browser_card_info_runtime(browser, *, scope: BrowserLoadScope) -> None:
     token, previous_runtime = _BROWSER_RUNTIME_OWNER.begin_load(browser_key)
     _close_runtime(previous_runtime, asynchronously=True)
     store = store_for_mw(mw)
+    pending_runtime: BrowserCardInfoRuntime | None = None
+
+    def release_pending_runtime(*, asynchronously: bool) -> None:
+        nonlocal pending_runtime
+        runtime = pending_runtime
+        pending_runtime = None
+        _close_runtime(runtime, asynchronously=asynchronously)
 
     def load_op(col, progress, _previous):
+        nonlocal pending_runtime
         card_ids: tuple[int, ...] | None = None
         if scope == "selection":
             progress.update(0, 1, "Finding cards in the current Browser search")
@@ -229,10 +245,14 @@ def load_browser_card_info_runtime(browser, *, scope: BrowserLoadScope) -> None:
             lease,
             visible_card_ids=None if card_ids is None else frozenset(card_ids),
         )
+        # Keep ownership until the GUI callback installs the lease. The stage
+        # runner can observe cancellation after this operation returns, in which
+        # case its result is discarded and success is never called.
+        pending_runtime = runtime
         try:
             progress.check_cancelled()
         except BaseException:
-            runtime.close()
+            release_pending_runtime(asynchronously=False)
             raise
         return _BrowserRuntimeLoadResult(
             runtime=runtime,
@@ -240,6 +260,8 @@ def load_browser_card_info_runtime(browser, *, scope: BrowserLoadScope) -> None:
         )
 
     def success(result: _BrowserRuntimeLoadResult) -> None:
+        nonlocal pending_runtime
+        pending_runtime = None
         if not _BROWSER_RUNTIME_OWNER.complete_load(token, result.runtime):
             _close_runtime(result.runtime, asynchronously=True)
             return
@@ -252,6 +274,7 @@ def load_browser_card_info_runtime(browser, *, scope: BrowserLoadScope) -> None:
         _refresh_open_browser_card_info(browser)
 
     def failure(exception: Exception) -> None:
+        release_pending_runtime(asynchronously=True)
         _BROWSER_RUNTIME_OWNER.cancel_load(token)
         if isinstance(exception, _EmptyBrowserSearchError):
             show_web_warning(str(exception), title="RWKV Card Info", parent=browser)
@@ -263,6 +286,7 @@ def load_browser_card_info_runtime(browser, *, scope: BrowserLoadScope) -> None:
         )
 
     def cancelled() -> None:
+        release_pending_runtime(asynchronously=True)
         _BROWSER_RUNTIME_OWNER.cancel_load(token)
 
     scope_label = "complete state" if scope == "all" else "search-result state"
@@ -305,7 +329,13 @@ def _close_runtime(runtime, *, asynchronously: bool) -> None:
     taskman = getattr(mw, "taskman", None)
     run_in_background = getattr(taskman, "run_in_background", None)
     if asynchronously and callable(run_in_background):
-        run_in_background(close, lambda _future: None, uses_collection=False)
+        try:
+            run_in_background(close, lambda _future: None, uses_collection=False)
+        except Exception:
+            # Profile/application teardown may already have stopped the worker
+            # pool. The owner has detached this lease, so release it here rather
+            # than losing the only remaining cleanup path.
+            close()
     else:
         close()
 

@@ -58,6 +58,8 @@ VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
 ASSET_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 NOTICE_NAMES = {"THIRD_PARTY_LICENSES.txt", "THIRD_PARTY_NOTICES.md"}
+MODEL_GENERATIONS = ("v1", "v5")
+V5_MODEL_NAME = "v5o-a.safetensors"
 
 
 class PackagingError(ValueError):
@@ -80,6 +82,7 @@ class ReleaseLock:
 
 @dataclass(frozen=True)
 class ModelAsset:
+    generation: str
     name: str
     url: str
     sha256: str
@@ -477,28 +480,41 @@ def _load_model_lock(path: Path) -> ModelLock:
         raw = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PackagingError(f"invalid RWKV model lock {path}: {error}") from error
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
         raise PackagingError(f"unsupported RWKV model lock: {path}")
+    schema_version = int(raw["schema_version"])
     models_raw = raw.get("models")
     if not isinstance(models_raw, list) or not models_raw:
         raise PackagingError("RWKV model lock must declare at least one model")
     models = tuple(
-        _parse_model_asset(value, label=f"model {index}") for index, value in enumerate(models_raw)
+        _parse_model_asset(
+            value,
+            label=f"model {index}",
+            default_generation="v1" if schema_version == 1 else None,
+        )
+        for index, value in enumerate(models_raw)
     )
-    names = [model.name for model in models]
-    if len(names) != len(set(names)):
-        raise PackagingError("RWKV model lock contains duplicate model names")
+    identities = [(model.generation, model.name) for model in models]
+    if len(identities) != len(set(identities)):
+        raise PackagingError("RWKV model lock contains duplicate generation/model pairs")
     return ModelLock(models=models, sha256=hashlib.sha256(payload).hexdigest())
 
 
-def _parse_model_asset(value: object, *, label: str) -> ModelAsset:
+def _parse_model_asset(
+    value: object,
+    *,
+    label: str,
+    default_generation: str | None,
+) -> ModelAsset:
     if not isinstance(value, dict):
         raise PackagingError(f"RWKV model lock {label} must be an object")
     name = value.get("name")
+    generation = value.get("generation", default_generation)
     url = value.get("url")
     digest = value.get("sha256")
     if (
-        not isinstance(name, str)
+        generation not in MODEL_GENERATIONS
+        or not isinstance(name, str)
         or ASSET_NAME_PATTERN.fullmatch(name) is None
         or PurePosixPath(name).name != name
         or not name.endswith(".safetensors")
@@ -519,7 +535,12 @@ def _parse_model_asset(value: object, *, label: str) -> ModelAsset:
         raise PackagingError(f"RWKV model lock {label} has an invalid URL")
     if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
         raise PackagingError(f"RWKV model lock {label} has an invalid sha256")
-    return ModelAsset(name=name, url=url, sha256=digest)
+    return ModelAsset(
+        generation=str(generation),
+        name=name,
+        url=url,
+        sha256=digest,
+    )
 
 
 def _resolve_backend(
@@ -994,7 +1015,7 @@ def _stage_models(
         copied = _copy_local_models(source, destination)
         return _model_records(copied, package_root.parent), "local-directory", None
 
-    embedded = sorted(destination.glob("*.safetensors")) if destination.is_dir() else []
+    embedded = _normalize_embedded_models(destination)
     if embedded:
         return _model_records(embedded, package_root.parent), "wheel", None
 
@@ -1008,27 +1029,89 @@ def _stage_models(
             cache_dir=cache_dir,
             offline=offline,
         )
-        target = destination / asset.name
+        target = destination / asset.generation / asset.name
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(downloaded, target)
         copied.append(target)
-        source_urls[asset.name] = asset.url
+        source_urls[f"{asset.generation}/{asset.name}"] = asset.url
     records = _model_records(copied, package_root.parent)
     for record in records:
-        record["url"] = source_urls[PurePosixPath(str(record["path"])).name]
+        path = PurePosixPath(str(record["path"]))
+        record["url"] = source_urls["/".join(path.parts[-2:])]
     return records, "fixed-download", model_lock.sha256
 
 
 def _copy_local_models(source: Path, destination: Path) -> list[Path]:
     copied: list[Path] = []
-    for model in sorted(source.glob("*.safetensors")):
+    candidates: list[tuple[str, Path]] = []
+    candidates.extend(
+        (
+            _flat_model_generation(model.name),
+            model,
+        )
+        for model in sorted(source.glob("*.safetensors"))
+    )
+    for generation in MODEL_GENERATIONS:
+        candidates.extend(
+            (generation, model)
+            for model in sorted((source / generation).glob("*.safetensors"))
+        )
+    discovered = set(source.rglob("*.safetensors"))
+    accepted = {model for _generation, model in candidates}
+    unsupported = sorted(discovered - accepted)
+    if unsupported:
+        raise PackagingError(
+            "models directory contains .safetensors outside v1/ or v5/: "
+            f"{unsupported[0]}"
+        )
+    targets: set[Path] = set()
+    for generation, model in candidates:
         if model.is_symlink() or not model.is_file():
             raise PackagingError(f"model must be an ordinary file: {model}")
-        target = destination / model.name
+        target = destination / generation / model.name
+        if target in targets:
+            raise PackagingError(f"duplicate local model target: {target}")
+        targets.add(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(model, target)
         copied.append(target)
     if not copied:
         raise PackagingError(f"no .safetensors model files found in {source}")
     return copied
+
+
+def _normalize_embedded_models(destination: Path) -> list[Path]:
+    if not destination.is_dir():
+        return []
+    embedded = sorted(destination.rglob("*.safetensors"))
+    plans: list[tuple[Path, Path]] = []
+    targets: set[Path] = set()
+    for model in embedded:
+        if model.is_symlink() or not model.is_file():
+            raise PackagingError(f"embedded model must be an ordinary file: {model}")
+        relative = model.relative_to(destination)
+        if len(relative.parts) == 1:
+            generation = _flat_model_generation(model.name)
+            target = destination / generation / model.name
+        elif len(relative.parts) == 2 and relative.parts[0] in MODEL_GENERATIONS:
+            target = model
+        else:
+            raise PackagingError(
+                "embedded model must be stored directly under pretrained/v1 or "
+                f"pretrained/v5: {model}"
+            )
+        if target in targets:
+            raise PackagingError(f"duplicate embedded model target: {target}")
+        targets.add(target)
+        plans.append((model, target))
+
+    normalized: list[Path] = []
+    for model, target in plans:
+        if target != model:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(model, target)
+        normalized.append(target)
+    return sorted(normalized)
 
 
 def _model_records(models: list[Path], vendor_root: Path) -> list[dict[str, object]]:
@@ -1079,7 +1162,10 @@ def _smoke_import(vendor_root: Path) -> None:
         "import rwkv_srs; "
         "from rwkv_srs.backends import rust; "
         "assert rwkv_srs.backend_name() == 'rust'; "
-        "assert rust.__name__ == 'rwkv_srs.backends.rust'"
+        "assert rust.__name__ == 'rwkv_srs.backends.rust'; "
+        "from rwkv_srs import V5oReviewBatch; "
+        "from rwkv_srs._native import native_api_version; "
+        "assert native_api_version() >= 80, 'RWKV4Anki requires native API 80 or newer'"
     )
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
@@ -1096,6 +1182,14 @@ def _smoke_import(vendor_root: Path) -> None:
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
         raise PackagingError(f"staged RWKV-SRS import smoke failed: {detail}")
+
+
+def _flat_model_generation(name: str) -> str:
+    if name == "rwkv-p-v2o.safetensors":
+        raise PackagingError("V2o models are no longer supported")
+    if name == "rwkv-p-v5o.safetensors":
+        raise PackagingError("The original V5 model is retired; provide v5o-a.safetensors")
+    return "v5" if name == V5_MODEL_NAME else "v1"
 
 
 def _zip_stage_contents(stage: Path, archive: Path) -> None:

@@ -21,14 +21,21 @@ from ..addon_config import (
     EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY,
     LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY,
     MODEL_CONFIG_KEY,
+    MODEL_GENERATION_CONFIG_KEY,
     PREDICT_MANY_MODE_CONFIG_KEY,
     PROCESS_MANY_MODE_CONFIG_KEY,
+    USE_FP16_STATE_CONFIG_KEY,
+    calculate_forgetting_curves,
+    configured_model_generation,
+    configured_runtime_model_id,
     default_addon_config,
     predict_many_batch_size,
+    predict_many_mode,
+    rwkv_immediate_enabled,
+    state_precision,
 )
 from ..anki_api import find_cards
 from ..checkpoint_storage import format_storage_bytes
-from ..constants import DEFAULT_MODEL_ID
 from ..dataset_export import (
     latest_collection_review_timestamp_seconds,
     load_review_data_for_checkpoint,
@@ -38,19 +45,41 @@ from ..dataset_export import (
 from ..glossary import GlossaryRenderer
 from ..live_prediction_benchmark import open_live_prediction_benchmark_session
 from ..metrics import MetricResult
+from ..model_generation import (
+    MODEL_GENERATIONS,
+    V1_MODEL_GENERATION,
+    model_generation_label,
+    model_generation_supports_curves,
+    normalize_model_generation,
+)
+from ..model_storage import default_model_id_for_generation
+from ..precision_comparison import (
+    StatePrecisionComparisonResult,
+    run_state_precision_comparison,
+    state_precision_comparison_plan,
+)
+from ..precision_comparison_html import state_precision_comparison_payload
 from ..process_many_benchmark import benchmark_process_many_rows
 from ..process_speed_cache import (
     cache_setup_process_mode_benchmark,
     process_many_speed_cache_path,
 )
-from ..progress import TimedProgressReporter, format_eta
+from ..progress import CoalescedProgressCallback, TimedProgressReporter, format_eta
 from ..review_rows import (
     checkpoint_scope_cards_for_card_ids,
     prediction_rows_for_card_ids,
 )
+from ..review_type_normalization import (
+    filtered_review_normalization_policy_for_store,
+    filtered_review_policy_from_config_values,
+)
+from ..runtime_inputs import RuntimeInputContext, input_context_for_generation
 from ..rwkv_performance_modes import (
+    DEFAULT_PREDICTION_MODE,
     PREDICT_MANY_FAST_MODE,
     PROCESS_MANY_FAST_MODE,
+    prediction_mode_label,
+    prediction_mode_math,
 )
 from ..rwkv_processing import (
     _begin_bulk_gpu_process,
@@ -59,7 +88,7 @@ from ..rwkv_processing import (
     new_rwkvp_runtime,
 )
 from ..rwkv_runtime_resources import release_runtime_resources
-from ..setup_faq_html import render_setup_faq_link
+from ..setup_view import SetupContent
 from ..setup_wizard import (
     METRIC_DISPLAY_DECIMAL_PLACES,
     apply_setup_feature_choices,
@@ -90,15 +119,19 @@ from ..speed_test import (
     state_backed_prediction_card_ids,
 )
 from ..state_comparison import (
+    ImmediateStateComparisonMeasurement,
     ImmediateStateComparisonPlan,
     ImmediateStateComparisonResult,
     current_review_rows_from_included_history,
     deleted_review_comparison_plan,
+    generation_comparison_plan,
+    generation_model_deleted_review_matrix_plan,
     model_comparison_plan,
-    model_deleted_review_matrix_plan,
     run_immediate_state_comparison,
 )
+from ..timestamp_context import millisecond_aligned_timestamp_seconds
 from .background_stages import ProgressStage, run_background_stages
+from .web_dialog import widget_uses_dark_palette
 
 if TYPE_CHECKING:
     from .config_dialog import RWKVConfigDialog
@@ -185,8 +218,10 @@ class _WizardHistoryEntry:
     selected_history_review_count: int | None
     optimization_counts: _OptimizationCounts | None
     model_result: ImmediateStateComparisonResult | None
+    generation_result: ImmediateStateComparisonResult | None
     deleted_result: ImmediateStateComparisonResult | None
     matrix_result: ImmediateStateComparisonResult | None
+    storage_result: StatePrecisionComparisonResult | None
     interruption_message: str | None
     interruption_retryable: bool
 
@@ -208,12 +243,31 @@ class _WizardSession:
     selected_history_review_count: int | None = None
     optimization_counts: _OptimizationCounts | None = None
     model_result: ImmediateStateComparisonResult | None = None
+    generation_result: ImmediateStateComparisonResult | None = None
     deleted_result: ImmediateStateComparisonResult | None = None
     matrix_result: ImmediateStateComparisonResult | None = None
+    storage_result: StatePrecisionComparisonResult | None = None
     interruption_message: str | None = None
     interruption_retryable: bool = True
     speed_tests_unavailable_reason: str | None = None
     history: list[_WizardHistoryEntry] = field(default_factory=list)
+
+
+def _checkpoint_matches_requested_model(
+    manager: object,
+    *,
+    model_id: object,
+    model_generation: object,
+    state_precision: str = "fp32",
+) -> bool:
+    """Return whether a durable checkpoint can back this tuning request."""
+
+    return getattr(manager, "state_precision", "fp32") == state_precision and (
+        str(getattr(manager, "model_id", "")) == str(model_id)
+    ) and (
+        normalize_model_generation(getattr(manager, "model_generation", None))
+        == normalize_model_generation(model_generation)
+    )
 
 
 class SetupWizardController:
@@ -223,19 +277,34 @@ class SetupWizardController:
         *,
         predict_gpu_available: bool,
         process_gpu_available: bool,
-        model_ids: Sequence[str],
+        model_ids: Sequence[str] = (),
+        model_ids_by_generation: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.dialog = dialog
         self._mw = mw
         self.predict_gpu_available = bool(predict_gpu_available)
         self.process_gpu_available = bool(process_gpu_available)
-        self.model_ids = tuple(dict.fromkeys(str(model_id) for model_id in model_ids))
+        self._fallback_model_ids = tuple(
+            dict.fromkeys(str(model_id) for model_id in model_ids)
+        )
+        self._model_ids_by_generation = {
+            generation: tuple(
+                dict.fromkeys(
+                    str(model_id)
+                    for model_id in (
+                        model_ids_by_generation.get(generation, ())
+                        if model_ids_by_generation is not None
+                        else ()
+                    )
+                )
+            )
+            for generation in MODEL_GENERATIONS
+        }
         self.session: _WizardSession | None = None
         self._reporter: TimedProgressReporter | None = None
         self._action_name: str | None = None
         self._action_generation = 0
-        self._progress_sequence = 0
-        self._last_progress_sequence = 0
+        self._progress_callback: CoalescedProgressCallback | None = None
         self._exit_after_cancel = False
         self._shutting_down = False
 
@@ -246,6 +315,107 @@ class SetupWizardController:
     @property
     def running(self) -> bool:
         return self._reporter is not None
+
+    @property
+    def model_ids(self) -> tuple[str, ...]:
+        config = (
+            self.session.working_config
+            if self.session is not None
+            else getattr(self.dialog, "_draft", {})
+        )
+        generation = configured_model_generation(config)
+        return self._model_ids_for_generation(generation)
+
+    @property
+    def generation_model_ids(self) -> dict[str, tuple[str, ...]]:
+        return {
+            generation: model_ids
+            for generation in MODEL_GENERATIONS
+            if (model_ids := self._model_ids_for_generation(generation))
+        }
+
+    def _model_ids_for_generation(self, model_generation: object) -> tuple[str, ...]:
+        generation = normalize_model_generation(model_generation)
+        model_ids = self._model_ids_by_generation.get(generation, ())
+        if model_ids:
+            return model_ids
+        if not any(self._model_ids_by_generation.values()):
+            return self._fallback_model_ids
+        return ()
+
+    def _default_model_id_for_generation(self, model_generation: object) -> str:
+        generation = normalize_model_generation(model_generation)
+        model_ids = self._model_ids_for_generation(generation)
+        if not model_ids:
+            raise ValueError(f"No models are available for {generation}.")
+        preferred = default_model_id_for_generation(generation)
+        return preferred if preferred in model_ids else model_ids[0]
+
+    def _default_model_id(self) -> str:
+        session = self._require_session()
+        return self._default_model_id_for_generation(
+            configured_model_generation(session.working_config)
+        )
+
+    def _select_model_generation(
+        self,
+        model_generation: object,
+        *,
+        use_default_model: bool = False,
+    ) -> None:
+        session = self._require_session()
+        generation = normalize_model_generation(model_generation)
+        available_models = self._model_ids_for_generation(generation)
+        selected_model = str(session.working_config.get(MODEL_CONFIG_KEY) or "")
+        session.working_config[MODEL_GENERATION_CONFIG_KEY] = generation
+        session.working_config[MODEL_CONFIG_KEY] = (
+            self._default_model_id_for_generation(generation)
+            if use_default_model or selected_model not in available_models
+            else selected_model
+        )
+        if not model_generation_supports_curves(generation):
+            session.curves_enabled = False
+            session.working_config = apply_setup_feature_choices(
+                session.working_config,
+                immediate_enabled=self._effective_immediate_choice(),
+                curves_enabled=False,
+            )
+
+    def _recommended_generation(self) -> str:
+        generations = self.generation_model_ids
+        if V1_MODEL_GENERATION in generations:
+            return V1_MODEL_GENERATION
+        if not generations:
+            raise ValueError("No RWKV generations are available.")
+        return next(iter(generations))
+
+    def _apply_generation_measurement(
+        self,
+        measurement: ImmediateStateComparisonMeasurement,
+    ) -> None:
+        session = self._require_session()
+        generation = normalize_model_generation(measurement.model_generation)
+        session.working_config[MODEL_GENERATION_CONFIG_KEY] = generation
+        session.working_config[MODEL_CONFIG_KEY] = str(measurement.model_id)
+        if not model_generation_supports_curves(generation):
+            session.curves_enabled = False
+        session.working_config = apply_setup_feature_choices(
+            session.working_config,
+            immediate_enabled=self._effective_immediate_choice(),
+            curves_enabled=self._effective_curve_choice(),
+        )
+
+    def _effective_immediate_choice(self) -> bool:
+        session = self._require_session()
+        if session.immediate_enabled is not None:
+            return bool(session.immediate_enabled)
+        return rwkv_immediate_enabled(session.working_config)
+
+    def _effective_curve_choice(self) -> bool:
+        session = self._require_session()
+        if session.curves_enabled is not None:
+            return bool(session.curves_enabled)
+        return calculate_forgetting_curves(session.working_config)
 
     def handle(self, event: str, value: object | None = None) -> None:
         event = str(event).strip().lower()
@@ -258,6 +428,13 @@ class SetupWizardController:
             return
         if event == "back":
             self._go_back()
+            return
+        if event.startswith("choose-generation-"):
+            generation = event.removeprefix("choose-generation-")
+            if generation not in self.generation_model_ids:
+                raise ValueError("That RWKV generation is unavailable.")
+            self._select_model_generation(generation, use_default_model=True)
+            self._show_summary()
             return
 
         handlers = {
@@ -280,11 +457,16 @@ class SetupWizardController:
             "skip-curve-test": self._skip_curve_test,
             "optimize-deleted-only": self._show_deleted_test_intro,
             "optimize-models-only": self._show_model_test_intro,
+            "optimize-generations-only": self._show_generation_test_intro,
+            "optimize-storage-only": self._show_storage_test_intro,
             "optimize-all": self._show_matrix_test_intro,
             "optimize-no": self._show_summary,
             "run-model-test": self._run_model_test,
             "continue-model-test": self._show_summary,
             "skip-model-test": self._skip_model_test,
+            "run-generation-test": self._run_generation_test,
+            "continue-generation-test": self._show_summary,
+            "skip-generation-test": self._skip_generation_test,
             "run-deleted-test": self._run_deleted_test,
             "continue-deleted-test": self._show_summary,
             "show-summary": self._show_summary,
@@ -292,6 +474,10 @@ class SetupWizardController:
             "run-matrix-test": self._run_matrix_test,
             "continue-matrix-test": self._show_summary,
             "skip-matrix-test": self._skip_matrix_test,
+            "run-storage-test": self._run_storage_test,
+            "skip-storage-test": self._show_summary,
+            "use-storage-fp16": lambda: self._choose_storage_precision(True),
+            "use-storage-fp32": lambda: self._choose_storage_precision(False),
             "retry": self._retry_current_action,
             "skip-current": self._skip_current_action,
             "cancel-run": self.cancel_running,
@@ -372,12 +558,16 @@ class SetupWizardController:
         if reporter is None:
             return
         reporter.cancel()
+        if self._progress_callback is not None:
+            self._progress_callback.close()
         self._eval_progress(0, 0, label, None)
 
     def shutdown(self) -> None:
         self._shutting_down = True
         if self._reporter is not None:
             self._reporter.cancel()
+        if self._progress_callback is not None:
+            self._progress_callback.close()
         self.session = None
 
     def _remember_current_step(self) -> _WizardHistoryEntry:
@@ -395,8 +585,10 @@ class SetupWizardController:
             selected_history_review_count=session.selected_history_review_count,
             optimization_counts=session.optimization_counts,
             model_result=session.model_result,
+            generation_result=session.generation_result,
             deleted_result=session.deleted_result,
             matrix_result=session.matrix_result,
+            storage_result=session.storage_result,
             interruption_message=session.interruption_message,
             interruption_retryable=session.interruption_retryable,
         )
@@ -431,8 +623,10 @@ class SetupWizardController:
         session.selected_history_review_count = previous.selected_history_review_count
         session.optimization_counts = previous.optimization_counts
         session.model_result = previous.model_result
+        session.generation_result = previous.generation_result
         session.deleted_result = previous.deleted_result
         session.matrix_result = previous.matrix_result
+        session.storage_result = previous.storage_result
         session.interruption_message = previous.interruption_message
         session.interruption_retryable = previous.interruption_retryable
         session.return_step = None
@@ -460,8 +654,9 @@ class SetupWizardController:
             "This is the first time RWKV4Anki has opened with this Anki profile, "
             "so Guided Setup is being offered once after installation.</div>"
             f'<p class="setup-copy">{glossary.render("The wizard explains RWKV Immediate and RWKV Forgetting Curve, runs short speed tests with your collection, and recommends settings for this computer.")}</p>'
-            f'<p class="setup-copy">{glossary.render("The tests use temporary RWKV state built from your review history. They do not change cards or save a checkpoint. You will review the proposed settings before anything is saved.")}</p>'
-            '<p class="setup-help-hint">Hover or focus a dotted term for a quick explanation.</p>'
+            f'<p class="setup-copy">{glossary.render("The tests use RWKV state built from your review history. They do not change cards. You will review proposed settings before saving them.")}</p>'
+            + self._generation_retention_notice()
+            + '<p class="setup-help-hint">Hover or focus a dotted term for a quick explanation.</p>'
             '<p class="setup-copy">If you close setup, it will not open automatically '
             "again for this profile. You can always rerun it from "
             "<strong>RWKV → Settings → General → Guided Setup</strong>.</p>"
@@ -514,13 +709,25 @@ class SetupWizardController:
     def _choose_immediate(self, enabled: bool) -> None:
         session = self._require_session()
         session.immediate_enabled = bool(enabled)
-        session.working_config = apply_setup_immediate_choice(
-            session.working_config,
-            immediate_enabled=bool(enabled),
-        )
         if enabled:
+            # Immediate-only setup deliberately starts on the newer generation.
+            # Start with V1; the later accuracy comparison can select V5.
+            session.curves_enabled = None
+            self._select_model_generation(
+                V1_MODEL_GENERATION,
+                use_default_model=True,
+            )
+            session.working_config = apply_setup_feature_choices(
+                session.working_config,
+                immediate_enabled=True,
+                curves_enabled=False,
+            )
             self._show_performance_intro(include_predictions=True)
         else:
+            session.working_config = apply_setup_immediate_choice(
+                session.working_config,
+                immediate_enabled=False,
+            )
             self._show_curve_question()
 
     def _show_performance_intro(self, *, include_predictions: bool) -> None:
@@ -533,8 +740,9 @@ class SetupWizardController:
             title = "Tune Immediate performance"
             if self.predict_gpu_available and self.process_gpu_available:
                 mode_purpose = (
-                    "GPU acceleration is available for both jobs, so Setup will compare "
-                    "CPU Fast and GPU for each one and use the fastest successful mode. "
+                    "Setup will compare CPU Fast and GPU for State Building, and CPU Fast "
+                    "and GPU (Full FP16) for Live Session predictions, then use the fastest "
+                    "successful mode for each job. "
                 )
             elif self.process_gpu_available:
                 mode_purpose = (
@@ -543,8 +751,9 @@ class SetupWizardController:
                 )
             elif self.predict_gpu_available:
                 mode_purpose = (
-                    "For Live Session predictions, Setup will compare CPU Fast and GPU and "
-                    "use the fastest successful mode. State Building will use CPU Fast. "
+                    "For Live Session predictions, Setup will compare CPU Fast and "
+                    "GPU (Full FP16) and use the fastest successful mode. "
+                    "State Building will use CPU Fast. "
                 )
             else:
                 mode_purpose = (
@@ -552,7 +761,8 @@ class SetupWizardController:
                     "calibrates performance rather than choosing between modes. "
                 )
             text = glossary.render(
-                "Setup will measure CPU Fast for two jobs: State Building with a sample "
+                "Setup will use RWKV V1 by default and measure CPU Fast for two jobs: "
+                "State Building with a sample "
                 "of up to 10,000 reviews, and a between-review Live Session update "
                 "using up to 1,000 reviewed cards. "
                 + mode_purpose
@@ -582,6 +792,8 @@ class SetupWizardController:
         body = (
             f'<p class="setup-copy">{text}</p>'
             f'<p class="setup-copy">{detail}</p>'
+            f'<p class="setup-copy">Card/note state storage: <strong>{state_precision(session.working_config).upper()}</strong>. '
+            'Setup preserves this Advanced setting; storage precision is separate from GPU prediction math.</p>'
             f'<div class="setup-callout warning">{glossary.render("The test uses temporary RWKV state. It does not change your cards or save a checkpoint. If no usable checkpoint exists yet, preparing the test may take about as long as processing the collection once.")}</div>'
         )
         self._show(
@@ -627,6 +839,9 @@ class SetupWizardController:
             f'<p class="setup-copy"><strong>{glossary.render("RWKV Forgetting Curve")}</strong>'
             f"{glossary.render(' estimates how a card’s retrievability is expected to change as time passes after an answer. It adds stability, suggested interval, and graph details to Card Info.')}</p>"
             f'<p class="setup-copy">{glossary.render("On benchmark data, it has outperformed known FSRS versions at both short and long intervals.")}</p>'
+            '<div class="setup-callout warning"><strong>Generation tradeoff:</strong> '
+            'enabling forgetting curves locks this setup to RWKV V1. For Immediate '
+            'predictions, compare V1 and V5 using your review history.</div>'
             '<div class="setup-callout warning">This feature has received less add-on '
             "testing than RWKV Immediate and can sometimes produce surprising results.</div>"
             + cpu_note
@@ -634,7 +849,7 @@ class SetupWizardController:
                 (
                     (
                         "Yes, calculate forgetting curves",
-                        "Turn on curve calculation and all curve-related Card Info fields.",
+                        "Use RWKV V1, turn on curve calculation, and enable all curve-related Card Info fields.",
                         "curves-yes",
                     ),
                     (
@@ -651,6 +866,13 @@ class SetupWizardController:
     def _choose_curves(self, enabled: bool) -> None:
         session = self._require_session()
         session.curves_enabled = bool(enabled)
+        if session.curves_enabled:
+            self._select_model_generation(V1_MODEL_GENERATION)
+        elif session.immediate_enabled:
+            self._select_model_generation(
+                V1_MODEL_GENERATION,
+                use_default_model=True,
+            )
         session.working_config = apply_setup_feature_choices(
             session.working_config,
             immediate_enabled=bool(session.immediate_enabled),
@@ -738,8 +960,13 @@ class SetupWizardController:
             return
 
         manager, store = self._manager_and_store()
-        model_id = str(session.working_config[MODEL_CONFIG_KEY])
-        return_curves = bool(not include_predictions and session.curves_enabled)
+        model_id = configured_runtime_model_id(session.working_config)
+        model_generation = configured_model_generation(session.working_config)
+        return_curves = bool(
+            not include_predictions
+            and session.curves_enabled
+            and calculate_forgetting_curves(session.working_config)
+        )
 
         def collect(col, progress, _previous):
             progress.update(0, 1, "Reading review history and current cards")
@@ -749,6 +976,7 @@ class SetupWizardController:
                 manager,
                 progress,
                 allow_incremental=True,
+                model_generation=model_generation,
             )
             all_card_ids = sorted(int(card_id) for card_id in find_cards(col, ""))
             eligible_ids = state_backed_prediction_card_ids(
@@ -756,9 +984,11 @@ class SetupWizardController:
                 review_load.review_data.last_by_card,
             )
             selected_ids = eligible_ids[:_MAX_TUNED_PREDICTION_CARDS]
-            target_timestamp = max(
-                time.time(),
-                float(latest_collection_review_timestamp_seconds(col) or 0.0),
+            target_timestamp = millisecond_aligned_timestamp_seconds(
+                max(
+                    time.time(),
+                    float(latest_collection_review_timestamp_seconds(col) or 0.0),
+                )
             )
             prediction_rows = (
                 prediction_rows_for_card_ids(
@@ -783,6 +1013,9 @@ class SetupWizardController:
         def benchmark(_col, progress, previous):
             input_data: _PerformanceInput = previous
             process_rows = input_data.process_rows[:SETUP_PROCESS_REVIEW_LIMIT]
+            input_context = self._input_context_for_review_data(
+                getattr(input_data.review_load, "review_data", None),
+            )
             slot = manager.reserve_runtime_slot(progress)
             try:
                 process_result = run_process_mode_benchmark(
@@ -792,9 +1025,12 @@ class SetupWizardController:
                         benchmark_process_many_rows(
                             rows,
                             model_id=model_id,
+                            model_generation=model_generation,
+                            state_precision=state_precision(session.working_config),
                             mode=mode,
                             return_curves=return_curves,
                             warm_gpu_before_timing=True,
+                            input_context=input_context,
                         )
                     ),
                     progress=progress,
@@ -810,6 +1046,7 @@ class SetupWizardController:
                         process_result,
                         model_id=model_id,
                         return_curves=return_curves,
+                        state_precision=state_precision(session.working_config),
                     )
             finally:
                 slot.close()
@@ -859,8 +1096,18 @@ class SetupWizardController:
         lease = None
         runtime = None
         slot = None
+        input_context = self._input_context_for_review_data(
+            getattr(input_data.review_load, "review_data", None),
+        )
         try:
-            if speed_test_checkpoint_is_usable(manager) and str(manager.model_id) == str(model_id):
+            if speed_test_checkpoint_is_usable(manager) and _checkpoint_matches_requested_model(
+                manager,
+                model_id=model_id,
+                model_generation=configured_model_generation(
+                    self._require_session().working_config
+                ),
+                state_precision=state_precision(self._require_session().working_config),
+            ):
                 _readiness, lease = open_checkpoint_runtime_from_load(
                     manager,
                     input_data.review_load,
@@ -869,6 +1116,9 @@ class SetupWizardController:
                         input_data.eligible_card_ids,
                         input_data.review_load.review_data,
                     ),
+                    # CPU Fast is unaffected by GPU arithmetic. Both candidates
+                    # share identical state with Full FP16 selected for GPU.
+                    gpu_prediction_math=prediction_mode_math(self._default_prediction_mode()),
                 )
 
                 def open_session(rows, mode, _batch_size, refresh_limit):
@@ -882,6 +1132,7 @@ class SetupWizardController:
                         ),
                         refresh_limit=refresh_limit,
                         target_timestamp_seconds=input_data.target_timestamp_seconds,
+                        input_context=input_context,
                     )
 
             else:
@@ -889,7 +1140,12 @@ class SetupWizardController:
                 progress.update(0, 1, "Preparing temporary data for prediction tuning")
                 runtime = new_rwkvp_runtime(
                     model_id=str(model_id),
+                    model_generation=configured_model_generation(
+                        self._require_session().working_config
+                    ),
                     process_many_mode=process_many_mode,
+                    state_precision=state_precision(self._require_session().working_config),
+                    gpu_prediction_math=prediction_mode_math(self._default_prediction_mode()),
                 )
                 use_gpu = _begin_bulk_gpu_process(
                     runtime,
@@ -904,6 +1160,7 @@ class SetupWizardController:
                             list(chunk),
                             return_curves=False,
                             use_gpu=use_gpu,
+                            input_context=input_context,
                         ),
                         progress=progress,
                         label="Preparing temporary prediction data",
@@ -923,6 +1180,7 @@ class SetupWizardController:
                         ),
                         refresh_limit=refresh_limit,
                         target_timestamp_seconds=input_data.target_timestamp_seconds,
+                        input_context=input_context,
                     )
 
             prediction_result = run_prediction_mode_benchmark(
@@ -988,7 +1246,7 @@ class SetupWizardController:
             )
         elif include_predictions:
             defaults = default_addon_config()
-            session.working_config[PREDICT_MANY_MODE_CONFIG_KEY] = PREDICT_MANY_FAST_MODE
+            session.working_config[PREDICT_MANY_MODE_CONFIG_KEY] = self._default_prediction_mode()
             session.working_config[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY] = int(
                 defaults[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY]
             )
@@ -1020,7 +1278,7 @@ class SetupWizardController:
         session.refresh_result = None
         session.selected_history_review_count = None
         session.working_config[PROCESS_MANY_MODE_CONFIG_KEY] = PROCESS_MANY_FAST_MODE
-        session.working_config[PREDICT_MANY_MODE_CONFIG_KEY] = PREDICT_MANY_FAST_MODE
+        session.working_config[PREDICT_MANY_MODE_CONFIG_KEY] = self._default_prediction_mode()
         session.working_config[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY] = int(
             defaults[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY]
         )
@@ -1034,11 +1292,19 @@ class SetupWizardController:
         session.working_config[PROCESS_MANY_MODE_CONFIG_KEY] = PROCESS_MANY_FAST_MODE
         self._after_process_performance()
 
+    def _default_prediction_mode(self) -> str:
+        return DEFAULT_PREDICTION_MODE if self.predict_gpu_available else PREDICT_MANY_FAST_MODE
+
     # ------------------------------------------------------------------
     # Curves and optional accuracy comparisons
 
     def _run_curve_test(self) -> None:
         session = self._require_session()
+        if not model_generation_supports_curves(
+            session.working_config.get(MODEL_GENERATION_CONFIG_KEY)
+        ):
+            self._choose_curves(False)
+            return
         if session.speed_tests_unavailable_reason:
             self._show_curve_test_intro()
             return
@@ -1049,7 +1315,8 @@ class SetupWizardController:
             )
             return
         manager, store = self._manager_and_store()
-        model_id = str(session.working_config[MODEL_CONFIG_KEY])
+        model_id = configured_runtime_model_id(session.working_config)
+        model_generation = configured_model_generation(session.working_config)
 
         def collect(col, progress, _previous):
             progress.update(0, 1, "Preparing 3,000 reviews")
@@ -1062,10 +1329,14 @@ class SetupWizardController:
             )
             rows = tuple(capped_curve_speed_test_rows(review_load.review_data.rows)[:3000])
             progress.update(1, 1, "Curve speed-test rows ready")
-            return rows, len(review_load.review_data.rows)
+            return (
+                rows,
+                len(review_load.review_data.rows),
+                self._input_context_for_review_data(review_load.review_data),
+            )
 
         def benchmark(_col, progress, previous):
-            rows, available_count = previous
+            rows, available_count, input_context = previous
             slot = manager.reserve_runtime_slot(progress)
             try:
                 return run_process_many_curve_speed_test(
@@ -1076,8 +1347,11 @@ class SetupWizardController:
                     run_once=lambda curves: benchmark_process_many_rows(
                         rows,
                         model_id=model_id,
+                        model_generation=model_generation,
+                        state_precision=state_precision(session.working_config),
                         mode=PROCESS_MANY_FAST_MODE,
                         return_curves=curves,
+                        input_context=input_context,
                     ),
                     progress=progress,
                     repetitions=1,
@@ -1114,19 +1388,19 @@ class SetupWizardController:
             else f"{abs(gain or 0):.1f}% slower"
         )
         body = (
-            '<div class="setup-results">'
-            + self._result_row(
-                "Forgetting curves on",
-                self._format_duration(with_curves.average_seconds),
-                f"{with_curves.reviews_per_minute:,.0f} reviews/minute",
-            )
-            + self._result_row(
-                "Forgetting curves off",
-                self._format_duration(without_curves.average_seconds),
-                f"{without_curves.reviews_per_minute:,.0f} reviews/minute",
-            )
-            + "</div>"
-            f'<div class="setup-callout">{glossary.render("On this sample, turning forgetting curves off was")} <strong>{html.escape(direction)}</strong>. '
+            SetupContent.results((
+                self._result_row(
+                    "Forgetting curves on",
+                    self._format_duration(with_curves.average_seconds),
+                    f"{with_curves.reviews_per_minute:,.0f} reviews/minute",
+                ),
+                self._result_row(
+                    "Forgetting curves off",
+                    self._format_duration(without_curves.average_seconds),
+                    f"{without_curves.reviews_per_minute:,.0f} reviews/minute",
+                ),
+            ))
+            + f'<div class="setup-callout">{glossary.render("On this sample, turning forgetting curves off was")} <strong>{html.escape(direction)}</strong>. '
             "Your feature choice has not changed.</div>"
             '<p class="setup-copy">Choose whether to keep forgetting curves enabled '
             "before continuing.</p>"
@@ -1145,6 +1419,13 @@ class SetupWizardController:
     def _finish_curve_test(self, curves_enabled: bool) -> None:
         session = self._require_session()
         session.curves_enabled = bool(curves_enabled)
+        if session.curves_enabled:
+            self._select_model_generation(V1_MODEL_GENERATION)
+        elif session.immediate_enabled:
+            self._select_model_generation(
+                V1_MODEL_GENERATION,
+                use_default_model=True,
+            )
         session.working_config = apply_setup_feature_choices(
             session.working_config,
             immediate_enabled=bool(session.immediate_enabled),
@@ -1180,10 +1461,17 @@ class SetupWizardController:
         session = self._require_session()
         session.optimization_counts = counts
         rate = self._selected_process_reviews_per_minute()
+        generation_model_ids = self.generation_model_ids
+        generation_count = len(generation_model_ids)
+        all_generation_model_count = sum(
+            len(model_ids) for model_ids in generation_model_ids.values()
+        )
         estimate = (
             estimate_optimization_durations(
                 reviews_per_minute=rate,
                 model_count=len(self.model_ids),
+                generation_count=generation_count,
+                all_generation_model_count=all_generation_model_count,
                 model_review_count=counts.selected_history_review_count,
                 without_deleted_review_count=counts.current_review_count,
                 with_deleted_review_count=counts.all_review_count,
@@ -1202,6 +1490,7 @@ class SetupWizardController:
             estimate_copy = (
                 "Based on the review history already measured: "
                 f"Models only, about {self._format_duration(estimate.model_comparison_seconds)}. "
+                f"Generations, about {self._format_duration(estimate.generation_comparison_seconds)}. "
                 f"Deleted history only, roughly {self._format_duration(estimate.deleted_reviews_comparison_seconds)}. "
                 f"Test All, roughly {self._format_duration(estimate.matrix_comparison_seconds)}. "
                 "The latter two may change because including deleted-card history changes "
@@ -1210,16 +1499,23 @@ class SetupWizardController:
         else:
             estimate_copy = (
                 f"Models only: about {self._format_duration(estimate.model_comparison_seconds)}. "
+                f"Generations: about {self._format_duration(estimate.generation_comparison_seconds)}. "
                 f"Deleted history only: about {self._format_duration(estimate.deleted_reviews_comparison_seconds)}. "
                 f"Test All: about {self._format_duration(estimate.matrix_comparison_seconds)}."
             )
+        generation_disabled_reason = self._generation_accuracy_disabled_reason(
+            require_multiple=True
+        )
+        matrix_disabled_reason = self._generation_accuracy_disabled_reason(
+            require_multiple=False
+        )
         body = (
             '<p class="setup-copy">RWKV is already configured. These optional tests '
             "process your full review history several times to look for small, "
             "collection-specific accuracy gains. <strong>Skipping them is recommended "
             "for most users.</strong></p>"
             f'<div class="setup-callout warning">{html.escape(estimate_copy)}</div>'
-            f'<p class="setup-copy">{glossary.render("Each RWKV model was trained on a different subset of benchmark data, and deleted-card history can affect the result. Test All checks every combination. Setup compares LogLoss and then RMSE(bins), both as shown to four decimal places; Test All uses the smaller checkpoint for any remaining tie. Lower metric scores are better.")}</p>'
+            f'<p class="setup-copy">{glossary.render("RWKV generations use different model architectures and input features. RWKV models within a generation were trained on different subsets of benchmark data, and deleted-card history can also affect the result. Test All checks every valid generation, model, and history combination at the current storage precision. Storage sizes are compared separately. Setup compares LogLoss and then RMSE(bins), both as shown to four decimal places; Test All uses the smaller checkpoint for any remaining tie. Lower metric scores are better.")}</p>'
             + self._choice_grid(
                 (
                     (
@@ -1229,17 +1525,29 @@ class SetupWizardController:
                     ),
                     (
                         "Test Models Only",
-                        "Compare every bundled model using the current setting for deleted-card history.",
+                        "Compare every bundled model in the selected generation using the current deleted-card history setting.",
                         "optimize-models-only",
                     ),
                     (
+                        "Test RWKV Generations",
+                        "Compare the default bundled models from V1 and V5 using the selected deleted-card history setting.",
+                        "optimize-generations-only",
+                        generation_disabled_reason,
+                    ),
+                    (
+                        "Compare Storage Sizes (FP16 vs FP32)",
+                        "Compare card/note storage size, build time, accuracy, and prediction speed using the current model and history settings.",
+                        "optimize-storage-only",
+                    ),
+                    (
                         "Test All",
-                        "Test every model with and without deleted-card history.",
+                        "Test every valid generation/model pairing with and without deleted-card history.",
                         "optimize-all",
+                        matrix_disabled_reason,
                     ),
                     (
                         "Skip accuracy tuning (recommended)",
-                        "Keep the current model and deleted-card history setting.",
+                        "Keep the current model, deleted-card history, and storage precision settings.",
                         "optimize-no",
                     ),
                 ),
@@ -1247,6 +1555,130 @@ class SetupWizardController:
             )
         )
         self._show("Step 3 of 4", "Optional accuracy tuning", body)
+
+    def _show_storage_test_intro(self) -> None:
+        session = self._require_session()
+        session.step = "storage-test"
+        current = state_precision(session.working_config).upper()
+        self._show(
+            "Accuracy tuning", "Compare Storage Sizes (FP16 vs FP32)",
+            '<p class="setup-copy">Build two disposable full-history states with this '
+            "setup's model, deleted-card history policy, curves and performance modes. "
+            "Compare state calculation time, checkpoint and tensor sizes, Immediate "
+            "LogLoss and RMSE(bins) for all eligible reviews and the most recent 25%, "
+            "and warmed predict_many() speed.</p>"
+            '<p class="setup-copy">FP16 halves card/note tensor storage, not total '
+            "memory or checkpoint size. Rounding can slightly change predictions and "
+            "accuracy. GPU prediction math is held at FP32 for both builds to isolate "
+            "storage precision; your Prediction Mode is not changed.</p>"
+            '<div class="setup-callout warning">This can take substantial time, RAM '
+            "and temporary disk space. It is cancellable and needs no existing "
+            "checkpoint. Neither state is retained, even if Retain Multiple Model "
+            "Generations is on. Saved checkpoints and Anki reviews are unchanged.</div>"
+            f'<p class="setup-copy">Current storage: <strong>{current}</strong>. '
+            "After comparing, choose which precision to include in your Setup draft. "
+            "Changing storage precision requires a checkpoint rebuild.</p>",
+            self._buttons(
+                (f"Skip and Keep {current}", "skip-storage-test", "secondary"),
+                ("Compare FP16 vs FP32", "run-storage-test", "primary"),
+            ),
+        )
+
+    def _run_storage_test(self) -> None:
+        if self._rwkv_busy():
+            self._render_inline_error(
+                "Stop the active RWKV operation before starting this comparison.",
+                retry_action="storage-test",
+            )
+            return
+        manager, store = self._manager_and_store()
+        draft = deepcopy(self._require_session().working_config)
+
+        def collect(col, progress, _previous):
+            progress.check_cancelled()
+            progress.update(0, 1, "Reading full review history for FP16 and FP32")
+            policy = filtered_review_policy_from_config_values(
+                draft, fallback=filtered_review_normalization_policy_for_store(store),
+            )
+            data = load_review_data_from_collection(
+                col, store,
+                exclude_deleted_card_revlogs=bool(draft[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY]),
+                model_generation=configured_model_generation(draft),
+                filtered_review_normalization_policy=policy,
+            )
+            progress.check_cancelled()
+            return state_precision_comparison_plan(
+                data, model_id=configured_runtime_model_id(draft),
+                model_generation=configured_model_generation(draft),
+                process_many_mode=str(draft[PROCESS_MANY_MODE_CONFIG_KEY]),
+                predict_many_mode=predict_many_mode(draft),
+                predict_batch_size=predict_many_batch_size(draft),
+                calculate_curves=calculate_forgetting_curves(draft),
+                target_timestamp_ms=time.time_ns() // 1_000_000,
+                temporary_directory=store.cache_dir,
+            )
+
+        def compare(_col, progress, plan):
+            slot = None
+            try:
+                progress.check_cancelled()
+                slot = manager.reserve_runtime_slot(progress)
+                return run_state_precision_comparison(plan, progress)
+            finally:
+                if slot is not None:
+                    slot.close()
+
+        self._start_action(
+            "storage-test", title="Comparing FP16 and FP32 storage",
+            stages=[
+                ProgressStage(collect, uses_collection=True),
+                ProgressStage(compare, uses_collection=False),
+            ],
+            on_success=self._storage_test_succeeded,
+        )
+
+    def _storage_test_succeeded(self, result: StatePrecisionComparisonResult) -> None:
+        session = self._require_session()
+        session.storage_result = result
+        session.step = "storage-result"
+        current = state_precision(session.working_config)
+        other = "fp32" if current == "fp16" else "fp16"
+        body = SetupContent.report(state_precision_comparison_payload(
+            result, is_dark=widget_uses_dark_palette(self.dialog),
+        )) + (
+            f'<p class="setup-copy">Current storage: <strong>{current.upper()}</strong>. '
+            "No precision was selected automatically. Your choice below changes only "
+            "the Setup draft; switching precision requires rebuilding your checkpoint.</p>"
+        )
+        self._show(
+            "Accuracy tuning", "FP16 vs FP32 storage results", body,
+            self._buttons(
+                (f"Use {other.upper()}", f"use-storage-{other}", "secondary"),
+                (f"Keep {current.upper()}", f"use-storage-{current}", "primary"),
+            ),
+        )
+
+    def _choose_storage_precision(self, fp16: bool) -> None:
+        session = self._require_session()
+        if session.step != "storage-result" or session.storage_result is None:
+            raise ValueError("Complete the storage comparison before selecting a precision.")
+        session.working_config[USE_FP16_STATE_CONFIG_KEY] = fp16
+        self._show_summary()
+
+    def _generation_accuracy_disabled_reason(
+        self,
+        *,
+        require_multiple: bool,
+    ) -> str | None:
+        session = self._require_session()
+        if session.curves_enabled:
+            return (
+                "Unavailable because this setup enables RWKV Forgetting Curves, "
+                "which lock the generation to V1."
+            )
+        if require_multiple and len(self.generation_model_ids) < 2:
+            return "Unavailable because fewer than two RWKV generations are bundled."
+        return None
 
     def _show_model_test_intro(self) -> None:
         session = self._require_session()
@@ -1290,6 +1722,7 @@ class SetupWizardController:
                 col,
                 store,
                 exclude_deleted_card_revlogs=not include_deleted,
+                **self._history_generation_kwargs(),
             )
             reviewed_ids: set[int] = set()
             current_review_count = 0
@@ -1307,9 +1740,12 @@ class SetupWizardController:
                     if str(session.working_config.get(MODEL_CONFIG_KEY)) in self.model_ids
                     else self.model_ids[0]
                 ),
+                model_generation=configured_model_generation(session.working_config),
                 include_deleted_reviews=include_deleted,
                 current_review_count=current_review_count,
                 process_many_mode=self._selected_process_mode(),
+                state_precision=state_precision(session.working_config),
+                input_context=self._input_context_for_review_data(data),
             )
             progress.update(2, 2, "Model comparison ready")
             return _ComparisonInput(plan)
@@ -1326,14 +1762,14 @@ class SetupWizardController:
         session = self._require_session()
         session.model_result = result
         metrics = {measurement.key: measurement.metrics for measurement in result.measurements}
-        default_key = DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in metrics else self.model_ids[0]
+        default_key = self._default_model_id()
         selection = select_metric_winner(metrics, default_key=default_key)
         winner = selection.winner_key
         valid_keys = valid_metric_candidate_keys(metrics)
         session.working_config[MODEL_CONFIG_KEY] = winner
         session.step = "model-result"
         glossary = GlossaryRenderer("setup-model-result")
-        rows = "".join(
+        rows = list(
             self._result_row(
                 measurement.label,
                 self._metric_pair(measurement.metrics),
@@ -1370,7 +1806,8 @@ class SetupWizardController:
             callout_class = "success"
         body = (
             f'<div class="setup-callout {callout_class}">{selection_copy}</div>'
-            f'<div class="setup-results">{rows}</div>'
+            + SetupContent.results(rows)
+            +
             f'<p class="setup-copy">{glossary.render("Scores are compared as shown, to four decimal places. LogLoss is considered first; RMSE(bins) is a tiebreaker only when LogLoss is tied. Lower scores are better.")}</p>'
         )
         buttons = []
@@ -1386,8 +1823,188 @@ class SetupWizardController:
 
     def _skip_model_test(self) -> None:
         session = self._require_session()
-        session.working_config[MODEL_CONFIG_KEY] = (
-            DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in self.model_ids else self.model_ids[0]
+        session.working_config[MODEL_CONFIG_KEY] = self._default_model_id()
+        self._show_summary()
+
+    def _show_generation_test_intro(self) -> None:
+        if self._generation_accuracy_disabled_reason(require_multiple=True) is not None:
+            self._show_optimization_choices(self._require_session().optimization_counts)
+            return
+        session = self._require_session()
+        session.step = "generation-test"
+        glossary = GlossaryRenderer("setup-generation-comparison")
+        history_policy = (
+            "with deleted-card history"
+            if not bool(
+                session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY]
+            )
+            else "without deleted-card history"
+        )
+        candidates = ", ".join(
+            f"{model_generation_label(generation)} ({self._default_model_id_for_generation(generation)})"
+            for generation in self.generation_model_ids
+        )
+        body = (
+            f'<p class="setup-copy">{glossary.render("Setup will compare the default bundled model from each RWKV generation on a common current-card scoring set, using the selected deleted-card history setting. V5 preserves unscored initial answers.")}</p>'
+            f'<p class="setup-copy">Candidates: <strong>{html.escape(candidates)}</strong>, '
+            f"{html.escape(history_policy)}. Each runtime is released before "
+            "the next generation is tested.</p>"
+            f'<p class="setup-copy">{glossary.render("The generation with the lowest LogLoss shown to four decimal places wins. RMSE(bins) breaks a LogLoss tie; if both scores tie, Setup prefers V1. Lower scores are better.")}</p>'
+            + self._generation_retention_notice()
+        )
+        self._show(
+            "Accuracy tuning",
+            "Compare RWKV generations",
+            body,
+            self._buttons(
+                *(
+                    (f"Use {model_generation_label(g)}", f"choose-generation-{g}", "secondary")
+                    for g in self.generation_model_ids
+                ),
+                ("Compare Generations", "run-generation-test", "primary"),
+            ),
+        )
+
+    def _run_generation_test(self) -> None:
+        if self._generation_accuracy_disabled_reason(require_multiple=True) is not None:
+            self._show_optimization_choices(self._require_session().optimization_counts)
+            return
+        manager, store = self._manager_and_store()
+        session = self._require_session()
+        include_deleted = not bool(
+            session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY]
+        )
+
+        def collect(col, progress, _previous):
+            progress.update(0, 2, "Finding current cards")
+            current_ids = frozenset(int(card_id) for card_id in find_cards(col, ""))
+            progress.update(1, 2, "Reading review history for generation comparison")
+            data = load_review_data_from_collection(
+                col,
+                store,
+                exclude_deleted_card_revlogs=not include_deleted,
+            )
+            reviewed_ids: set[int] = set()
+            current_review_count = 0
+            for row in data.rows:
+                card_id = int(row["card_id"])
+                if card_id in current_ids:
+                    reviewed_ids.add(card_id)
+                    current_review_count += 1
+            plan = generation_comparison_plan(
+                rows=data.rows,
+                current_card_ids=reviewed_ids,
+                model_ids_by_generation=self.generation_model_ids,
+                current_model_generation=configured_model_generation(
+                    session.working_config
+                ),
+                include_deleted_reviews=include_deleted,
+                current_review_count=current_review_count,
+                process_many_mode=self._selected_process_mode(),
+                state_precision=state_precision(session.working_config),
+                v5o_review_data=self._collect_v5_comparison_data(
+                    col, store, include_deleted_reviews=include_deleted,
+                ),
+            )
+            progress.update(2, 2, "Generation comparison ready")
+            return _ComparisonInput(plan)
+
+        self._start_comparison_action(
+            "generation-test",
+            title="Comparing RWKV generations",
+            collect=collect,
+            on_success=self._generation_test_succeeded,
+            manager=manager,
+        )
+
+    def _generation_test_succeeded(
+        self,
+        result: ImmediateStateComparisonResult,
+    ) -> None:
+        session = self._require_session()
+        session.generation_result = result
+        metrics = {
+            measurement.key: measurement.metrics
+            for measurement in result.measurements
+        }
+        default_generation = self._recommended_generation()
+        default_measurement = next(
+            measurement
+            for measurement in result.measurements
+            if measurement.model_generation == default_generation
+        )
+        selection = select_metric_winner(
+            metrics,
+            default_key=default_measurement.key,
+        )
+        winner = result.measurement(selection.winner_key)
+        valid_keys = valid_metric_candidate_keys(metrics)
+        self._apply_generation_measurement(winner)
+        session.step = "generation-result"
+        rows = list(
+            self._result_row(
+                measurement.label,
+                self._metric_pair(measurement.metrics),
+                "Selected" if measurement.key == winner.key else "",
+                selected=measurement.key == winner.key,
+            )
+            for measurement in result.measurements
+        )
+        if not valid_keys:
+            selection_copy = (
+                "No generation produced usable metrics. Setup retained the recommended "
+                f"<strong>{html.escape(winner.label)}</strong>."
+            )
+            callout_class = "warning"
+        elif len(valid_keys) == 1:
+            selection_copy = (
+                f"Selected <strong>{html.escape(winner.label)}</strong>. It was the "
+                "only generation that produced usable metrics."
+            )
+            callout_class = "success"
+        else:
+            alternative = result.measurement(str(selection.comparison_key))
+            metric_changes = self._metric_change_summary(
+                winner.metrics,
+                alternative.metrics,
+            )
+            selection_copy = (
+                f"Selected <strong>{html.escape(winner.label)}</strong>. "
+                f"{self._metric_selection_reason(selection.reason)}<br>"
+                f"Compared with <strong>{html.escape(alternative.label)}</strong>, "
+                f"{html.escape(metric_changes)}."
+            )
+            callout_class = "success"
+        body = (
+            f'<div class="setup-callout {callout_class}">{selection_copy}</div>'
+            + SetupContent.results(rows)
+            +
+            '<p class="setup-copy">Scores are compared as shown, to four decimal '
+            "places. LogLoss is considered first; RMSE(bins) is a tiebreaker only "
+            "when LogLoss is tied. Lower scores are better.</p>"
+        )
+        buttons = []
+        if len(valid_keys) < len(metrics):
+            buttons.append(("Retry Comparison", "run-generation-test", "secondary"))
+        buttons.append(("Review Setup", "continue-generation-test", "primary"))
+        self._show(
+            "Accuracy tuning",
+            "RWKV generation selected",
+            body,
+            self._buttons(*buttons),
+        )
+
+    def _skip_generation_test(self) -> None:
+        session = self._require_session()
+        self._select_model_generation(
+            self._recommended_generation(),
+            use_default_model=True,
+        )
+        session.curves_enabled = False
+        session.working_config = apply_setup_feature_choices(
+            session.working_config,
+            immediate_enabled=self._effective_immediate_choice(),
+            curves_enabled=False,
         )
         self._show_summary()
 
@@ -1416,23 +2033,27 @@ class SetupWizardController:
         session = self._require_session()
 
         def collect(col, progress, _previous):
-            current_rows, all_rows, reviewed_ids, adjustment = (
+            current_rows, all_rows, reviewed_ids, adjustment, review_data = (
                 self._collect_deleted_history_comparison_rows(
                     col,
                     progress,
                     store,
+                    model_generation=configured_model_generation(session.working_config),
                 )
             )
             plan = deleted_review_comparison_plan(
                 current_rows=current_rows,
                 all_rows=all_rows,
                 current_card_ids=reviewed_ids,
-                model_id=str(session.working_config[MODEL_CONFIG_KEY]),
+                model_id=configured_runtime_model_id(session.working_config),
+                model_generation=configured_model_generation(session.working_config),
                 current_includes_deleted_reviews=not bool(
                     session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY]
                 ),
                 process_many_mode=self._selected_process_mode(),
+                state_precision=state_precision(session.working_config),
                 without_deleted_day_offset_adjustment=adjustment,
+                input_context=self._input_context_for_review_data(review_data),
             )
             progress.update(2, 2, "Deleted-history comparison ready")
             return _ComparisonInput(plan)
@@ -1446,7 +2067,7 @@ class SetupWizardController:
         )
 
     @staticmethod
-    def _collect_deleted_history_comparison_rows(col, progress, store):
+    def _collect_deleted_history_comparison_rows(col, progress, store, *, model_generation="v1"):
         progress.update(0, 2, "Finding current cards")
         current_ids = frozenset(int(card_id) for card_id in find_cards(col, ""))
         progress.update(1, 2, "Reading history including deleted cards")
@@ -1454,6 +2075,7 @@ class SetupWizardController:
             col,
             store,
             exclude_deleted_card_revlogs=False,
+            **({"model_generation": "v5o"} if model_generation == "v5o" else {}),
         )
         current_rows, adjustment = current_review_rows_from_included_history(
             data.rows,
@@ -1461,7 +2083,7 @@ class SetupWizardController:
             source_day_offset_origin=data.day_offset_origin,
         )
         reviewed_ids = frozenset(int(row["card_id"]) for row in current_rows)
-        return current_rows, data.rows, reviewed_ids, adjustment
+        return current_rows, data.rows, reviewed_ids, adjustment, data
 
     def _deleted_test_succeeded(self, result: ImmediateStateComparisonResult) -> None:
         session = self._require_session()
@@ -1483,7 +2105,7 @@ class SetupWizardController:
         size_without = result.measurement("without-deleted-reviews").expected_checkpoint_bytes
         size_with = result.measurement("with-deleted-reviews").expected_checkpoint_bytes
         size_text = self._checkpoint_size_comparison(size_without, size_with)
-        rows = "".join(
+        rows = list(
             self._result_row(
                 measurement.label,
                 self._metric_pair(measurement.metrics),
@@ -1522,7 +2144,8 @@ class SetupWizardController:
         body = (
             f'<div class="setup-callout {callout_class}">Selected <strong>{html.escape(selected.label)}</strong>. '
             f"{html.escape(improvement_text)}</div>"
-            f'<div class="setup-results">{rows}</div>'
+            + SetupContent.results(rows)
+            +
             f'<div class="setup-callout">{html.escape(size_text)}</div>'
             f'<p class="setup-copy">{glossary.render("Scores are compared as shown, to four decimal places. LogLoss is considered first; RMSE(bins) is a tiebreaker only when LogLoss is tied. Lower scores are better.")}</p>'
         )
@@ -1543,18 +2166,24 @@ class SetupWizardController:
         self._show_summary()
 
     def _show_matrix_test_intro(self) -> None:
+        if self._generation_accuracy_disabled_reason(require_multiple=False) is not None:
+            self._show_optimization_choices(self._require_session().optimization_counts)
+            return
         session = self._require_session()
         session.step = "matrix-test"
         glossary = GlossaryRenderer("setup-model-history-matrix")
-        combination_count = len(self.model_ids) * 2
+        combination_count = sum(
+            len(model_ids) * 2 for model_ids in self.generation_model_ids.values()
+        )
         body = (
             f'<p class="setup-copy">Setup will build and score all {combination_count:,} '
-            f"{glossary.render('combinations of bundled RWKV model and setting for deleted-card history. Each temporary state is discarded before the next combination is tested.')}</p>"
-            f'<p class="setup-copy">{glossary.render("The lowest LogLoss shown to four decimal places wins. RMSE(bins) breaks a LogLoss tie; if both metrics tie, the smaller expected checkpoint wins. If every value still ties, Setup prefers the default model without deleted-card history.")}</p>'
+            f"{glossary.render('valid combinations of RWKV generation, its bundled RWKV models, and the setting for deleted-card history. Models are tested only with the generation they belong to. Each runtime is released before the next combination is tested.')}</p>"
+            f'<p class="setup-copy">{glossary.render("The lowest LogLoss shown to four decimal places wins. RMSE(bins) breaks a LogLoss tie; if both metrics tie, the smaller expected checkpoint wins. If every value still ties, Setup prefers V1’s default model without deleted-card history.")}</p>'
+            + self._generation_retention_notice()
         )
         self._show(
             "Accuracy tuning",
-            "Test all model and history combinations",
+            "Test all generation, model, and history combinations",
             body,
             self._buttons(
                 ("Skip and Use Defaults", "skip-matrix-test", "secondary"),
@@ -1563,42 +2192,50 @@ class SetupWizardController:
         )
 
     def _run_matrix_test(self) -> None:
+        if self._generation_accuracy_disabled_reason(require_multiple=False) is not None:
+            self._show_optimization_choices(self._require_session().optimization_counts)
+            return
         manager, store = self._manager_and_store()
         session = self._require_session()
 
         def collect(col, progress, _previous):
-            current_rows, all_rows, reviewed_ids, adjustment = (
+            current_rows, all_rows, reviewed_ids, adjustment, review_data = (
                 self._collect_deleted_history_comparison_rows(
                     col,
                     progress,
                     store,
                 )
             )
+            selected_generation = configured_model_generation(session.working_config)
+            selected_models = self._model_ids_for_generation(selected_generation)
             selected_model = str(session.working_config.get(MODEL_CONFIG_KEY))
-            if selected_model not in self.model_ids:
-                selected_model = (
-                    DEFAULT_MODEL_ID
-                    if DEFAULT_MODEL_ID in self.model_ids
-                    else self.model_ids[0]
+            if selected_model not in selected_models:
+                selected_model = self._default_model_id_for_generation(
+                    selected_generation
                 )
-            plan = model_deleted_review_matrix_plan(
+            plan = generation_model_deleted_review_matrix_plan(
                 current_rows=current_rows,
                 all_rows=all_rows,
                 current_card_ids=reviewed_ids,
-                model_ids=self.model_ids,
+                model_ids_by_generation=self.generation_model_ids,
+                current_model_generation=selected_generation,
                 current_model_id=selected_model,
                 current_includes_deleted_reviews=not bool(
                     session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY]
                 ),
                 process_many_mode=self._selected_process_mode(),
+                state_precision=state_precision(session.working_config),
                 without_deleted_day_offset_adjustment=adjustment,
+                v5o_review_data=self._collect_v5_comparison_data(
+                    col, store, include_deleted_reviews=True,
+                ),
             )
             progress.update(2, 2, "Full accuracy comparison ready")
             return _ComparisonInput(plan)
 
         self._start_comparison_action(
             "matrix-test",
-            title="Testing every model and history combination",
+            title="Testing every generation, model, and history combination",
             collect=collect,
             on_success=self._matrix_test_succeeded,
             manager=manager,
@@ -1616,17 +2253,12 @@ class SetupWizardController:
             measurement.key: measurement.expected_checkpoint_bytes
             for measurement in result.measurements
         }
-        default_model = (
-            DEFAULT_MODEL_ID
-            if any(
-                measurement.model_id == DEFAULT_MODEL_ID
-                for measurement in result.measurements
-            )
-            else self.model_ids[0]
-        )
+        default_generation = self._recommended_generation()
+        default_model = self._default_model_id_for_generation(default_generation)
         default_measurement = next(
             measurement
             for measurement in result.measurements
+            if measurement.model_generation == default_generation
             if measurement.model_id == default_model
             and not measurement.include_deleted_reviews
         )
@@ -1637,11 +2269,11 @@ class SetupWizardController:
         )
         winner = result.measurement(selection.winner_key)
         valid_keys = valid_metric_candidate_keys(metrics)
-        session.working_config[MODEL_CONFIG_KEY] = winner.model_id
+        self._apply_generation_measurement(winner)
         session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY] = (
             not winner.include_deleted_reviews
         )
-        rows = "".join(
+        rows = list(
             self._result_row(
                 measurement.label,
                 self._metric_pair(measurement.metrics),
@@ -1653,7 +2285,7 @@ class SetupWizardController:
         if not valid_keys:
             selection_copy = (
                 "No combination produced usable metrics. Setup retained the default "
-                "model without deleted-card history."
+                "V1 model without deleted-card history."
             )
             callout_class = "warning"
         elif len(valid_keys) == 1:
@@ -1677,7 +2309,8 @@ class SetupWizardController:
             callout_class = "success"
         body = (
             f'<div class="setup-callout {callout_class}">{selection_copy}</div>'
-            f'<div class="setup-results">{rows}</div>'
+            + SetupContent.results(rows)
+            +
             '<p class="setup-copy">Scores are compared as shown, to four decimal '
             "places. Lower scores are better. Checkpoint size is considered only "
             "after both displayed metrics tie.</p>"
@@ -1688,18 +2321,38 @@ class SetupWizardController:
         buttons.append(("Review Setup", "continue-matrix-test", "primary"))
         self._show(
             "Accuracy tuning",
-            "Model and history selected",
+            "Generation, model, and history selected",
             body,
             self._buttons(*buttons),
         )
 
     def _skip_matrix_test(self) -> None:
         session = self._require_session()
-        session.working_config[MODEL_CONFIG_KEY] = (
-            DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in self.model_ids else self.model_ids[0]
+        self._select_model_generation(
+            self._recommended_generation(),
+            use_default_model=True,
+        )
+        session.curves_enabled = False
+        session.working_config = apply_setup_feature_choices(
+            session.working_config,
+            immediate_enabled=self._effective_immediate_choice(),
+            curves_enabled=False,
         )
         session.working_config[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY] = True
         self._show_summary()
+
+    def _generation_retention_notice(self) -> str:
+        from ..addon_config import retain_multiple_model_generations
+
+        if retain_multiple_model_generations(self._require_session().working_config):
+            return (
+                '<p class="setup-copy">Retain Multiple Model Generations is on. Successful '
+                'generation comparisons save one checkpoint and Immediate evaluation cache '
+                'per generation; Test All keeps the best candidate in each generation. '
+                'These replace previous checkpoints and remain even if you abandon Setup. '
+                'V1 curve features require rebuilding with curves enabled.</p>'
+            )
+        return '<p class="setup-copy">Comparison states are temporary; no checkpoints are saved.</p>'
 
     def _start_comparison_action(
         self,
@@ -1717,12 +2370,19 @@ class SetupWizardController:
             )
             return
 
+        from ..addon_config import retain_multiple_model_generations
+
+        retain_generations = retain_multiple_model_generations(self._require_session().working_config)
+
         def compare(_col, progress, previous):
             input_data: _ComparisonInput = previous
             slot = None
             try:
                 slot = manager.reserve_runtime_slot(progress)
-                return run_immediate_state_comparison(input_data.plan, progress)
+                return run_immediate_state_comparison(
+                    input_data.plan, progress,
+                    **({"retention_store": manager.store} if retain_generations else {}),
+                )
             finally:
                 input_data.release_rows()
                 if slot is not None:
@@ -1769,7 +2429,7 @@ class SetupWizardController:
                 "nothing is saved until you choose <strong>Apply</strong> or <strong>OK</strong>.</p>"
             )
             finish_label = "Use These Settings"
-        body = introduction + changes + notices + render_setup_faq_link()
+        body = introduction + changes + notices + SetupContent.faq_link()
         self._show(
             "Step 4 of 4",
             "Review setup",
@@ -1882,18 +2542,19 @@ class SetupWizardController:
             introduction = (
                 '<p class="setup-copy">You can copy the choices made so far to the main '
                 "Settings page, discard every Guided Setup change, or return to the wizard. "
-                "Nothing is saved until you later choose <strong>Apply</strong> or "
+                "Settings are saved when you later choose <strong>Apply</strong> or "
                 "<strong>OK</strong>.</p>"
             )
             keep_label = "Keep Changes and Exit"
         body = (
             introduction
+            + self._generation_retention_notice()
             + self._change_list(summary.changes)
             + self._summary_notices(
                 summary,
                 checkpoint_exists=self.dialog._checkpoint_exists(),
             )
-            + render_setup_faq_link()
+            + SetupContent.faq_link()
         )
         self._show(
             "Exit setup",
@@ -1970,26 +2631,23 @@ class SetupWizardController:
         self._action_name = action_name
         self._action_generation += 1
         generation = self._action_generation
-        self._progress_sequence = 0
-        self._last_progress_sequence = 0
 
-        def progress_callback(current: int, total: int, label: str, eta: float | None):
-            self._progress_sequence += 1
-            sequence = self._progress_sequence
+        def apply_progress(current: int, total: int, label: str, eta: float | None):
+            if (
+                self._shutting_down
+                or generation != self._action_generation
+                or self._reporter is None
+                or self._reporter.cancelled
+            ):
+                return
+            self._eval_progress(current, total, label, eta)
 
-            def apply() -> None:
-                if (
-                    self._shutting_down
-                    or generation != self._action_generation
-                    or sequence <= self._last_progress_sequence
-                ):
-                    return
-                self._last_progress_sequence = sequence
-                self._eval_progress(current, total, label, eta)
-
-            self._mw.taskman.run_on_main(apply)
-
-        reporter = TimedProgressReporter(progress_callback)
+        callback = CoalescedProgressCallback(
+            apply_progress,
+            schedule=lambda apply: self._mw.taskman.run_on_main(apply),
+        )
+        self._progress_callback = callback
+        reporter = TimedProgressReporter(callback)
         self._reporter = reporter
         self._render_progress(title)
 
@@ -2044,18 +2702,15 @@ class SetupWizardController:
     def _finish_action(self, generation: int) -> bool:
         if generation != self._action_generation or self._reporter is None:
             return False
+        if self._progress_callback is not None:
+            self._progress_callback.close()
+            self._progress_callback = None
         self._reporter = None
         self._action_name = None
         return not self._shutting_down and self.session is not None
 
     def _render_progress(self, title: str) -> None:
-        body = (
-            '<div class="setup-progress-wrap">'
-            '<div class="setup-progress-track indeterminate" id="rwkv-setup-progress-track" role="progressbar" aria-label="Setup progress" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">'
-            '<div class="setup-progress-bar" id="rwkv-setup-progress-bar"></div></div>'
-            '<div class="setup-progress-label" id="rwkv-setup-progress-label" aria-live="polite">Preparing…</div>'
-            '<div class="setup-progress-meta"><span id="rwkv-setup-progress-count">Working…</span><span id="rwkv-setup-progress-eta">ETA unknown</span></div>'
-            "</div>"
+        body = SetupContent(({"kind": "progress"},)) + (
             '<p class="setup-copy">Cancellation is checked between processing chunks and '
             "short speed-test runs. Reading Anki's exported history may need to finish "
             "its current operation before cancellation completes.</p>"
@@ -2098,7 +2753,12 @@ class SetupWizardController:
         session.step = f"interrupted:{action_name}"
         session.interruption_message = str(message)
         session.interruption_retryable = bool(retryable)
+        storage_comparison = action_name == "storage-test"
         guidance = (
+            '<p class="setup-copy">You can rerun this comparison or keep the current '
+            "storage precision and continue. No partial result or setting change "
+            "has been applied.</p>"
+            if storage_comparison else
             '<p class="setup-copy">You can rerun this step, or use the recommended '
             "defaults for it and continue. No partial measurement has been applied.</p>"
             if retryable
@@ -2109,9 +2769,13 @@ class SetupWizardController:
         buttons = [("Exit Setup", "exit", "secondary")]
         if retryable:
             buttons.append(("Run Again", "retry", "secondary"))
-        buttons.append(("Use Defaults and Continue", "skip-current", "primary"))
+        buttons.append((
+            "Keep Current Storage and Continue" if storage_comparison else "Use Defaults and Continue",
+            "skip-current", "primary",
+        ))
         self._show(
             "Test interrupted",
+            "Rerun or keep current storage" if storage_comparison else
             "Rerun or continue with defaults" if retryable else "Continue with defaults",
             body,
             self._buttons(*buttons),
@@ -2125,8 +2789,10 @@ class SetupWizardController:
             "process-performance": lambda: self._run_performance(include_predictions=False),
             "curve-test": self._run_curve_test,
             "model-test": self._run_model_test,
+            "generation-test": self._run_generation_test,
             "deleted-test": self._run_deleted_test,
             "matrix-test": self._run_matrix_test,
+            "storage-test": self._run_storage_test,
         }.get(action, self._show_summary)()
 
     def _skip_current_action(self) -> None:
@@ -2137,8 +2803,10 @@ class SetupWizardController:
             "process-performance": self._skip_process_performance,
             "curve-test": self._skip_curve_test,
             "model-test": self._skip_model_test,
+            "generation-test": self._skip_generation_test,
             "deleted-test": self._skip_deleted_test,
             "matrix-test": self._skip_matrix_test,
+            "storage-test": self._show_summary,
         }.get(action, self._show_summary)()
 
     # ------------------------------------------------------------------
@@ -2198,6 +2866,11 @@ class SetupWizardController:
                 self._model_test_succeeded(session.model_result)
             else:
                 self._show_model_test_intro()
+        elif step in {"generation-test", "generation-result"}:
+            if step == "generation-result" and session.generation_result is not None:
+                self._generation_test_succeeded(session.generation_result)
+            else:
+                self._show_generation_test_intro()
         elif step in {"deleted-test", "deleted-result"}:
             if step == "deleted-result" and session.deleted_result is not None:
                 self._deleted_test_succeeded(session.deleted_result)
@@ -2208,6 +2881,11 @@ class SetupWizardController:
                 self._matrix_test_succeeded(session.matrix_result)
             else:
                 self._show_matrix_test_intro()
+        elif step in {"storage-test", "storage-result"}:
+            if step == "storage-result" and session.storage_result is not None:
+                self._storage_test_succeeded(session.storage_result)
+            else:
+                self._show_storage_test_intro()
         elif step == "summary":
             self._show_summary()
         elif step == "neither":
@@ -2227,19 +2905,20 @@ class SetupWizardController:
         self,
         step: str,
         title: str,
-        body: str,
-        footer: str = "",
+        body: SetupContent | str,
+        footer: list[dict[str, Any]] | None = None,
         *,
         busy: bool = False,
         show_close_button: bool = True,
     ) -> None:
+        footer = list(footer or ())
         if not busy and self._back_is_available():
             footer = self._buttons(("Back", "back", "quiet")) + footer
         payload = {
             "step": str(step),
             "title": str(title),
-            "body": str(body),
-            "footer": str(footer),
+            "content": SetupContent.coerce(body).payload(),
+            "actions": footer,
             "busy": bool(busy),
             "showCloseButton": bool(show_close_button and not busy),
         }
@@ -2252,9 +2931,9 @@ class SetupWizardController:
         result: _PerformanceResult,
         *,
         include_predictions: bool,
-    ) -> str:
+    ) -> SetupContent:
         glossary = GlossaryRenderer("setup-performance-result")
-        process_rows = "".join(
+        process_rows = list(
             self._result_row(
                 f"{self._mode_label(item.mode)} state building",
                 "Failed" if not item.succeeded else self._format_duration(item.average_seconds),
@@ -2297,10 +2976,10 @@ class SetupWizardController:
             + " ".join(sample_context)
             + "</div>",
             f'<div class="setup-callout success">Selected <strong>{selected_process_mode}</strong> for {glossary.render("State Building")}.</div>',
-            f'<div class="setup-results">{process_rows}</div>',
+            SetupContent.results(process_rows),
         ]
         if include_predictions and result.prediction is not None:
-            prediction_rows = "".join(
+            prediction_rows = list(
                 self._result_row(
                     f"{self._mode_label(item.mode)} Live Session cycle",
                     "Failed" if not item.succeeded else self._format_duration(item.average_seconds),
@@ -2317,7 +2996,7 @@ class SetupWizardController:
             sections.extend(
                 (
                     f'<div class="setup-callout success">Selected <strong>{glossary.render(self._mode_label(result.prediction.selected_mode))}</strong> for Live Session predictions.</div>',
-                    f'<div class="setup-results">{prediction_rows}</div>',
+                    SetupContent.results(prediction_rows),
                 )
             )
         if include_predictions and result.refresh_search is not None:
@@ -2334,7 +3013,7 @@ class SetupWizardController:
                 '<div class="setup-callout warning">No reviewed cards were available for '
                 "prediction tuning, so the recommended default prediction settings remain in use.</div>"
             )
-        return "".join(sections)
+        return SetupContent.join(sections)
 
     def _render_inline_error(
         self,
@@ -2351,7 +3030,7 @@ class SetupWizardController:
             self._buttons(("Exit Setup", "exit", "secondary"), ("Try Again", "retry", "primary")),
         )
 
-    def _buttons(self, *buttons: tuple[str, str, str]) -> str:
+    def _buttons(self, *buttons: tuple[str, str, str]) -> list[dict[str, Any]]:
         speed_tests_unavailable_reason = (
             self.session.speed_tests_unavailable_reason if self.session else None
         )
@@ -2375,54 +3054,40 @@ class SetupWizardController:
             raise ValueError("Setup Wizard footers may only have one primary action")
         if primary_indices and primary_indices[0] != len(normalized_buttons) - 1:
             raise ValueError("The Setup Wizard primary action must be the rightmost footer button")
-        rendered: list[str] = []
-        for label, event, kind, disabled_reason in normalized_buttons:
-            variant = {
-                "primary": "primary",
-                "danger": "destructive",
-                "quiet": "quiet",
-            }.get(kind, "secondary")
-            classes = f"rwkv-button rwkv-button--{variant}"
-            if event == "back":
-                classes += " setup-back-button"
-            initial_focus = (
-                " data-setup-initial-focus" if kind == "primary" and disabled_reason is None else ""
-            )
-            escaped_event = html.escape(event, quote=True)
-            disabled = ' disabled aria-disabled="true"' if disabled_reason is not None else ""
-            button = (
-                f'<button type="button" class="{classes}" '
-                f'data-setup-event="{escaped_event}"{initial_focus}{disabled}>'
-                f"{html.escape(label)}</button>"
-            )
-            if disabled_reason is not None:
-                escaped_label = html.escape(label, quote=True)
-                escaped_reason = html.escape(disabled_reason, quote=True)
-                button = (
-                    '<span class="rwkv-disabled-control-help rwkv-help-surface" '
-                    f'tabindex="0" aria-label="{escaped_label}. {escaped_reason}" '
-                    f'data-rwkv-tooltip="{escaped_reason}">{button}</span>'
-                )
-            rendered.append(button)
-        return "".join(rendered)
+        return [
+            {
+                "label": label,
+                "event": event,
+                "variant": {
+                    "primary": "primary", "danger": "destructive", "quiet": "quiet",
+                }.get(kind, "secondary"),
+                "initialFocus": kind == "primary" and disabled_reason is None,
+                "disabledReason": disabled_reason,
+                "back": event == "back",
+            }
+            for label, event, kind, disabled_reason in normalized_buttons
+        ]
 
     @staticmethod
     def _choice_grid(
-        choices: Sequence[tuple[str, str, str]],
+        choices: Sequence[
+            tuple[str, str, str] | tuple[str, str, str, str | None]
+        ],
         *,
         initial_focus_event: str | None = None,
-    ) -> str:
-        rendered: list[str] = []
-        for title, description, event in choices:
-            initial_focus = " data-setup-initial-focus" if event == initial_focus_event else ""
-            rendered.append(
-                '<button type="button" class="setup-choice" '
-                f'data-setup-event="{html.escape(event, quote=True)}"'
-                f"{initial_focus}>"
-                f"<strong>{html.escape(title)}</strong>"
-                f"<span>{html.escape(description)}</span></button>"
-            )
-        return '<div class="setup-choice-grid">' + "".join(rendered) + "</div>"
+    ) -> SetupContent:
+        return SetupContent(({
+            "kind": "choices",
+            "choices": [
+                {
+                    "title": choice[0], "description": choice[1], "event": choice[2],
+                    "disabledReason": choice[3] if len(choice) == 4 else None,
+                    "initialFocus": choice[2] == initial_focus_event
+                    and (len(choice) < 4 or choice[3] is None),
+                }
+                for choice in choices
+            ],
+        },))
 
     @staticmethod
     def _result_row(
@@ -2431,27 +3096,20 @@ class SetupWizardController:
         detail: str = "",
         *,
         selected: bool = False,
-    ) -> str:
-        selected_class = " setup-selected" if selected else ""
-        selected_text = " · selected" if selected else ""
-        return (
-            '<div class="setup-result-row">'
-            f'<div class="{selected_class.strip()}"><strong>{html.escape(label)}</strong>'
-            f"<small>{html.escape(detail)}{html.escape(selected_text)}</small></div>"
-            f'<div class="setup-result-value{selected_class}">{html.escape(value)}</div>'
-            "</div>"
-        )
+    ) -> dict[str, Any]:
+        return {
+            "label": label, "value": value, "detail": detail, "selected": bool(selected),
+        }
 
     @staticmethod
-    def _change_list(changes) -> str:
+    def _change_list(changes) -> SetupContent | str:
         if not changes:
             return '<div class="setup-callout">No settings differ from when setup started.</div>'
         glossary = GlossaryRenderer("setup-change-list")
-        return (
-            '<ul class="setup-change-list">'
-            + "".join(f"<li>{glossary.render(change.description)}</li>" for change in changes)
-            + "</ul>"
-        )
+        return SetupContent(({
+            "kind": "changes",
+            "items": [glossary.render(change.description) for change in changes],
+        },))
 
     @staticmethod
     def _summary_notices(summary, *, checkpoint_exists: bool) -> str:
@@ -2464,7 +3122,7 @@ class SetupWizardController:
             else '<div class="setup-callout success">No Anki restart is required by these changes.</div>'
         )
         rebuild = (
-            f'<div class="setup-callout warning"><strong>{glossary.render("Rebuild the checkpoint after applying:")}</strong><ul class="setup-change-list">'
+            f'<div class="setup-callout warning"><strong>{glossary.render("Check checkpoint compatibility after applying:")}</strong><p>Each generation reuses its own saved checkpoint when the model, history policy and required caches match. Otherwise, initialize or rebuild from Manage Checkpoint.</p><ul class="setup-change-list">'
             + "".join(
                 f"<li>{glossary.render(reason.explanation)}</li>"
                 for reason in summary.checkpoint_rebuild_reasons
@@ -2558,7 +3216,7 @@ class SetupWizardController:
 
     @staticmethod
     def _mode_label(mode: str) -> str:
-        return "GPU" if str(mode).lower() == "gpu" else str(mode).title()
+        return prediction_mode_label(mode)
 
     @staticmethod
     def _format_storage(value: int | None) -> str:
@@ -2644,6 +3302,22 @@ class SetupWizardController:
         from ..runtime import manager_for_mw, store_for_mw
 
         return manager_for_mw(self._mw), store_for_mw(self._mw)
+
+    def _input_context_for_review_data(self, review_data) -> RuntimeInputContext | None:
+        generation = self._require_session().working_config.get(MODEL_GENERATION_CONFIG_KEY)
+        return input_context_for_generation(review_data, generation)
+
+    def _history_generation_kwargs(self) -> dict[str, str]:
+        generation = configured_model_generation(self._require_session().working_config)
+        return {"model_generation": generation} if generation == "v5o" else {}
+
+    def _collect_v5_comparison_data(self, col, store, *, include_deleted_reviews: bool):
+        if "v5o" not in self.generation_model_ids:
+            return None
+        return load_review_data_from_collection(
+            col, store, exclude_deleted_card_revlogs=not include_deleted_reviews,
+            model_generation="v5o",
+        )
 
     def _rwkv_busy(self) -> bool:
         manager, _store = self._manager_and_store()

@@ -55,12 +55,20 @@ _FIELD_KINDS = frozenset(
         "time",
         "datetime-local",
         "select",
+        "multiselect",
         "checkbox",
         "switch",
         "textarea",
+        "code",
     }
 )
 _BUTTON_VARIANTS = frozenset({"primary", "secondary", "quiet", "destructive"})
+_BUTTON_ICONS = {
+    "edit": "m16 3 5 5-12 12-6 1 1-6L16 3Zm-2 2 5 5M4 15l5 5",
+    "trash": "M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7",
+    "code": "m7 6-5 6 5 6m10-12 5 6-5 6M14 3l-4 18",
+    "refresh": "M20 7v5h-5M4 17v-5h5M6.1 6.1a8 8 0 0 1 13.4 3.1M17.9 17.9a8 8 0 0 1-13.4-3.1",
+}
 _NOTICE_TONES = frozenset({"info", "success", "warning", "error"})
 _STATUS_STATES = frozenset({"empty", "loading", "disabled", "error", "success"})
 _BADGE_TONES = frozenset({"neutral", "accent", "success", "warning", "error"})
@@ -86,6 +94,7 @@ class ModalButton:
     tooltip: str | None = None
     form_no_validate: bool = False
     aria_label: str | None = None
+    icon: Literal["edit", "trash", "code", "refresh"] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,11 +155,13 @@ class ModalField:
         "time",
         "datetime-local",
         "select",
+        "multiselect",
         "checkbox",
         "switch",
         "textarea",
+        "code",
     ] = "text"
-    value: str | int | float = ""
+    value: str | int | float | Sequence[str] = ""
     description: str | None = None
     tooltip: str | None = None
     options: Sequence[FieldOption] = ()
@@ -166,7 +177,10 @@ class ModalField:
     change_serialize_form: bool = False
     enter_action: str | None = None
     enable_fields: Sequence[str] = ()
+    check_all_fields: Sequence[str] = ()
+    exclusive_with: str | None = None
     initial_focus: bool = False
+    serialize: bool = True
 
 
 @dataclass(frozen=True)
@@ -380,9 +394,7 @@ def render_card(
         f'<h3 class="rwkv-card-title">{html.escape(title)}</h3>' if title is not None else ""
     )
     label_attribute = (
-        f' aria-label="{html.escape(aria_label, quote=True)}"'
-        if aria_label is not None
-        else ""
+        f' aria-label="{html.escape(aria_label, quote=True)}"' if aria_label is not None else ""
     )
     classes = _validated_classes(("rwkv-card", *extra_classes), "card class")
     return (
@@ -482,7 +494,20 @@ def render_button(button: ModalButton) -> str:
         attributes.append("data-rwkv-overlay-cancel")
     if button.serialize_form:
         attributes.append("data-rwkv-serialize-form")
-    return f"<button {' '.join(attributes)}>{html.escape(button.label)}</button>"
+    content = html.escape(button.label)
+    if button.icon is not None:
+        _require_member(button.icon, _BUTTON_ICONS, "button icon")
+        if not (button.aria_label or button.label).strip():
+            raise ValueError("icon buttons require an accessible label")
+        content = (
+            f'<svg class="rwkv-button__icon" data-rwkv-icon="{button.icon}" '
+            'width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false" '
+            'fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            f'<path d="{_BUTTON_ICONS[button.icon]}" /></svg>'
+            f'<span class="rwkv-sr-only">{content}</span>'
+        )
+    return f"<button {' '.join(attributes)}>{content}</button>"
 
 
 def render_button_group(group: ModalButtonGroup) -> str:
@@ -623,9 +648,7 @@ def render_disclosure(disclosure: ModalDisclosure, panel_html: str) -> str:
         f'role="{disclosure.panel_role}"',
     ]
     if disclosure.panel_label is not None:
-        panel_attributes.append(
-            f'aria-label="{html.escape(disclosure.panel_label, quote=True)}"'
-        )
+        panel_attributes.append(f'aria-label="{html.escape(disclosure.panel_label, quote=True)}"')
     else:
         panel_attributes.append(f'aria-labelledby="{html.escape(button_id, quote=True)}"')
     if disclosure.panel_tabindex is not None:
@@ -640,10 +663,10 @@ def render_disclosure(disclosure: ModalDisclosure, panel_html: str) -> str:
         f"{html.escape(visible_label)}</span>"
     )
     return (
-        f'<button {" ".join(button_attributes)}>{label_markup}'
+        f"<button {' '.join(button_attributes)}>{label_markup}"
         '<span class="rwkv-inline-disclosure__indicator" aria-hidden="true">▸</span>'
         "</button>"
-        f'<div {" ".join(panel_attributes)}>{panel_html}</div>'
+        f"<div {' '.join(panel_attributes)}>{panel_html}</div>"
     )
 
 
@@ -664,14 +687,17 @@ def render_field(field: ModalField) -> str:
     )
     is_choice = field.kind in {"checkbox", "switch"}
     common = _field_common_attributes(field, description_id=description_id)
+    name_attr = f' name="{html.escape(field.name, quote=True)}"' if field.serialize else ""
     tooltip = f" {_tooltip_data_attribute(field.tooltip)}" if field.tooltip else ""
+    if tooltip and field.disabled:
+        tooltip += ' tabindex="0"'
     if is_choice:
         control_class = "rwkv-switch" if field.kind == "switch" else "rwkv-checkbox"
         checked = " checked" if field.checked else ""
         label_tooltip = tooltip
         control = (
             f'<label class="{control_class}" for="{field_id}">'
-            f'<input id="{field_id}" name="{html.escape(field.name, quote=True)}" '
+            f'<input id="{field_id}"{name_attr} '
             f'type="checkbox"{checked}{common}>'
             + (
                 '<span class="rwkv-switch__track" aria-hidden="true"></span>'
@@ -687,38 +713,42 @@ def render_field(field: ModalField) -> str:
         f'<label class="rwkv-field__label" for="{field_id}"{tooltip}>'
         f"{html.escape(field.label)}</label>"
     )
-    if field.kind == "select":
-        selected_value = str(field.value)
+    if field.kind in ("select", "multiselect"):
+        multiple = field.kind == "multiselect"
+        selected_values = set(field.value) if multiple else {str(field.value)}
         options = []
         for option in field.options:
-            selected = " selected" if option.value == selected_value else ""
+            selected = " selected" if option.value in selected_values else ""
             disabled = " disabled" if option.disabled else ""
             options.append(
                 f'<option value="{html.escape(option.value, quote=True)}"{selected}{disabled}>'
                 f"{html.escape(option.label)}</option>"
             )
+        list_attributes = f' multiple size="{max(2, int(field.rows))}"' if multiple else ""
         control = (
-            f'<select class="rwkv-field__control" id="{field_id}" '
-            f'name="{html.escape(field.name, quote=True)}"{common}>{"".join(options)}</select>'
+            f'<select class="rwkv-field__control" id="{field_id}"'
+            f"{name_attr}{common}{list_attributes}>{''.join(options)}</select>"
         )
-    elif field.kind == "textarea":
+    elif field.kind in ("textarea", "code"):
         rows = max(1, int(field.rows))
+        code_class = " rwkv-field__control--code" if field.kind == "code" else ""
+        code_attributes = (
+            ' spellcheck="false" autocapitalize="off" wrap="off"' if field.kind == "code" else ""
+        )
         control = (
-            f'<textarea class="rwkv-field__control" id="{field_id}" '
-            f'name="{html.escape(field.name, quote=True)}" rows="{rows}"{common}>'
+            f'<textarea class="rwkv-field__control{code_class}" id="{field_id}"'
+            f'{name_attr} rows="{rows}"{common}{code_attributes}>'
             f"{html.escape(str(field.value))}</textarea>"
         )
     elif field.kind == "number":
         control = render_number_input(field)
     else:
         extra = (
-            _numeric_attributes(field)
-            if field.kind in {"date", "time", "datetime-local"}
-            else ""
+            _numeric_attributes(field) if field.kind in {"date", "time", "datetime-local"} else ""
         )
         control = (
-            f'<input class="rwkv-field__control" id="{field_id}" '
-            f'name="{html.escape(field.name, quote=True)}" type="{field.kind}" '
+            f'<input class="rwkv-field__control" id="{field_id}"'
+            f'{name_attr} type="{field.kind}" '
             f'value="{html.escape(str(field.value), quote=True)}"{extra}{common}>'
         )
     return f'<div class="rwkv-field">{label}{control}{description}</div>'
@@ -734,19 +764,20 @@ def render_number_input(
 
     if field.kind != "number":
         raise ValueError("render_number_input requires a number field")
-    field_id = _field_id(field.name) if control_id is None else _require_html_id(
-        control_id, "field ID"
+    field_id = (
+        _field_id(field.name) if control_id is None else _require_html_id(control_id, "field ID")
     )
     description_id = f"{field_id}-description"
     common = _field_common_attributes(field, description_id=description_id)
+    name_attr = f' name="{html.escape(field.name, quote=True)}"' if field.serialize else ""
     data_markup = ""
     for name, value in (data_attributes or {}).items():
         if not re.fullmatch(r"data-[a-z][a-z0-9-]*", name):
             raise ValueError(f"invalid numeric input data attribute: {name!r}")
         data_markup += f' {name}="{html.escape(str(value), quote=True)}"'
     return (
-        f'<input class="rwkv-field__control" id="{html.escape(field_id, quote=True)}" '
-        f'name="{html.escape(field.name, quote=True)}" type="number" '
+        f'<input class="rwkv-field__control" id="{html.escape(field_id, quote=True)}"'
+        f'{name_attr} type="number" '
         f'value="{html.escape(str(field.value), quote=True)}"'
         f"{_numeric_attributes(field)}{common}{data_markup}>"
     )
@@ -1004,6 +1035,19 @@ def _field_common_attributes(
             raise ValueError("enable_fields requires a checkbox or switch")
         target_ids = ",".join(_field_id(name) for name in field.enable_fields)
         attributes.append(f'data-rwkv-enable-targets="{html.escape(target_ids, quote=True)}"')
+    if field.check_all_fields:
+        if field.kind != "checkbox" or field.serialize:
+            raise ValueError("check_all_fields requires a non-serialized checkbox")
+        if field.name in field.check_all_fields:
+            raise ValueError("check_all_fields cannot target itself")
+        target_ids = ",".join(_field_id(name) for name in field.check_all_fields)
+        attributes.append(f'data-rwkv-check-all-targets="{html.escape(target_ids, quote=True)}"')
+    if field.exclusive_with:
+        if field.kind not in {"checkbox", "switch", "text"}:
+            raise ValueError("exclusive_with requires a checkbox, switch or text field")
+        attributes.append(
+            f'data-rwkv-exclusive-with="{html.escape(_field_id(field.exclusive_with), quote=True)}"'
+        )
     if field.initial_focus:
         attributes.extend(("data-rwkv-initial-focus", "autofocus"))
     return (" " + " ".join(attributes)) if attributes else ""

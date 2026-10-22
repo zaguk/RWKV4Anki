@@ -14,6 +14,7 @@ from .svg_chart import (
     render_chart_tooltip,
     render_count_y_ticks,
     render_empty_chart_state,
+    render_model_comparison_legend,
     render_percent_x_ticks,
     render_percent_y_ticks,
     render_plot_background,
@@ -71,9 +72,7 @@ def calibration_graph_model(summary: CalibrationSummary) -> CalibrationGraphMode
         predicted = finite_number_or_none(bucket.predicted_average)
         actual = finite_number_or_none(bucket.actual_average)
         if predicted is not None and actual is not None:
-            line_points.append(
-                (GEOMETRY.x_for_unit(predicted), GEOMETRY.y_for_unit(actual))
-            )
+            line_points.append((GEOMETRY.x_for_unit(predicted), GEOMETRY.y_for_unit(actual)))
         bins.append(
             CalibrationGraphBin(
                 index=bucket.index,
@@ -117,17 +116,70 @@ def render_calibration_graph_fragment(
     summary: CalibrationSummary,
     *,
     title: str,
+    include_fsrs: bool = False,
+    fsrs_summary: CalibrationSummary | None = None,
+    unpaired_count: int = 0,
+    active_label: str = "RWKV",
+    comparison_label: str = "FSRS",
+    comparison_is_fsrs: bool = True,
 ) -> str:
     """Render the calibration chart inside the owning unified analysis document."""
 
     model = calibration_graph_model(summary)
-    bars = "\n".join(_bin_svg(bucket) for bucket in model.bins)
+    fsrs_model = calibration_graph_model(fsrs_summary) if include_fsrs and fsrs_summary else None
+    bars = "\n".join(
+        _bin_svg(
+            bucket,
+            fsrs_model.bins[index] if fsrs_model else None,
+            active_label=active_label,
+            comparison_label=comparison_label,
+        )
+        for index, bucket in enumerate(model.bins)
+    )
     calibration_line = _polyline_svg(model.line_points)
+    fsrs_line = "" if fsrs_model is None else _polyline_svg(fsrs_model.line_points, fsrs=True)
+    legend = ""
+    comparison_note = ""
+    fsrs_average = ""
+    predicted_label = "Average predicted"
+    if include_fsrs:
+        legend = render_model_comparison_legend(
+            include_perfect=True,
+            active_label=active_label,
+            comparison_label=comparison_label,
+        )
+        if fsrs_model is None:
+            comparison_note = f"Click Calculate to load the {comparison_label} comparison."
+        else:
+            comparison_note = (
+                "Both lines use the same answers, grouped by each model's predicted probability. "
+                f"Bars show {active_label} review counts. "
+                + (
+                    "FSRS uses current preset parameters."
+                    if comparison_is_fsrs
+                    else "Both generations use saved review-time predictions."
+                )
+            )
+            if unpaired_count:
+                comparison_note += f" Omitted without paired predictions: {unpaired_count:,}."
+            predicted_label = f"{active_label} predicted"
+            fsrs_average = (
+                f"<div><span>{html.escape(comparison_label)} predicted</span>"
+                f"<strong>{_percent(fsrs_model.average_prediction)}</strong></div>"
+            )
+    comparison_markup = (
+        f'<p class="rwkv-section-intro" role="status">{html.escape(comparison_note)}</p>'
+        if comparison_note
+        else ""
+    )
+    aria_label = (
+        f"{active_label} and {comparison_label} calibration graph"
+        if include_fsrs
+        else f"{active_label} calibration graph"
+    )
     no_data = "" if model.count else render_empty_chart_state(GEOMETRY)
     skipped = (
-        ""
-        if not model.invalid_count
-        else f"<span>Skipped invalid: {model.invalid_count:,}</span>"
+        "" if not model.invalid_count else f"<span>Skipped invalid: {model.invalid_count:,}</span>"
     )
     missing_prediction = (
         ""
@@ -147,12 +199,14 @@ def render_calibration_graph_fragment(
     x_ticks = render_percent_x_ticks(GEOMETRY, ticks=model.x_ticks)
     axes = render_chart_axes(GEOMETRY, right_axis=True)
     markup = f"""
-<section class="rwkvp-embedded-graph rwkvp-calibration-graph"
+<section class="rwkvp-embedded-graph rwkvp-calibration-graph rwkvp-model-comparison"
          data-rwkv-chart aria-labelledby="rwkvp-calibration-title">
   <h2 class="rwkv-section-title" id="rwkvp-calibration-title">{html.escape(title)}</h2>
   <p class="rwkv-section-intro rwkvp-subtitle">Actual recall rate by predicted probability.</p>
+  {legend}
+  {comparison_markup}
   <svg class="rwkv-chart" viewBox="{GEOMETRY.view_box}" role="img"
-       aria-label="RWKV calibration graph">
+       aria-label="{html.escape(aria_label, quote=True)}">
     {render_plot_background(GEOMETRY)}
     <g class="rwkvp-count-bars">
 {bars}
@@ -161,6 +215,7 @@ def render_calibration_graph_fragment(
           d="M {GEOMETRY.x_for_unit(0):.2f} {GEOMETRY.y_for_unit(0):.2f}
              L {GEOMETRY.x_for_unit(1):.2f} {GEOMETRY.y_for_unit(1):.2f}" />
 {calibration_line}
+{fsrs_line}
 {actual_y_ticks}
 {count_y_ticks}
 {x_ticks}
@@ -178,7 +233,8 @@ def render_calibration_graph_fragment(
   </svg>
   {render_chart_tooltip()}
   <div class="rwkv-chart-summary">
-    <div><span>Average predicted</span><strong>{_percent(model.average_prediction)}</strong></div>
+    <div><span>{html.escape(predicted_label)}</span><strong>{_percent(model.average_prediction)}</strong></div>
+    {fsrs_average}
     <div><span>Actual recall</span><strong>{_percent(model.actual_recall)}</strong></div>
     <div><span>Reviews</span><strong>{model.count:,}</strong></div>
     {missing_prediction}
@@ -205,8 +261,17 @@ def _tooltip(
     )
 
 
-def _bin_svg(bucket: CalibrationGraphBin) -> str:
-    tooltip = html.escape(bucket.tooltip, quote=True)
+def _bin_svg(
+    bucket: CalibrationGraphBin,
+    fsrs_bucket: CalibrationGraphBin | None = None,
+    *,
+    active_label: str = "RWKV",
+    comparison_label: str = "FSRS",
+) -> str:
+    text = bucket.tooltip
+    if fsrs_bucket is not None:
+        text = f"{active_label}\n{text}\n\n{comparison_label}\n{fsrs_bucket.tooltip}"
+    tooltip = html.escape(text, quote=True)
     return f"""
       <rect class="rwkvp-count-bar" x="{bucket.x:.2f}" y="{bucket.y:.2f}"
             width="{bucket.width:.2f}" height="{bucket.height:.2f}" />
@@ -216,16 +281,25 @@ def _bin_svg(bucket: CalibrationGraphBin) -> str:
             data-rwkv-chart-tooltip-text="{tooltip}" aria-label="{tooltip}" />"""
 
 
-def _polyline_svg(points: list[tuple[float, float]]) -> str:
+def _polyline_svg(points: list[tuple[float, float]], *, fsrs: bool = False) -> str:
     if not points:
         return ""
     data = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
-    circles = "\n".join(
-        f'    <circle class="rwkvp-calibration-point" cx="{x:.2f}" cy="{y:.2f}" r="3" />'
-        for x, y in points
-    )
+    if fsrs:
+        # Distinct markers make coincident lines and the legend easier to read.
+        circles = "\n".join(
+            f'<path class="rwkvp-calibration-point rwkvp-fsrs-point" '
+            f'd="M {x:.2f} {y - 3:.2f} l 3 3 l -3 3 l -3 -3 Z" />'
+            for x, y in points
+        )
+    else:
+        circles = "\n".join(
+            f'    <circle class="rwkvp-calibration-point" cx="{x:.2f}" cy="{y:.2f}" r="3" />'
+            for x, y in points
+        )
+    classes = "rwkvp-calibration-line rwkvp-fsrs-line" if fsrs else "rwkvp-calibration-line"
     return f"""
-    <polyline class="rwkvp-calibration-line" points="{data}" />
+    <polyline class="{classes}" points="{data}" />
 {circles}"""
 
 
@@ -260,6 +334,13 @@ _CALIBRATION_CSS = """
   fill: #3b82f6;
   stroke: var(--canvas, #fff);
   stroke-width: 1;
+}
+.rwkvp-fsrs-line {
+  stroke: var(--rwkvp-fsrs-color);
+  stroke-width: 1.5;
+}
+.rwkvp-fsrs-point {
+  fill: var(--rwkvp-fsrs-color);
 }
 html.night-mode .rwkvp-calibration-point,
 body.night-mode .rwkvp-calibration-point {

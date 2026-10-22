@@ -23,15 +23,20 @@ from .addon_config import (
     LIVE_REVIEW_SAMEDAY_REENTRY_DELAY_REVIEWS_CONFIG_KEY,
     MINIMUM_REVIEW_WIDENING_EXTRA_PERCENT_CONFIG_KEY,
     MODEL_CONFIG_KEY,
+    MODEL_GENERATION_CONFIG_KEY,
     PREDICT_MANY_BATCH_SIZES_CONFIG_KEY,
     PREDICT_MANY_MODE_CONFIG_KEY,
     PROCESS_MANY_MODE_CONFIG_KEY,
+    RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY,
     SAVE_CHECKPOINT_EVERY_REVIEWS_CONFIG_KEY,
     SHOW_CHECKPOINT_REBUILD_CONFIRMATION_CONFIG_KEY,
+    USE_FP16_GPU_PREDICTIONS_CONFIG_KEY,
+    USE_FP16_STATE_CONFIG_KEY,
     WINDOWS_DISPLAY_BUG_PATCH_CONFIG_KEY,
 )
 from .constants import CHECKPOINT_SAVE_INTERVAL, PREDICT_BATCH_SIZE
 from .live_review_engine import DEFAULT_QUIET_REFRESH_ATTEMPTS
+from .model_generation import MODEL_GENERATIONS
 from .review_load_policy import DEFAULT_MINIMUM_RETENTION_STEP
 from .review_type_normalization import (
     FILTERED_REVIEW_NORMALIZATION_CUTOFF_CONFIG_KEY,
@@ -40,8 +45,8 @@ from .review_type_normalization import (
 from .rwkv_performance_modes import (
     PREDICT_MANY_FAST_MODE,
     PREDICT_MANY_GPU_MODE,
-    PREDICT_MANY_MODES,
     PREDICT_MANY_ORACLE_MODE,
+    PREDICTION_MODE_CHOICES,
     PROCESS_MANY_MODES,
 )
 
@@ -59,6 +64,8 @@ class ConfigOption:
     maximum: int | None = None
     requires_gpu: bool = False
     requires_curves: bool = False
+    requires_v1_generation: bool = False
+    v5_unavailable_reason: str = ""
     group: str = ""
     subsection: str = ""
     inverted: bool = False
@@ -93,8 +100,12 @@ CONFIG_OPTIONS = (
         "Prediction Mode",
         "choice",
         "Chooses how RWKV scores large groups of cards for Live Sessions, reports, and "
-        "filtered decks. Fast uses CPU; GPU can be faster for large groups; Oracle is "
-        "the reference mode.",
+        "filtered decks. Default: GPU (Full FP16) uses half-precision math for faster "
+        "V1/V5 GPU predictions. Risk: small rounding differences can affect retrievability "
+        "and ordering near thresholds. GPU uses FP32 math; Fast uses CPU; Oracle is "
+        "the reference. State storage and building are unchanged. No rebuild needed. "
+        "If FP16 kernels are unavailable, GPU math falls back to FP32; unavailable GPUs "
+        "safely fall back to CPU Fast.",
         group="Performance",
         subsection="State Building and Predictions",
         speed_test="predictions",
@@ -120,7 +131,9 @@ CONFIG_OPTIONS = (
         "int",
         "After each Live Session answer, RWKV updates predictions for up to this many "
         "cards before choosing the next card. Higher values consider more cards but can "
-        "delay the next card.",
+        "delay the next card. Auto uses Setup's sizing test with your selected Prediction "
+        "Mode and current checkpoint, checking each size three times to find the largest "
+        "tested count that stays within 100 ms. Apply or OK saves the result.",
         minimum=1,
         maximum=99999,
         group="Performance",
@@ -227,6 +240,19 @@ CONFIG_OPTIONS = (
     ),
     ConfigOption(
         "Advanced",
+        (MODEL_GENERATION_CONFIG_KEY,),
+        "RWKV Generation",
+        "choice",
+        "A model generation is a version of RWKV's architecture and review-history "
+        "inputs. V5 support RWKV Immediate; choose V1 to use RWKV Forgetting Curve "
+        "features. Each generation has its own checkpoint; compatible saved state is "
+        "reused when you switch back. Compare Generations tests each generation's default model.",
+        group="RWKV State Settings",
+        comparison="generations",
+        checkpoint_rebuild_required=True,
+    ),
+    ConfigOption(
+        "Advanced",
         (MODEL_CONFIG_KEY,),
         "Underlying Model",
         "choice",
@@ -234,6 +260,37 @@ CONFIG_OPTIONS = (
         "Most users should leave this unchanged.",
         group="RWKV State Settings",
         comparison="models",
+        checkpoint_rebuild_required=True,
+    ),
+    ConfigOption(
+        "Advanced",
+        (USE_FP16_STATE_CONFIG_KEY,),
+        "Use FP16 for Card/Note State",
+        "bool",
+        "Enabled by default for new configurations. Stores card and note state at "
+        "half precision (FP16), halving those tensors' "
+        "storage, not total memory or checkpoint size. Processing and shared state "
+        "remain FP32; GPU prediction math is selected in General > Prediction Mode. FP16 uses less "
+        "memory but rounding can change predictions and "
+        "accuracy; speed depends on your hardware and collection. Off uses FP32 "
+        "to avoid this quantization. Changing either way requires "
+        "rebuilding the checkpoint. Compare both using this Settings draft without "
+        "changing your saved state.",
+        group="RWKV State Settings",
+        comparison="state-precision",
+        checkpoint_rebuild_required=True,
+    ),
+    ConfigOption(
+        "Advanced",
+        (USE_FP16_GPU_PREDICTIONS_CONFIG_KEY,),
+        "FP16 GPU Predictions",
+        "action",
+        "Compare how full FP16 GPU math changes predictions versus FP32 math using "
+        "identical temporary FP16 card/note state. Reports mean, median, P90, P99 and "
+        "maximum absolute percentage-point differences; no speed test. Select GPU "
+        "(Full FP16) under General > Performance > Prediction Mode to enable it.",
+        group="RWKV State Settings",
+        comparison="gpu-math",
     ),
     ConfigOption(
         "Advanced",
@@ -259,6 +316,17 @@ CONFIG_OPTIONS = (
         f"Update Checkpoint to save immediately. Default: {CHECKPOINT_SAVE_INTERVAL:,} reviews.",
         minimum=1,
         maximum=100000,
+        group="Checkpoint Settings",
+    ),
+    ConfigOption(
+        "Advanced",
+        (RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY,),
+        "Retain Multiple Model Generations",
+        "bool",
+        "Saves one checkpoint and Immediate evaluation cache per generation when "
+        "comparing generations, including Guided Setup and Test All. Test All retains "
+        "the best candidate in each generation. Uses additional disk space. Off by "
+        "default; turning it off leaves existing checkpoints available.",
         group="Checkpoint Settings",
     ),
     ConfigOption(
@@ -342,9 +410,10 @@ CONFIG_OPTIONS = (
         (WINDOWS_DISPLAY_BUG_PATCH_CONFIG_KEY,),
         "Windows Display Bug Patch",
         "bool",
-        "Uses in-window dropdowns and date pickers to prevent an expanding blank area "
+        "Uses in-window dropdowns to prevent an expanding blank area "
         "seen on some Windows systems. It is enabled by default on Windows and usually "
-        "unnecessary elsewhere. Changes apply to newly opened RWKV windows.",
+        "unnecessary elsewhere. Dates always support typing and an in-window calendar. "
+        "Changes apply to newly opened RWKV windows.",
         group="Appearance",
     ),
     ConfigOption(
@@ -353,8 +422,10 @@ CONFIG_OPTIONS = (
         "Enable RWKV Behavior Lab",
         "bool",
         "Shows the Behavior Lab simulator in the RWKV menus in Anki's main window and "
-        "Browse window. It can "
-        "compare how hypothetical review sequences affect a card and related cards.",
+        "Browse window. It can compare how hypothetical review sequences affect a card "
+        "and related cards. Behavior Lab currently supports RWKV V1 only; its simulated "
+        "inputs and results still need to be adapted for V5.",
+        requires_v1_generation=True,
         group="Functionality",
     ),
     ConfigOption(
@@ -439,7 +510,8 @@ CONFIG_OPTIONS = (
 
 
 CONFIG_CHOICE_VALUES = {
-    (PREDICT_MANY_MODE_CONFIG_KEY,): PREDICT_MANY_MODES,
+    (MODEL_GENERATION_CONFIG_KEY,): MODEL_GENERATIONS,
+    (PREDICT_MANY_MODE_CONFIG_KEY,): PREDICTION_MODE_CHOICES,
     (PROCESS_MANY_MODE_CONFIG_KEY,): PROCESS_MANY_MODES,
 }
 

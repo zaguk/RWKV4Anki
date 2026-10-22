@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-from .analysis_workflow import (
-    AnalysisControls,
-    render_analysis_controls,
-    render_analysis_help_heading,
-    render_analysis_results_heading,
-    render_analysis_status,
-)
-from .modal_html import (
-    ModalField,
-    render_field,
-    render_modal_document,
-    render_notice,
-)
+from dataclasses import asdict
+
+from .modal_html import ModalDisclosure, ModalField
+from .report_payload import chart_markup
 from .retrievability import RetrievabilitySummary
 from .retrievability_graph import render_retrievability_graph_fragment
 from .rwkv_modes import RetrievabilityMode
+from .svelte_ui import render_svelte_document
 
 
 def render_retrievability_dialog_html(
@@ -39,8 +31,8 @@ def render_retrievability_dialog_html(
     target_time_help = "Estimate recall at this local date and time."
     if latest_review_warning:
         target_time_help += f" {latest_review_warning}"
-    source_fields = "".join(
-        render_field(field)
+    source_fields = [
+        asdict(field)
         for field in (
             ModalField(
                 name="target_time",
@@ -64,8 +56,8 @@ def render_retrievability_dialog_html(
                 initial_focus=focus_target == "initial_search",
             ),
         )
-    )
-    filter_field = render_field(
+    ]
+    filter_field = asdict(
         ModalField(
             name="filter_search",
             label="Display filter",
@@ -80,64 +72,49 @@ def render_retrievability_dialog_html(
             initial_focus=focus_target == "filter_search",
         )
     )
-    source_panel_content = f'<div class="rwkv-form-grid">{source_fields}</div>'
-    submission_form = render_analysis_controls(
-        AnalysisControls(
-            form_id="rwkv-retrievability-form",
-            source_panel_id="rwkv-retrievability-source-panel",
-            source_disclosure_id="rwkv-retrievability-source-disclosure",
-            source_disclosure_action="toggle-prediction-editor",
-            source_disclosure_label="Generate a new prediction set",
-            source_disclosure_tooltip=(
+    disclosure = asdict(
+        ModalDisclosure(
+            panel_id="rwkv-retrievability-source-panel",
+            button_id="rwkv-retrievability-source-disclosure",
+            action="toggle-prediction-editor",
+            collapsed_label="Generate a new prediction set",
+            expanded_label="Generate a new prediction set",
+            tooltip=(
                 "Expand to change the prediction time or cards. The next Calculate "
                 "will run RWKV again before applying the display filter."
             ),
-            source_panel_html=source_panel_content,
-            filter_fields_html=filter_field,
-            calculate_button_id="rwkv-retrievability-calculate",
-            calculate_tooltip=(
-                "Generate predictions when needed, then apply the display filter."
-            ),
-            has_result_set=has_result_set,
-            source_expanded=prediction_editor_expanded,
-            running=running,
-            source_panel_classes=("rwkv-retrievability-source-panel",),
-            filter_row_classes=("rwkv-retrievability-filter-row",),
+            expanded=prediction_editor_expanded,
+            disabled=running,
+            button_classes=("rwkv-analysis-source-disclosure",),
+            panel_classes=("rwkv-analysis-source-panel", "rwkv-retrievability-source-panel"),
         )
     )
-    status = render_analysis_status(
-        error_message=error_message,
-        running=running,
-        running_message="Retrievability calculation is running.",
-    )
+    notices = []
+    if error_message:
+        notices.append(dict(message=error_message, tone="error"))
+    elif running:
+        notices.append(dict(message="Retrievability calculation is running.", tone="info"))
     if invalid_log_path:
-        status += render_notice(
-            f"Non-finite predictions were recorded in {invalid_log_path}.",
+        notices.append(dict(
+            message=f"Non-finite predictions were recorded in {invalid_log_path}.",
             tone="warning",
-        )
+        ))
     prediction_help = (
         "Calculate creates predictions when none exist or when the prediction controls "
         "are expanded. Otherwise it only reapplies the display filter to the current "
         "results."
     )
-    body_html = f"""
-<section class="rwkv-section" id="rwkv-retrievability-prediction">
-  {render_analysis_help_heading("Prediction", prediction_help)}
-  <div class="rwkv-card rwkv-analysis-controls">
-    {submission_form}
-  </div>
-</section>
-<section class="rwkv-section" id="rwkv-retrievability-results">
-  {render_analysis_results_heading("Retrievability Results", summary_text)}
-  {status}
-  <div class="rwkv-card rwkv-analysis-graph-region">
-    {render_retrievability_graph_fragment(summary)}
-  </div>
-</section>
-""".strip()
-    return render_modal_document(
+    return render_svelte_document(
+        "analysis", dict(
+            title=mode.window_title, prefix="retrievability", controlsTitle="Prediction",
+            controlsHelp=prediction_help, sourceFields=source_fields,
+            filterGroups=[dict(fields=[filter_field])], disclosure=disclosure,
+            hasResultSet=has_result_set, running=running,
+            calculateTooltip="Generate predictions when needed, then apply the display filter.",
+            resultsTitle="Retrievability Results", summaryText=summary_text, notices=notices,
+            graph=chart_markup(render_retrievability_graph_fragment(summary)),
+        ),
         title=mode.window_title,
-        body_html=body_html,
         generation=generation,
         is_dark=is_dark,
         width="wide",

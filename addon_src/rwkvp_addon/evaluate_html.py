@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import datetime as dt
-import html
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from .modal_html import (
+    FieldOption,
     ModalButton,
     ModalDisclosure,
     ModalField,
-    render_button,
-    render_disclosure,
-    render_field,
-    render_modal_document,
-    render_notice,
 )
+from .model_generation import model_generation_label
+from .svelte_ui import render_svelte_document
 
 if TYPE_CHECKING:
     from .evaluate_controller import EvaluationDisplayRow, EvaluationScopeSelection
@@ -41,9 +39,17 @@ def render_evaluate_dialog_html(
     advanced_options_expanded: bool = False,
     is_dark: bool = False,
     generation: int = 1,
+    comparison_generation: str | None = None,
+    comparison_generations: Sequence[str] = (),
+    active_generation: str = "v1",
+    comparison_button_label: str | None = None,
 ) -> str:
-    scope_fields = "".join(
-        render_field(field)
+    comparison_label = (
+        model_generation_label(comparison_generation) if comparison_generation else "FSRS"
+    )
+    active_label = model_generation_label(active_generation) if comparison_generation else "RWKV"
+    scope_fields = [
+        asdict(field)
         for field in (
             ModalField(
                 name="include_collection",
@@ -61,7 +67,10 @@ def render_evaluate_dialog_html(
                 label="Presets",
                 kind="checkbox",
                 checked=scope_selection.include_presets,
-                tooltip="Add one result row for each FSRS scheduling preset.",
+                tooltip=(
+                    "Add one result row for each FSRS scheduling preset currently "
+                    "assigned to a deck."
+                ),
                 disabled=running,
                 change_action="update-options",
                 change_serialize_form=True,
@@ -77,9 +86,9 @@ def render_evaluate_dialog_html(
                 change_serialize_form=True,
             ),
         )
-    )
-    date_fields = "".join(
-        render_field(field)
+    ]
+    date_fields = [
+        asdict(field)
         for field in (
             ModalField(
                 name="start_date",
@@ -111,9 +120,9 @@ def render_evaluate_dialog_html(
                 change_serialize_form=True,
             ),
         )
-    )
-    advanced_fields = "".join(
-        render_field(field)
+    ]
+    advanced_fields = [
+        asdict(field)
         for field in (
             ModalField(
                 name="cheating_fsrs",
@@ -122,9 +131,9 @@ def render_evaluate_dialog_html(
                 checked=cheating_fsrs,
                 tooltip=(
                     "Train fresh FSRS-6 parameters for each scope and evaluate them "
-                    "on those same review items."
+                    "on those same review items. Available when comparing with FSRS-6."
                 ),
-                disabled=running or not comparison_available,
+                disabled=running or not comparison_available or comparison_generation is not None,
                 change_action="update-options",
                 change_serialize_form=True,
             ),
@@ -139,8 +148,8 @@ def render_evaluate_dialog_html(
                 change_serialize_form=True,
             ),
         )
-    )
-    full_range_button = render_button(
+    ]
+    full_range_button = asdict(
         ModalButton(
             "Use Full Range",
             "use-full-range",
@@ -148,311 +157,105 @@ def render_evaluate_dialog_html(
             disabled=running,
             serialize_form=True,
             button_id="rwkv-evaluate-full-range",
+            form_no_validate=True,
         )
     )
     date_range_help = (
+        "Both RWKV generations are scored on the same eligible reviews within these dates."
+        if comparison_generation else
         "Date limits apply only to RWKV. FSRS-6 comparison requires the full collection range."
     )
-    additional_options_help = "Less commonly needed evaluation and result-display controls."
-    advanced_options = render_disclosure(
-        ModalDisclosure(
-            button_id="rwkv-evaluate-advanced-disclosure",
-            panel_id="rwkv-evaluate-advanced-panel",
-            collapsed_label="Show advanced options...",
-            expanded_label="Hide advanced options...",
-            expanded=advanced_options_expanded,
-            disabled=running,
-            action="toggle-advanced-options",
-            button_classes=("rwkv-evaluation-disclosure",),
-            panel_classes=("rwkv-evaluation-advanced-panel",),
+    swap_field = asdict(ModalField(
+        name="comparison_generation",
+        label="Model generation",
+        kind="select",
+        value=comparison_generation or "",
+        options=(FieldOption("", "FSRS-6 (default)"), *(
+            FieldOption(value, f"RWKV {model_generation_label(value)}")
+            for value in comparison_generations
+        )),
+        tooltip=(
+            f"Active: RWKV {model_generation_label(active_generation)}. Only generations "
+            "supporting the same history and evaluation settings are listed."
+            if comparison_generations else
+            "No other generation supports the active history and evaluation settings."
         ),
-        f"""
-      <section class="rwkv-evaluation-advanced-subsection"
-               aria-labelledby="rwkv-evaluate-date-title">
-        <h3 class="rwkv-evaluation-option-title rwkv-evaluation-subsection-title rwkv-help-surface"
-            tabindex="0"
-            id="rwkv-evaluate-date-title"
-            data-rwkv-tooltip="{html.escape(date_range_help, quote=True)}">
-          RWKV Date Range</h3>
-        <div class="rwkv-evaluation-date-grid">
-          {date_fields}
-          <div class="rwkv-evaluation-date-action">{full_range_button}</div>
-        </div>
-      </section>
-      <section class="rwkv-evaluation-advanced-subsection"
-               aria-labelledby="rwkv-evaluate-additional-title">
-        <h3 class="rwkv-evaluation-option-title rwkv-evaluation-subsection-title rwkv-help-surface"
-            tabindex="0"
-            id="rwkv-evaluate-additional-title"
-            data-rwkv-tooltip="{html.escape(additional_options_help, quote=True)}">
-          Additional Evaluation Options</h3>
-        <div class="rwkv-evaluation-advanced-grid">{advanced_fields}</div>
-      </section>
-""".strip(),
-    )
-    options_form = f"""
-<form class="rwkv-form rwkv-evaluation-form" id="rwkv-evaluate-options"
-      data-rwkv-form-action="update-options">
-  <section class="rwkv-evaluation-option-group rwkv-evaluation-scope-options"
-           aria-labelledby="rwkv-evaluate-group-results-title">
-    <h3 class="rwkv-evaluation-option-title rwkv-help-surface" tabindex="0"
-        id="rwkv-evaluate-group-results-title"
-        data-rwkv-tooltip="Choose one or more ways to group the metric results.">
-      Group results by</h3>
-    <div class="rwkv-evaluation-scope-grid">{scope_fields}</div>
-  </section>
-  <section class="rwkv-evaluation-option-group rwkv-evaluation-advanced-options">
-    {advanced_options}
-  </section>
-  {
-        _options_actions(
-            rwkv_label=rwkv_label,
-            comparison_available=comparison_available,
-            running=running,
-            focus_target=focus_target,
-        )
-    }
-</form>
-""".strip()
-    scope_help = (
-        "Choose whether metrics are grouped for the whole collection, scheduling "
-        "presets, decks, or any combination."
-    )
+        disabled=running or not comparison_generations,
+        change_action="update-options",
+        change_serialize_form=True,
+    ))
+    additional_options_help = "Less commonly needed evaluation and result-display controls."
+    disclosure = asdict(ModalDisclosure(
+        button_id="rwkv-evaluate-advanced-disclosure",
+        panel_id="rwkv-evaluate-advanced-panel",
+        collapsed_label="Show advanced options...",
+        expanded_label="Hide advanced options...",
+        expanded=advanced_options_expanded, disabled=running,
+        action="toggle-advanced-options",
+        button_classes=("rwkv-evaluation-disclosure",),
+        panel_classes=("rwkv-evaluation-advanced-panel",),
+    ))
+    actions = [
+        asdict(ModalButton(
+            f"{rwkv_label} Only", "run-rwkv-only", variant="secondary",
+            disabled=running, serialize_form=True, button_id="rwkv-evaluate-rwkv-only",
+            initial_focus=focus_target == "run_rwkv_only",
+        )),
+        asdict(ModalButton(
+            comparison_button_label or f"Compare FSRS-6 and {rwkv_label}", "run-comparison",
+            variant="primary", disabled=running or not comparison_available,
+            serialize_form=True, button_id="rwkv-evaluate-compare",
+            initial_focus=focus_target == "run_comparison",
+        )),
+    ]
     results_help = (
-        f"Lower RMSE(bins) and LogLoss values are better. Improvement shows {rwkv_label} "
-        "as a percentage of FSRS-6: under 100% is better (green), while over 100% "
-        "is worse (red)."
-    )
-    status = ""
-    if running:
-        status = render_notice("Evaluation is running.", tone="info")
-    elif not comparison_available:
-        status = render_notice(
-            f"The selected dates can be evaluated with {rwkv_label} Only. Use Full "
-            "Range to enable the FSRS-6 comparison.",
-            tone="info",
+        "Lower RMSE(bins) and LogLoss values are better. Improvement shows the active "
+        f"model as a percentage of {comparison_label}. For RMSE(bins) and LogLoss, "
+        "under 100% is better (green), while over 100% is worse (red). "
+        "Higher AUC is better: it measures how well predicted recall "
+        "distinguishes successes from lapses (0.5 means chance ranking, 1 means perfect "
+        "ranking). AUC is rounded to six decimals, matching srs-benchmark. A dash means "
+        "the scored reviews lack successes or lapses. "
+        + (
+            "For AUC Improvement, over 100% is better (green), while under 100% is "
+            "worse (red). Equal scores are neutral. Missing AUC or a zero comparison "
+            "AUC shows a dash for Improvement. Both generations use the same eligible "
+            "review IDs and date range."
+            if comparison_generation else
+            "Anki does not expose FSRS AUC, so this column reports RWKV only."
         )
+    )
+    status = (
+        "Evaluation is running." if running else
+        f"The selected dates can be evaluated with {rwkv_label} Only. Use Full "
+        "Range to enable the FSRS-6 comparison." if not comparison_available else ""
+    )
     hidden_note = ""
     if hidden_insufficient_count:
         suffix = "scope" if hidden_insufficient_count == 1 else "scopes"
-        hidden_note = render_notice(
-            f"{hidden_insufficient_count} {suffix} with insufficient reviews hidden.",
-            tone="info",
+        hidden_note = f"{hidden_insufficient_count} {suffix} with insufficient reviews hidden."
+    if selected_scope_count == 0:
+        empty_message = "Select at least one evaluation scope."
+    elif hidden_insufficient_count:
+        empty_message = (
+            "Every selected scope has insufficient reviews. Enable Show "
+            "insufficient reviews to display them."
         )
-    body_html = f"""
-<section class="rwkv-section" id="rwkv-evaluate-scope">
-  <h2 class="rwkv-section-title rwkv-help-surface" tabindex="0"
-      data-rwkv-tooltip="{html.escape(scope_help, quote=True)}">Evaluation Scope</h2>
-  <div class="rwkv-card">
-    {options_form}
-    {status}
-  </div>
-</section>
-<section class="rwkv-section" id="rwkv-evaluate-results">
-  <h2 class="rwkv-section-title rwkv-help-surface" tabindex="0"
-      data-rwkv-tooltip="{html.escape(results_help, quote=True)}">Evaluation Results</h2>
-  {hidden_note}
-  <div class="rwkv-card rwkv-evaluation-results" aria-live="polite">
-    {
-        _render_results_table(
-            rwkv_label=rwkv_label,
-            rows=rows,
-            show_comparison=show_comparison,
-            selected_scope_count=selected_scope_count,
-            hidden_insufficient_count=hidden_insufficient_count,
-        )
-    }
-  </div>
-</section>
-""".strip()
-    return render_modal_document(
-        title=title,
-        body_html=body_html,
-        generation=generation,
-        is_dark=is_dark,
-        width="wide",
+    else:
+        empty_message = "No evaluation scopes are available."
+    return render_svelte_document(
+        "evaluate", dict(
+            title=title, rwkvLabel=rwkv_label, scopeFields=scope_fields,
+            dateFields=date_fields, advancedFields=advanced_fields, swapField=swap_field,
+            fullRangeButton=full_range_button, disclosure=disclosure, actions=actions,
+            dateRangeHelp=date_range_help, additionalOptionsHelp=additional_options_help,
+            resultsHelp=results_help, status=status, hiddenNote=hidden_note,
+            emptyMessage=empty_message, showComparison=show_comparison,
+            compareAuc=comparison_generation is not None,
+            comparisonLabel=comparison_label, activeLabel=active_label,
+            rows=[dict(asdict(row), sort_values=dict(
+                asdict(row.sort_values), scope=row.sort_values.scope or row.scope.casefold(),
+            )) for row in rows],
+        ), title=title, generation=generation, is_dark=is_dark, width="wide",
         root_extra_classes="rwkv-evaluation-dialog",
     )
-
-
-def _options_actions(
-    *,
-    rwkv_label: str,
-    comparison_available: bool,
-    running: bool,
-    focus_target: str | None,
-) -> str:
-    return (
-        '<div class="rwkv-evaluation-actions">'
-        + '<div class="rwkv-evaluation-actions__runs">'
-        + render_button(
-            ModalButton(
-                f"{rwkv_label} Only",
-                "run-rwkv-only",
-                variant="secondary",
-                disabled=running,
-                serialize_form=True,
-                button_id="rwkv-evaluate-rwkv-only",
-                initial_focus=focus_target == "run_rwkv_only",
-            )
-        )
-        + render_button(
-            ModalButton(
-                f"Compare FSRS-6 and {rwkv_label}",
-                "run-comparison",
-                variant="primary",
-                disabled=running or not comparison_available,
-                serialize_form=True,
-                button_id="rwkv-evaluate-compare",
-                initial_focus=focus_target == "run_comparison",
-            )
-        )
-        + "</div></div>"
-    )
-
-
-def _render_results_table(
-    *,
-    rwkv_label: str,
-    rows: Sequence[EvaluationDisplayRow],
-    show_comparison: bool,
-    selected_scope_count: int,
-    hidden_insufficient_count: int,
-) -> str:
-    if show_comparison:
-        headers = (
-            '<th scope="col" class="rwkv-evaluation-scope-header">Scope</th>'
-            '<th scope="col" class="rwkv-number rwkv-evaluation-reviews-header">'
-            "Reviews Evaluated</th>"
-            + _render_metric_header(
-                "RMSE(bins)",
-                rwkv_label=rwkv_label,
-                show_comparison=True,
-            )
-            + '<th scope="col" class="rwkv-number rwkv-evaluation-improvement-header">'
-            "Improvement</th>"
-            + _render_metric_header(
-                "LogLoss",
-                rwkv_label=rwkv_label,
-                show_comparison=True,
-            )
-            + '<th scope="col" class="rwkv-number rwkv-evaluation-improvement-header">'
-            "Improvement</th>"
-        )
-        column_count = 6
-    else:
-        headers = (
-            '<th scope="col" class="rwkv-evaluation-scope-header">Scope</th>'
-            '<th scope="col" class="rwkv-number rwkv-evaluation-reviews-header">'
-            "Reviews Evaluated</th>"
-            + _render_metric_header(
-                "RMSE(bins)",
-                rwkv_label=rwkv_label,
-                show_comparison=False,
-            )
-            + _render_metric_header(
-                "LogLoss",
-                rwkv_label=rwkv_label,
-                show_comparison=False,
-            )
-        )
-        column_count = 4
-    if rows:
-        body = "".join(_render_result_row(row, show_comparison=show_comparison) for row in rows)
-    else:
-        if selected_scope_count == 0:
-            message = "Select at least one evaluation scope."
-        elif hidden_insufficient_count:
-            message = (
-                "Every selected scope has insufficient reviews. Enable Show "
-                "insufficient reviews to display them."
-            )
-        else:
-            message = "No evaluation scopes are available."
-        body = (
-            f'<tr class="rwkv-table-empty"><td colspan="{column_count}">'
-            f"{html.escape(message)}</td></tr>"
-        )
-    return f"""
-<div class="rwkv-table-wrap" tabindex="0" role="region"
-     aria-label="Evaluation results">
-  <table class="rwkv-data-table rwkv-evaluation-table" id="rwkv-evaluation-table">
-    <caption class="rwkv-sr-only">Evaluation results</caption>
-    <thead><tr>{headers}</tr></thead>
-    <tbody>{body}</tbody>
-  </table>
-</div>
-""".strip()
-
-
-def _render_metric_header(
-    metric: str,
-    *,
-    rwkv_label: str,
-    show_comparison: bool,
-) -> str:
-    if show_comparison:
-        visible_sources = "FSRS | RWKV"
-        accessible_sources = f"FSRS-6 and {rwkv_label}"
-    else:
-        visible_sources = "RWKV"
-        accessible_sources = rwkv_label
-    return (
-        '<th scope="col" class="rwkv-number rwkv-evaluation-metric-header">'
-        f'<span class="rwkv-evaluation-metric-header__name">{html.escape(metric)}</span>'
-        '<span class="rwkv-evaluation-metric-header__sources" '
-        f'aria-label="{html.escape(accessible_sources, quote=True)}">'
-        f"{html.escape(visible_sources)}</span></th>"
-    )
-
-
-def _render_result_row(
-    row: EvaluationDisplayRow,
-    *,
-    show_comparison: bool,
-) -> str:
-    cells = [
-        f'<th scope="row" class="rwkv-evaluation-scope-cell">{html.escape(row.scope)}</th>',
-        '<td class="rwkv-number rwkv-evaluation-reviews-cell">'
-        f"{html.escape(row.reviews_evaluated)}</td>",
-    ]
-    if show_comparison:
-        cells.extend(
-            (
-                _render_metric_pair_cell(row.fsrs_rmse, row.rwkv_rmse),
-                _render_improvement_cell(
-                    row.rmse_improvement,
-                    row.rmse_improvement_state,
-                ),
-                _render_metric_pair_cell(row.fsrs_logloss, row.rwkv_logloss),
-                _render_improvement_cell(
-                    row.logloss_improvement,
-                    row.logloss_improvement_state,
-                ),
-            )
-        )
-    else:
-        cells.extend(
-            (
-                '<td class="rwkv-number rwkv-evaluation-metric-value">'
-                f"{html.escape(row.rwkv_rmse)}</td>",
-                '<td class="rwkv-number rwkv-evaluation-metric-value">'
-                f"{html.escape(row.rwkv_logloss)}</td>",
-            )
-        )
-    return "<tr>" + "".join(cells) + "</tr>"
-
-
-def _render_metric_pair_cell(fsrs_value: str, rwkv_value: str) -> str:
-    if not fsrs_value and not rwkv_value:
-        value = ""
-    else:
-        value = f"{fsrs_value or '—'} | {rwkv_value or '—'}"
-    return f'<td class="rwkv-number rwkv-evaluation-metric-pair">{html.escape(value)}</td>'
-
-
-def _render_improvement_cell(value: str, state: str) -> str:
-    classes = ["rwkv-number", "rwkv-evaluation-improvement-cell"]
-    if state in {"better", "worse"}:
-        classes.append(f"rwkv-evaluation-cell--{state}")
-    return f'<td class="{html.escape(" ".join(classes), quote=True)}">{html.escape(value)}</td>'

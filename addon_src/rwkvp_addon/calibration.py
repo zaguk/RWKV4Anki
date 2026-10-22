@@ -86,7 +86,9 @@ def calibration_reviews(
     return reviews
 
 
-def calibration_review_from_row(row: dict[str, Any]) -> CalibrationReview | None:
+def calibration_review_from_row(
+    row: dict[str, Any], *, prediction_key: str = "prediction",
+) -> CalibrationReview | None:
     card_id = _optional_int(row.get("card_id"))
     if card_id is None:
         return None
@@ -95,7 +97,7 @@ def calibration_review_from_row(row: dict[str, Any]) -> CalibrationReview | None
         return None
 
     try:
-        prediction = float(row["prediction"])
+        prediction = float(row[prediction_key])
     except (KeyError, TypeError, ValueError):
         return None
     if not math.isfinite(prediction) or prediction < 0.0 or prediction > 1.0:
@@ -251,6 +253,40 @@ def calibration_bin_index(prediction: float, *, bin_count: int = 20) -> int:
     value = min(1.0, max(0.0, float(prediction)))
     index = math.floor(math.exp(math.log(bin_count + 1) * value)) - 1
     return min(bin_count - 1, max(0, index))
+
+
+def summarize_calibration_comparison(
+    rows: Iterable[dict[str, Any]], *, include_sameday: bool = False, bin_count: int = 20,
+) -> tuple[CalibrationSummary, CalibrationSummary, int]:
+    """Use the same answers for both models, binning by each model's prediction."""
+    rwkv_reviews = []
+    fsrs_reviews = []
+    unpaired = 0
+    for rwkv, fsrs in paired_calibration_reviews(rows, include_sameday=include_sameday):
+        if rwkv is None or fsrs is None:
+            unpaired += 1
+            continue
+        rwkv_reviews.append(rwkv)
+        fsrs_reviews.append(fsrs)
+    return (
+        summarize_calibration(rwkv_reviews, bin_count=bin_count),
+        summarize_calibration(fsrs_reviews, bin_count=bin_count),
+        unpaired,
+    )
+
+
+def paired_calibration_reviews(
+    rows: Iterable[dict[str, Any]], *, include_sameday: bool = False,
+) -> Iterable[tuple[CalibrationReview | None, CalibrationReview | None]]:
+    """Shared cohort for Calibration and UM+; absent predictions remain explicit."""
+    for row in rows:
+        elapsed = _optional_float(row.get("elapsed_days", 0))
+        if elapsed is None or not _include_elapsed_days(elapsed, include_sameday=include_sameday):
+            continue
+        yield (
+            calibration_review_from_row(row),
+            calibration_review_from_row(row, prediction_key="fsrs_prediction"),
+        )
 
 
 def calibration_bin_low(index: int, *, bin_count: int) -> float:

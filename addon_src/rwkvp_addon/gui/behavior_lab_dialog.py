@@ -9,6 +9,7 @@ from aqt import mw
 from aqt.qt import Qt
 from aqt.utils import tooltip
 
+from ..addon_config import addon_config_for_mw, configured_model_generation
 from ..anki_api import find_cards, is_fsrs_enabled
 from ..behavior_lab import (
     BehaviorLabExperiment,
@@ -30,6 +31,7 @@ from ..dataset_export import (
     load_review_data_for_checkpoint,
     open_checkpoint_runtime_from_load,
 )
+from ..model_generation import model_generation_supports_curves
 from ..review_rows import checkpoint_scope_cards_for_card_ids
 from ..runtime import manager_for_mw, store_for_mw
 from ..vendor_bootstrap import require_rwkv_probability
@@ -97,6 +99,9 @@ class BehaviorLabDialog(WebDialogHost):
         if self._running:
             return
         if mw.col is None:
+            return
+        if not _behavior_lab_supports_current_generation():
+            _show_v1_only_warning(self)
             return
         if not is_fsrs_enabled(mw.col):
             show_fsrs_disabled(self)
@@ -271,6 +276,9 @@ def show_behavior_lab(
     parent = parent or mw
     if mw.col is None:
         return None
+    if not _behavior_lab_supports_current_generation():
+        _show_v1_only_warning(parent)
+        return None
     if not is_fsrs_enabled(mw.col):
         show_fsrs_disabled(parent)
         return None
@@ -280,6 +288,21 @@ def show_behavior_lab(
     dialog = BehaviorLabDialog(parent, initial_card_ids=initial_card_ids)
     dialog.open()
     return dialog
+
+
+def _behavior_lab_supports_current_generation() -> bool:
+    return model_generation_supports_curves(
+        configured_model_generation(addon_config_for_mw(mw))
+    )
+
+
+def _show_v1_only_warning(parent: object) -> None:
+    show_web_warning(
+        "Behavior Lab currently supports RWKV V1 only. Its simulated inputs and "
+        "results need adjustments before it can support V5.",
+        title="RWKV Behavior Lab",
+        parent=parent,
+    )
 
 
 def _current_card_id() -> int:

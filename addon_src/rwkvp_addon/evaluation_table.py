@@ -79,8 +79,10 @@ def is_insufficient_reviews_error(error: str | None) -> bool:
     return any(marker in normalized for marker in _INSUFFICIENT_REVIEW_MARKERS)
 
 
-def format_relative_ratio(fsrs_value: float | None, rwkv_value: float | None) -> str:
-    """Format RWKV as a percentage of FSRS for a lower-is-better metric."""
+def format_relative_ratio(
+    fsrs_value: float | None, rwkv_value: float | None, *, decimals: int = 0
+) -> str:
+    """Format the second score as a percentage of the baseline, independent of direction."""
 
     if fsrs_value is None or rwkv_value is None:
         return ""
@@ -88,16 +90,20 @@ def format_relative_ratio(fsrs_value: float | None, rwkv_value: float | None) ->
     rwkv = float(rwkv_value)
     if not math.isfinite(fsrs) or not math.isfinite(rwkv) or fsrs <= 0 or rwkv < 0:
         return ""
-    return f"{rwkv / fsrs:.0%}"
+    ratio = rwkv / fsrs
+    return f"{ratio:.{decimals}%}" if math.isfinite(ratio) else ""
 
 
-def comparison_states(fsrs_value: float | None, rwkv_value: float | None) -> tuple[str, str]:
+def comparison_states(
+    fsrs_value: float | None, rwkv_value: float | None, *, higher_is_better: bool = False
+) -> tuple[str, str]:
     if fsrs_value is None or rwkv_value is None:
         return "", ""
+    lower_state, higher_state = ("worse", "better") if higher_is_better else ("better", "worse")
     if fsrs_value < rwkv_value:
-        return "better", "worse"
+        return lower_state, higher_state
     if rwkv_value < fsrs_value:
-        return "worse", "better"
+        return higher_state, lower_state
     return "equal", "equal"
 
 

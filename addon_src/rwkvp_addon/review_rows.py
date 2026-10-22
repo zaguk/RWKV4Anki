@@ -19,7 +19,6 @@ from .review_type_normalization import (
 
 SECONDS_PER_DAY = 86_400
 NEW_CARD_ELAPSED = -1
-RWKV_DURATION_MAX_MS = 60_000
 ANKI_REVLOG_KIND_LEARNING = 0
 ANKI_REVLOG_KIND_REVIEW = 1
 ANKI_REVLOG_KIND_RELEARNING = 2
@@ -40,6 +39,10 @@ class CardInfo:
     note_id: int | None
     deck_id: int | None
     preset_id: int | None
+    # V5 treats creation time as an explicit source fact. Although Anki card
+    # ids ordinarily contain that timestamp, callers must not reconstruct it
+    # by decoding an opaque model identity.
+    card_creation_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,9 @@ class ReviewData:
     row_build_context: ReviewRowBuildContext | None = None
     latest_revlog_id_by_card: dict[int, int] | None = None
     complete_history: bool = True
+    # V5 preserves source history without V1's learning-sequence trimming.
+    # Keep that distinction when cached history is incrementally extended.
+    history_generation: str = "v1"
 
 
 @dataclass(frozen=True)
@@ -134,12 +140,21 @@ def review_data_from_dataset(
     exclude_deleted_card_revlogs: bool = False,
     trim_learning_sequences: bool = True,
     filtered_review_normalization_policy: FilteredReviewNormalizationPolicy | None = None,
+    model_generation: str | None = None,
 ) -> ReviewData:
     normalization_policy = (
         filtered_review_normalization_policy or FilteredReviewNormalizationPolicy.disabled()
     )
     cards = _cards_from_dataset(dataset)
     decks = _decks_from_dataset(dataset)
+    if str(model_generation).strip().lower() in {"v5", "v5o"}:
+        from .v5o_history import build_v5o_review_data
+
+        return build_v5o_review_data(
+            dataset.revlogs, cards, decks, int(dataset.next_day_at),
+            exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
+            filtered_review_normalization_policy=normalization_policy,
+        )
     source_revlogs = (
         _revlogs_for_current_cards(dataset.revlogs, cards)
         if exclude_deleted_card_revlogs
@@ -221,6 +236,7 @@ def build_compact_review_history(
     latest_by_card: dict[int, tuple[int, int, int]] = {}
     lapse_counts_by_card: dict[int, int] = {}
     retained_processable_count = 0
+    metadata_by_card: dict[int, tuple[int | None, int | None, int | None]] = {}
 
     for revlog in ordered_revlogs:
         review_id = int(revlog.id)
@@ -239,8 +255,11 @@ def build_compact_review_history(
         interval = int(getattr(revlog, "interval", 0))
         last_interval = int(getattr(revlog, "last_interval", 0))
         ease_factor = int(getattr(revlog, "ease_factor", 0))
-        note_id, deck_id, preset_id = _card_metadata(card_id, cards, decks)
-        metadata_rows.append_values(
+        metadata = metadata_by_card.get(card_id)
+        if metadata is None:
+            metadata = metadata_by_card[card_id] = _card_metadata(card_id, cards, decks)
+        note_id, deck_id, preset_id = metadata
+        metadata_rows._append_prepared_values(
             review_id=review_id,
             card_id=card_id,
             note_id=note_id,
@@ -640,7 +659,7 @@ def _append_review_values_to_context(
             prior_lapses=prior_lapses,
         )
     else:
-        packed_rows.append_values(
+        packed_rows._append_prepared_values(
             review_id=review_id,
             card_id=card_id,
             note_id=note_id,
@@ -916,12 +935,12 @@ def rwkv_processable_revlog_where_sql(table: str) -> str:
 
 
 def rwkv_duration_millis(taken_millis: Any) -> float:
-    """Clamp RWKV input duration to the benchmark dataset's documented range."""
+    """Return a nonnegative duration without truncating valid Anki history."""
 
     duration = float(taken_millis)
     if not math.isfinite(duration):
         raise ValueError("Review duration must be finite.")
-    return min(float(RWKV_DURATION_MAX_MS), max(0.0, duration))
+    return max(0.0, duration)
 
 
 def review_row_build_context_from_rows(
@@ -1093,17 +1112,19 @@ def prediction_row_for_card(
     next_day_at: int,
     day_offset_origin: int = 0,
 ) -> dict[str, Any]:
-    raw_target_day = day_offset_for_timestamp(target_timestamp_seconds, next_day_at)
+    target_timestamp_ms = int(float(target_timestamp_seconds) * 1_000)
+    aligned_target_timestamp = target_timestamp_ms / 1_000.0
+    raw_target_day = day_offset_for_timestamp(aligned_target_timestamp, next_day_at)
     target_day = raw_target_day - day_offset_origin
     if last_review is None:
         elapsed_days = NEW_CARD_ELAPSED
         elapsed_seconds = NEW_CARD_ELAPSED
     else:
         elapsed_days = target_day - last_review.day_offset
-        elapsed_seconds = target_timestamp_seconds - last_review.timestamp_seconds
+        elapsed_seconds = (target_timestamp_ms - int(last_review.review_id)) / 1_000.0
 
     return prediction_input_row(
-        review_id=int(target_timestamp_seconds * 1000),
+        review_id=target_timestamp_ms,
         card_id=card.card_id,
         note_id=card.note_id,
         deck_id=card.deck_id,
@@ -1157,6 +1178,30 @@ def checkpoint_scope_cards_for_card_ids(
     return scope
 
 
+def extend_last_review_map(
+    last_by_card: dict[int, LastReviewInfo],
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[int, LastReviewInfo]:
+    last = dict(last_by_card)
+    lapses = {card_id: info.lapse_count for card_id, info in last.items()}
+    latest_by_card: dict[int, tuple[int, int, int]] = {}
+    for review_id, card_id, day_offset, elapsed_days, rating, interval in last_review_scalar_values(
+        rows
+    ):
+        if rating == 1 and elapsed_days != 0:
+            lapses[card_id] = lapses.get(card_id, 0) + 1
+        latest_by_card[card_id] = (review_id, day_offset, interval)
+    for card_id, (review_id, day_offset, interval) in latest_by_card.items():
+        last[card_id] = LastReviewInfo(
+            review_id=review_id,
+            day_offset=day_offset,
+            timestamp_seconds=review_id / 1000.0,
+            interval=interval,
+            lapse_count=lapses.get(card_id, 0),
+        )
+    return last
+
+
 def day_offset_for_timestamp(timestamp_seconds: float, next_day_at: int) -> int:
     return math.floor((timestamp_seconds - next_day_at) / SECONDS_PER_DAY)
 
@@ -1191,6 +1236,7 @@ def _cards_from_dataset(dataset: Any) -> dict[int, CardInfo]:
             note_id=int(entry.note_id) if int(entry.note_id) else None,
             deck_id=deck_id,
             preset_id=deck.preset_id if deck else None,
+            card_creation_ms=int(entry.id),
         )
     return cards
 

@@ -4,8 +4,14 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .runtime_inputs import RuntimeInputContext
 from .rwkv_performance_modes import PROCESS_MANY_MODES
-from .rwkv_processing import PROCESS_MANY_CHUNK_SIZE, new_rwkvp_runtime
+from .rwkv_processing import (
+    PROCESS_MANY_CHUNK_SIZE,
+    PROCESS_MANY_THREADS,
+    new_rwkvp_runtime,
+    runtime_process_many_input,
+)
 from .rwkv_runtime_resources import release_runtime_resources
 
 
@@ -13,9 +19,12 @@ def benchmark_process_many_rows(
     rows: Sequence[dict[str, Any]],
     *,
     model_id: str,
+    model_generation: str | None = None,
+    state_precision: str = "fp32",
     mode: str,
     return_curves: bool = True,
     warm_gpu_before_timing: bool = False,
+    input_context: RuntimeInputContext | None = None,
     runtime_factory: Callable[..., Any] = new_rwkvp_runtime,
     release_runtime: Callable[[Any], None] = release_runtime_resources,
     clock: Callable[[], float] = time.perf_counter,
@@ -34,11 +43,15 @@ def benchmark_process_many_rows(
     if not rows:
         raise ValueError("At least one review row is required for the process-many test.")
 
-    runtime = runtime_factory(
-        model_id=str(model_id),
-        backend="rust",
-        process_many_mode=normalized_mode,
-    )
+    runtime_kwargs = {
+        "model_id": str(model_id),
+        "backend": "rust",
+        "process_many_mode": normalized_mode,
+        "state_precision": state_precision,
+    }
+    if model_generation is not None:
+        runtime_kwargs["model_generation"] = str(model_generation)
+    runtime = runtime_factory(**runtime_kwargs)
     try:
         warm_gpu_for_call = bool(warm_gpu_before_timing and normalized_mode == "gpu")
         if warm_gpu_for_call:
@@ -48,13 +61,20 @@ def benchmark_process_many_rows(
         kwargs: dict[str, Any] = {
             "batch_size": PROCESS_MANY_CHUNK_SIZE,
             "return_curves": bool(return_curves),
+            "num_threads": PROCESS_MANY_THREADS,
         }
         if normalized_mode == "gpu":
             if not warm_gpu_for_call:
                 _require_process_gpu(runtime)
             kwargs["mode"] = "gpu"
 
-        results = runtime.process_many(rows, **kwargs)
+        process_input = runtime_process_many_input(
+            runtime,
+            rows,
+            input_context=input_context,
+            model_generation=model_generation,
+        )
+        results = runtime.process_many(process_input, **kwargs)
         if normalized_mode == "gpu":
             release_gpu = getattr(runtime, "release_gpu", None)
             if not callable(release_gpu):

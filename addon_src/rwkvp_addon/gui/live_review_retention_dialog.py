@@ -15,6 +15,7 @@ class LiveReviewRetentionDialog(WebDialogHost):
         summary: LiveRetentionSummary,
         *,
         message: str | None = None,
+        diagnostic_details: str | None = None,
         include_fsrs: bool = True,
     ) -> None:
         self.summary = summary
@@ -24,6 +25,7 @@ class LiveReviewRetentionDialog(WebDialogHost):
             lambda generation: render_live_retention_html(
                 self.summary,
                 message=message,
+                diagnostic_details=diagnostic_details,
                 include_fsrs=self.include_fsrs,
                 is_dark=is_dark,
                 generation=generation,
@@ -33,7 +35,7 @@ class LiveReviewRetentionDialog(WebDialogHost):
             parent,
             title="RWKV Live Session Retention",
             controller=self._report_controller,
-            size=(980, 360),
+            size=(980, 560),
             web_minimum_height=250,
         )
         self.setMinimumSize(980, 360)

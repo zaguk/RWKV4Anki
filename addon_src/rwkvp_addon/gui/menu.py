@@ -16,11 +16,12 @@ from ..addon_config import (
     addon_config_for_mw,
     behavior_lab_enabled,
     calculate_forgetting_curves,
-    configured_model_id,
+    configured_runtime_model_id,
     curve_rescheduling_enabled,
     process_many_mode,
     rwkv_immediate_enabled,
     show_checkpoint_rebuild_confirmation,
+    state_precision,
     write_addon_config_for_mw,
 )
 from ..anki_api import (
@@ -94,11 +95,14 @@ _checkpoint_manage_action: QAction | None = None
 _checkpoint_integrity_action: QAction | None = None
 _live_review_history_action: QAction | None = None
 _behavior_lab_action: QAction | None = None
+
+
 _fsrs_disabled_action: QAction | None = None
 _rwkv_normal_menu_actions: list[QAction] = []
 _mode_evaluate_menu_actions: dict[RetrievabilityMode, QAction] = {}
 _mode_evaluate_actions: dict[RetrievabilityMode, QAction] = {}
 _mode_calibration_actions: dict[RetrievabilityMode, QAction] = {}
+_mode_um_plus_actions: dict[RetrievabilityMode, QAction] = {}
 _mode_retrievability_actions: dict[RetrievabilityMode, QAction] = {}
 _mode_reschedule_actions: dict[RetrievabilityMode, QAction] = {}
 _active_review_prototype_actions: list[QAction] = []
@@ -145,6 +149,13 @@ def _add_top_level_mode_actions(menu: QMenu, mode: RetrievabilityMode) -> None:
     )
     evaluate_menu.addAction(calibration_action)
 
+    um_plus_action = QAction("UM+...", mw)
+    qconnect(
+        um_plus_action.triggered,
+        lambda _checked=False, mode=mode: show_um_plus_dialog(mode=mode),
+    )
+    evaluate_menu.addAction(um_plus_action)
+
     if mode == RetrievabilityMode.FORGETTING_CURVE:
         reschedule_action = QAction("Reschedule Cards", mw)
         qconnect(
@@ -157,6 +168,7 @@ def _add_top_level_mode_actions(menu: QMenu, mode: RetrievabilityMode) -> None:
     _mode_evaluate_menu_actions[mode] = evaluate_menu.menuAction()
     _mode_evaluate_actions[mode] = evaluate_action
     _mode_calibration_actions[mode] = calibration_action
+    _mode_um_plus_actions[mode] = um_plus_action
     _mode_retrievability_actions[mode] = retrievability_action
 
 
@@ -164,6 +176,7 @@ def setup_menu() -> None:
     global _rwkv_menu, _checkpoint_action, _checkpoint_rebuild_action
     global _checkpoint_manage_action, _checkpoint_integrity_action
     global _live_review_history_action, _behavior_lab_action
+
     global _fsrs_disabled_action, _rwkv_normal_menu_actions
     global _mode_section_separator, _curve_section_separator
     if _rwkv_menu is not None:
@@ -261,6 +274,16 @@ def setup_menu() -> None:
     # but reloads and newer startup sequences can initialize us afterward.
     # The scheduler is idempotent, so eagerly checking closes that race.
     _schedule_initial_setup()
+
+
+
+
+
+
+
+
+
+
 
 
 def _install_top_level_rwkv_menu(menu: QMenu) -> None:
@@ -419,6 +442,7 @@ def refresh_menu_state() -> None:
         *_mode_evaluate_menu_actions.values(),
         *_mode_evaluate_actions.values(),
         *_mode_calibration_actions.values(),
+        *_mode_um_plus_actions.values(),
         *_mode_retrievability_actions.values(),
         *_mode_reschedule_actions.values(),
         *_active_review_prototype_actions,
@@ -428,6 +452,7 @@ def refresh_menu_state() -> None:
         or len(_mode_evaluate_menu_actions) != len(RETRIEVABILITY_MODES)
         or len(_mode_evaluate_actions) != len(RETRIEVABILITY_MODES)
         or len(_mode_calibration_actions) != len(RETRIEVABILITY_MODES)
+        or len(_mode_um_plus_actions) != len(RETRIEVABILITY_MODES)
         or len(_mode_retrievability_actions) != len(RETRIEVABILITY_MODES)
     ):
         return
@@ -478,6 +503,7 @@ def refresh_menu_state() -> None:
             _mode_evaluate_menu_actions[mode],
             _mode_evaluate_actions[mode],
             _mode_calibration_actions[mode],
+            _mode_um_plus_actions[mode],
             _mode_retrievability_actions[mode],
         ):
             action.setEnabled(mode_ready)
@@ -545,6 +571,7 @@ def _set_retrievability_feature_visibility(*, immediate: bool, curves: bool) -> 
         _mode_evaluate_menu_actions.get(immediate_mode),
         _mode_evaluate_actions.get(immediate_mode),
         _mode_calibration_actions.get(immediate_mode),
+        _mode_um_plus_actions.get(immediate_mode),
         _mode_retrievability_actions.get(immediate_mode),
     )
     for action in immediate_actions:
@@ -558,6 +585,7 @@ def _set_retrievability_feature_visibility(*, immediate: bool, curves: bool) -> 
         _mode_evaluate_menu_actions.get(curve_mode),
         _mode_evaluate_actions.get(curve_mode),
         _mode_calibration_actions.get(curve_mode),
+        _mode_um_plus_actions.get(curve_mode),
         _mode_retrievability_actions.get(curve_mode),
     )
     for action in actions:
@@ -627,11 +655,11 @@ def run_checkpoint_integrity_action() -> None:
         )
 
     def integrity_op(_col, progress, previous):
-        result = manager.check_integrity(previous.review_data.rows, progress)
         manager.remember_review_data(
             previous.review_data,
             latest_collection_review_id=getattr(previous, "latest_review_id", None),
         )
+        result = manager.check_integrity(previous.review_data.rows, progress)
         return result
 
     def success(result) -> None:
@@ -1047,6 +1075,7 @@ def _cache_completed_checkpoint_build_speed(
             mode=str(mode),
             review_count=review_count,
             duration_seconds=duration_seconds,
+            state_precision=getattr(manager, "state_precision", "fp32"),
         )
 
 
@@ -1150,11 +1179,7 @@ def _checkpoint_processing_speed_note(speed: CheckpointBuildSpeedEstimate) -> st
         )
     if speed.basis == CHECKPOINT_SPEED_WITHOUT_CURVES:
         measurement = speed.measurement
-        mode_label = (
-            "GPU"
-            if measurement is not None and measurement.mode == "gpu"
-            else "CPU Fast"
-        )
+        mode_label = "GPU" if measurement is not None and measurement.mode == "gpu" else "CPU Fast"
         return (
             f'<p class="rwkv-checkpoint-estimate__note">No {mode_label} speed '
             "measurement with Forgetting Curves is available. This estimate uses "
@@ -1186,7 +1211,7 @@ def _selected_checkpoint_build_speed(store, manager) -> CheckpointBuildSpeedEsti
     config = addon_config_for_mw(mw)
     model_id = getattr(manager, "model_id", None)
     if model_id is None:
-        model_id = configured_model_id(config)
+        model_id = configured_runtime_model_id(config)
     selected_mode = getattr(manager, "process_many_mode", None)
     if selected_mode is None:
         selected_mode = process_many_mode(config)
@@ -1198,6 +1223,7 @@ def _selected_checkpoint_build_speed(store, manager) -> CheckpointBuildSpeedEsti
         model_id=str(model_id),
         return_curves=bool(return_curves),
         mode=str(selected_mode),
+        state_precision=getattr(manager, "state_precision", state_precision(config)),
     )
 
 
@@ -1234,6 +1260,18 @@ def show_calibration_dialog(
 
     initial_search = active_card_search_for_deck(mw.col, deck_id) if deck_id is not None else None
     CalibrationDialog(mw, initial_search=initial_search, mode=mode).show()
+
+
+def show_um_plus_dialog(
+    *, mode: RetrievabilityMode = RetrievabilityMode.IMMEDIATE,
+) -> None:
+    if not _require_retrievability_mode_enabled(mode, mw):
+        return
+    if not _require_ready():
+        return
+    from .calibration_dialog import CalibrationDialog
+
+    CalibrationDialog(mw, mode=mode, um_plus=True).show()
 
 
 def show_retrievability_dialog(
@@ -1415,10 +1453,9 @@ def show_active_review_prototype(deck_id: int | None = None) -> None:
 
 def show_live_review_history() -> None:
     try:
-        from .live_review_history_dialog import LiveReviewHistoryDialog
+        from .live_review_history_dialog import open_live_review_history
 
-        dialog = LiveReviewHistoryDialog(mw, store_for_mw(mw))
-        dialog.show()
+        open_live_review_history(mw, store_for_mw(mw))
     except Exception as exc:
         show_web_warning(
             f"Unable to open RWKV Live Review History: {exc}",

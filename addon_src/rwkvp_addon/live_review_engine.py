@@ -28,6 +28,7 @@ from .review_load_policy import (
     DEFAULT_MINIMUM_RETENTION_STEP,
     is_same_day_elapsed,
     prediction_below_retention,
+    validate_random_card_percent,
 )
 
 DEFAULT_HOT_PREDICT_LIMIT = 50
@@ -80,8 +81,10 @@ class LiveReviewSettings:
     same_day_reentry_delay_reviews: int = DEFAULT_SAME_DAY_REENTRY_DELAY_REVIEWS
     order_index: int = int(FilteredDeckOrder.RETRIEVABILITY_ASCENDING)
     adaptive_retention: AdaptiveRetentionSettings | None = None
+    random_card_percent: float = 0.0
 
     def __post_init__(self) -> None:
+        validate_random_card_percent(self.random_card_percent)
         _require_non_negative("hot_predict_limit", self.hot_predict_limit)
         _require_non_negative("hot_curve_margin", self.hot_curve_margin)
         _require_non_negative(
@@ -320,6 +323,7 @@ class LiveNativePredictionValue:
     card_id: int
     predicted_retrievability: float
     elapsed_days: float
+    randomly_selected: bool = False
 
 
 @dataclass(frozen=True)
@@ -356,12 +360,10 @@ class LiveReviewEngine:
     _undoable_candidates_by_review_id: dict[int, LiveReviewCandidate | None] = field(
         default_factory=dict
     )
-    _minimum_retention_extra_by_review_id: dict[int, float] = field(
-        default_factory=dict
+    _minimum_retention_extra_by_review_id: dict[int, float] = field(default_factory=dict)
+    _candidate_universe_snapshots_by_review_id: dict[int, _LiveCandidateUniverseUndoSnapshot] = (
+        field(default_factory=dict)
     )
-    _candidate_universe_snapshots_by_review_id: dict[
-        int, _LiveCandidateUniverseUndoSnapshot
-    ] = field(default_factory=dict)
     _hot_releases_by_review_id: dict[int, _LiveHotRelease] = field(default_factory=dict)
     _native_hot_includes_by_review_id: dict[int, set[int]] = field(default_factory=dict)
     _answered_desired_retention_by_card: dict[int, float] = field(default_factory=dict)
@@ -375,6 +377,14 @@ class LiveReviewEngine:
     _retention_records_by_review_id: dict[int, LiveRetentionRecord] = field(default_factory=dict)
     _skipped_retention_review_ids: set[int] = field(default_factory=set)
     _random_sort_keys: dict[int, float] = field(default_factory=dict)
+    # Grants only validate native-selected/buffered cards; they never expand the
+    # ranked pool. Retaining them until close also permits paired answer undo.
+    _random_selection_grants: set[int] = field(default_factory=set)
+    # The latest draw's provenance is separate from lifetime eligibility grants.
+    # Buffered draws stay fixed until answered/released; undo restores the whole
+    # pre-answer buffer, including a look-ahead card later drawn by another route.
+    _selection_randomly_selected_by_card: dict[int, bool] = field(default_factory=dict)
+    _selection_flags_by_review_id: dict[int, dict[int, bool]] = field(default_factory=dict)
     _candidate_transport_order_index: tuple[int, ...] = ()
     stale_recheck_batches: int = 0
     stale_recheck_checked_count: int = 0
@@ -403,8 +413,7 @@ class LiveReviewEngine:
         return tuple(
             card_id
             for card_id in self._emitted_card_order
-            if card_id in self._emitted_card_ids
-            and self._card_is_available_below_active_retention(card_id)
+            if card_id in self._emitted_card_ids and self._card_is_available_for_selection(card_id)
         )
 
     @property
@@ -652,6 +661,17 @@ class LiveReviewEngine:
             excluded.update(self._answered_card_ids)
         return tuple(excluded)
 
+    def native_mixed_selection_policy(self) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+        """Pass Anki-owned hot priority and exclusions to native mixed selection."""
+        priority = tuple(
+            hot.card_id for hot in self._hot_registry.values() if self._hot_card_is_released(hot)
+        )
+        excluded = set(self.native_selection_exclusion_card_ids())
+        excluded.difference_update(priority)
+        excluded.update(self._emitted_card_ids)
+        excluded.update(self._unavailable_card_ids)
+        return tuple(excluded), priority, self.reviews_done + len(self._emitted_card_ids)
+
     def apply_native_refresh_result(
         self,
         token: LivePredictionToken,
@@ -721,21 +741,39 @@ class LiveReviewEngine:
                 target_timestamp_seconds=target,
             )
             materialized = candidate_table.materialize(candidate)
-            candidate_table.below_retention[slot] = self._candidate_is_within_active_retention(
-                materialized
-            )
             if card_id in special_card_ids:
                 candidates_by_card[card_id] = materialized
                 candidate_table.upsert(materialized)
                 refreshed_special_candidates[card_id] = materialized
+            # upsert() initializes the generation-independent base-DR flag.
+            # Install Live's active policy afterward, including for special
+            # candidates, so widening is not erased by that metadata update.
+            candidate_table.below_retention[slot] = self._candidate_is_within_active_retention(
+                materialized
+            )
 
         self._reconcile_refreshed_special_candidates(refreshed_special_candidates)
+        for value in selected_values:
+            card_id = int(value.card_id)
+            if card_id not in self._emitted_card_ids:
+                self._selection_randomly_selected_by_card[card_id] = bool(
+                    self.settings.random_card_percent > 0 and value.randomly_selected
+                )
         hot_ids = set(self._hot_registry)
+        if self.settings.random_card_percent > 0:
+            self._random_selection_grants.update(
+                int(value.card_id)
+                for value in selected_values
+                if value.randomly_selected and value.elapsed_days >= 1
+            )
         self._native_selection_card_ids = tuple(
             card_id
             for value in selected_values
-            if (card_id := int(value.card_id)) not in hot_ids
-            and self._card_is_available_below_active_retention(card_id)
+            if (
+                (card_id := int(value.card_id)) not in hot_ids
+                or self.settings.random_card_percent > 0
+            )
+            and self._card_is_available_for_selection(card_id)
             and card_id not in self._emitted_card_ids
         )
         self._native_refreshed_count = max(0, int(refreshed_count))
@@ -1033,8 +1071,7 @@ class LiveReviewEngine:
         if not normalized_card_ids:
             return False
         if any(
-            not self._card_is_available_below_active_retention(card_id)
-            for card_id in normalized_card_ids
+            not self._card_is_available_for_selection(card_id) for card_id in normalized_card_ids
         ):
             return False
 
@@ -1049,8 +1086,7 @@ class LiveReviewEngine:
         if not normalized_card_ids:
             return False
         if any(
-            not self._card_is_available_below_active_retention(card_id)
-            for card_id in normalized_card_ids
+            not self._card_is_available_for_selection(card_id) for card_id in normalized_card_ids
         ):
             return False
 
@@ -1090,6 +1126,15 @@ class LiveReviewEngine:
                 transient_applied_review_count=self.transient_applied_review_count,
             )
 
+        review_id = _review_id_from_row(review_row)
+        if review_id is not None:
+            self._selection_flags_by_review_id[review_id] = {
+                card_id: self._selection_randomly_selected_by_card.get(card_id, False)
+                for card_id in self._emitted_card_ids
+            }
+        randomly_selected = self._selection_randomly_selected_by_card.get(
+            normalized_card_id, False,
+        )
         previous_minimum_retention_extra = float(self.minimum_retention_extra)
         answered_candidate = self._candidates_by_card.get(normalized_card_id)
         if answered_candidate is not None:
@@ -1123,6 +1168,7 @@ class LiveReviewEngine:
             review_row,
             answered_candidate=shown_candidate or answered_candidate,
             fsrs_prediction=shown_fsrs_prediction,
+            randomly_selected=randomly_selected,
         )
         self._record_undoable_review_row(
             review_row,
@@ -1227,6 +1273,9 @@ class LiveReviewEngine:
         self._shown_candidates_by_card.clear()
         self._shown_fsrs_predictions_by_card.clear()
         self._random_sort_keys.clear()
+        self._random_selection_grants.clear()
+        self._selection_randomly_selected_by_card.clear()
+        self._selection_flags_by_review_id.clear()
         self._candidate_transport_order_index = ()
         self.record_stale_recheck(batches=0, checked_count=0, eligible_count=0)
         self.minimum_retention_extra = 0.0
@@ -1236,6 +1285,15 @@ class LiveReviewEngine:
     def _next_unemitted_card_ids(self, limit: int) -> tuple[int, ...]:
         if int(limit) <= 0:
             return ()
+        if self.settings.random_card_percent > 0 and self._native_selection_enabled:
+            return self._take_indexed_card_ids(
+                self._native_selection_card_ids,
+                limit=int(limit),
+                predicate=lambda card_id: (
+                    card_id not in self._emitted_card_ids
+                    and self._card_is_available_for_selection(card_id)
+                ),
+            )
         selected: list[int] = []
         for card_id in self._hot_selectable_card_ids(limit=int(limit)):
             selected.append(card_id)
@@ -1287,8 +1345,8 @@ class LiveReviewEngine:
             predicate=lambda card_id: (
                 card_id not in excluded
                 and card_id not in self._emitted_card_ids
-                and card_id not in self._hot_registry
-                and self._card_is_available_below_active_retention(card_id)
+                and (card_id not in self._hot_registry or self.settings.random_card_percent > 0)
+                and self._card_is_available_for_selection(card_id)
             ),
         )
 
@@ -1344,6 +1402,18 @@ class LiveReviewEngine:
             slot is not None
             and self._candidate_table.below_retention[slot]
             and self._card_is_available(normalized)
+        )
+
+    def _card_is_available_for_selection(self, card_id: int) -> bool:
+        if self._card_is_available_below_active_retention(card_id):
+            return True
+        if self.settings.random_card_percent <= 0 or card_id not in self._random_selection_grants:
+            return False
+        slot = self._candidate_table.slot_by_card_id.get(card_id)
+        return (
+            slot is not None
+            and self._card_is_available(card_id)
+            and self._candidate_table.elapsed_days[slot] >= 1
         )
 
     def _card_is_stale_recheckable(self, card_id: int) -> bool:
@@ -1569,8 +1639,20 @@ class LiveReviewEngine:
         candidates_by_card = {
             int(candidate.card_id): candidate for candidate in snapshot.candidates
         }
+        # The universe snapshot is captured after the answer, which may have
+        # met the minimum and reset widening. Undo needs the pre-answer policy
+        # for both the answered card and the restored lookahead candidates.
+        self.minimum_retention_extra = float(
+            self._minimum_retention_extra_by_review_id.get(
+                int(review_id), snapshot.minimum_retention_extra
+            )
+        )
         self._candidates_by_card = candidates_by_card
         self._candidate_table.rebuild(candidates_by_card)
+        for slot, candidate in enumerate(self._candidate_table.candidates):
+            self._candidate_table.below_retention[slot] = (
+                self._candidate_is_within_active_retention(candidate)
+            )
         self._candidate_transport_order_index = tuple(snapshot.transport_card_ids)
         self._hot_registry = dict(snapshot.hot_registry)
         self._emitted_card_ids = set(snapshot.emitted_card_ids)
@@ -1580,7 +1662,6 @@ class LiveReviewEngine:
             snapshot.hot_candidate_templates_by_card
         )
         self._random_sort_keys = dict(snapshot.random_sort_keys)
-        self.minimum_retention_extra = float(snapshot.minimum_retention_extra)
         self._native_selection_card_ids = tuple(
             snapshot.native_selection_card_ids
         )
@@ -1592,6 +1673,7 @@ class LiveReviewEngine:
         *,
         answered_candidate: LiveReviewCandidate | None,
         fsrs_prediction: float | None = None,
+        randomly_selected: bool = False,
     ) -> None:
         if review_row is None:
             return
@@ -1599,6 +1681,7 @@ class LiveReviewEngine:
             answered_candidate,
             review_row,
             fsrs_prediction=fsrs_prediction,
+            randomly_selected=randomly_selected,
         )
         if record is None:
             review_id = _review_id_from_row(review_row)
@@ -1621,6 +1704,9 @@ class LiveReviewEngine:
         self._shown_candidates_by_card.pop(card_id, None)
         self._shown_fsrs_predictions_by_card.pop(card_id, None)
         if review_id is not None:
+            self._selection_randomly_selected_by_card.update(
+                self._selection_flags_by_review_id.pop(review_id, {})
+            )
             self._hot_releases_by_review_id.pop(review_id, None)
             self._retention_records_by_review_id.pop(review_id, None)
             self._skipped_retention_review_ids.discard(review_id)
@@ -1634,7 +1720,12 @@ class LiveReviewEngine:
         if candidate is not None:
             restored_card_id = int(candidate.card_id)
             self._candidates_by_card[restored_card_id] = candidate
-            self._candidate_table.upsert(candidate)
+            slot = self._candidate_table.upsert(candidate)
+            # A widened native selection can be above the original DR. The
+            # table's default base-DR flag would reject that same card on Undo.
+            self._candidate_table.below_retention[slot] = (
+                self._candidate_is_within_active_retention(candidate)
+            )
             self._unavailable_card_ids.discard(restored_card_id)
             if restored_card_id not in self._candidate_transport_order_index:
                 self._candidate_transport_order_index = (
@@ -1651,11 +1742,13 @@ class LiveReviewEngine:
             row = self._undoable_review_rows.popleft()
             review_id = _review_id_from_row(row)
             if review_id is not None:
+                self._selection_flags_by_review_id.pop(review_id, None)
                 self._undoable_candidates_by_review_id.pop(review_id, None)
                 self._minimum_retention_extra_by_review_id.pop(review_id, None)
                 self._hot_releases_by_review_id.pop(review_id, None)
                 self._native_hot_includes_by_review_id.pop(review_id, None)
                 self._candidate_universe_snapshots_by_review_id.pop(review_id, None)
+
 
 def _candidate_elapsed_days(candidate: LiveReviewCandidate) -> float:
     try:

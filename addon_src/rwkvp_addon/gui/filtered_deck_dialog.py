@@ -69,12 +69,22 @@ FILTERED_DECK_MINIMUM_CARD_LIMIT_TOOLTIP = (
     "Same-day cards are not widened."
 )
 FILTERED_DECK_CARD_LIMIT_TOOLTIP = "Caps how many cards are added to the filtered deck."
+FILTERED_DECK_ORDER_TOOLTIP = (
+    "Controls the order used to gather cards for the deck. Once built, cards in "
+    "the filtered deck are always shown in random order."
+)
+FILTERED_DECK_MIXED_ORDER_TOOLTIP = (
+    "Controls the order used to gather cards for the deck. "
+    "Cards are normally shown in random order. Random card % above 0 preserves "
+    "the mixed selection order, except in same-day-only decks."
+)
 FILTERED_DECK_MAX_CARD_LIMIT = 100000
 FILTERED_DECK_DEFAULT_CARD_LIMIT = 200
 FILTERED_DECK_DEFAULT_MINIMUM_CARD_LIMIT = 0
 FILTERED_DECK_DEFAULT_ORDER_INDEX = int(FilteredDeckOrder.RETRIEVABILITY_ASCENDING)
 FILTERED_DECK_SAME_DAY_ONLY_TOOLTIP = (
-    "Build a filtered deck using only cards that have already been reviewed today."
+    "Build a filtered deck using only cards that have already been reviewed today. "
+    "The main button builds from all eligible matching cards."
 )
 FILTERED_DECK_SEARCH_FILTER_PLACEHOLDER = "Optional Anki search filter, e.g. is:due or prop:ivl>20"
 FILTERED_DECK_SEARCH_FILTER_TOOLTIP = (
@@ -98,7 +108,10 @@ class FilteredDeckDialog(WebDialogHost):
         self.settings_key = filtered_deck_settings_key(mode, self.deck_id)
         self.source_name = deck_name(mw.col, self.deck_id)
         self.retentions = tuple(deck_retentions_for_subtree(mw.col, self.deck_id))
-        self.form_spec = _filtered_deck_form_spec(self.mode_spec.filtered_deck_title)
+        self.form_spec = _filtered_deck_form_spec(
+            self.mode_spec.filtered_deck_title,
+            random_card_available=self.mode == RetrievabilityMode.IMMEDIATE,
+        )
         self._study_controller = StudySessionFormController(
             spec=self.form_spec,
             source_name=self.source_name,
@@ -294,11 +307,17 @@ class FilteredDeckDialog(WebDialogHost):
                 ),
             )
             selected_ids = [candidate.card_id for candidate in plan.selected]
+            order_options = (
+                {"preserve_card_order": True}
+                if settings.random_card_percent > 0 and not settings.same_day_only
+                else {}
+            )
             op_result = create_filtered_deck_from_card_ids_with_changes(
                 col,
                 name=plan.deck_name,
                 card_ids=selected_ids,
                 order_index=1,
+                **order_options,
             )
             all_settings = store.settings()
             filtered_settings = all_settings.setdefault("filtered_deck_settings", {})
@@ -315,14 +334,14 @@ class FilteredDeckDialog(WebDialogHost):
             self._study_controller.finish_submission(rerender=False)
             plan, op_result = result
             notify_collection_operation_finished(op_result)
+            self.accept()
             show_quiet_info(
                 f"Created filtered deck:\n{plan.deck_name}\n\n"
                 f"Selected cards: {len(plan.selected)}\n"
                 f"Expected R: {plan.expected_retrievability:.4f}",
                 title=self.mode_spec.warning_title,
-                parent=self,
+                parent=mw,
             )
-            self.accept()
 
         def failure(exc: Exception) -> None:
             if self.cleaned_up:
@@ -366,6 +385,9 @@ class FilteredDeckDialog(WebDialogHost):
             minimum=request.minimum,
             minimum_retention_extra_quantum=minimum_review_widening_extra(addon_config_for_mw(mw)),
             adaptive_retention=request.adaptive_retention_settings,
+            random_card_percent=(
+                request.random_card_percent if self.mode == RetrievabilityMode.IMMEDIATE else 0.0
+            ),
         )
 
     def _matching_candidate_count(self, search_filter: str) -> int:
@@ -396,7 +418,9 @@ class FilteredDeckDialog(WebDialogHost):
         )
 
 
-def _filtered_deck_form_spec(title: str) -> StudySessionFormSpec:
+def _filtered_deck_form_spec(
+    title: str, *, random_card_available: bool = False
+) -> StudySessionFormSpec:
     return StudySessionFormSpec(
         title=title,
         intro=("Build a temporary deck selected and ordered by RWKV retrievability."),
@@ -419,6 +443,13 @@ def _filtered_deck_form_spec(title: str) -> StudySessionFormSpec:
         same_day_action="build-same-day-deck",
         same_day_label="Build Same-Day-Only Deck",
         same_day_description=FILTERED_DECK_SAME_DAY_ONLY_TOOLTIP,
+        order_description=(
+            FILTERED_DECK_MIXED_ORDER_TOOLTIP
+            if random_card_available
+            else FILTERED_DECK_ORDER_TOOLTIP
+        ),
+        split_same_day_action=True,
+        random_card_available=random_card_available,
     )
 
 

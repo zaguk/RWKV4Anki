@@ -202,10 +202,13 @@ def fsrs_training_item_review_ids(
     ignore_revlogs_before_ms: int = 0,
 ) -> list[int]:
     allowed_cards = None if card_ids is None else {int(card_id) for card_id in card_ids}
-    scoped = (
-        row
-        for row in sorted(revlogs, key=lambda item: (int(item["card_id"]), int(item["review_id"])))
-        if allowed_cards is None or int(row["card_id"]) in allowed_cards
+    scoped = sorted(
+        (
+            row
+            for row in revlogs
+            if allowed_cards is None or int(row["card_id"]) in allowed_cards
+        ),
+        key=lambda item: (int(item["card_id"]), int(item["review_id"])),
     )
     item_ids: list[int] = []
     for _card_id, card_entries in groupby(scoped, key=lambda item: int(item["card_id"])):

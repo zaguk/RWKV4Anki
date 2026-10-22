@@ -2,6 +2,8 @@ name: Build RWKV4Anki release
 
 'on':
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -20,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RWKV4ANKI_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  RWKV4ANKI_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
 
 jobs:
   package:
@@ -128,7 +130,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: assemble
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -148,6 +150,19 @@ jobs:
       - name: Publish the immutable tag's assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: |
+            ## V5o-a: experimental
+
+            V5o-a (shown as V5 in Settings) is experimental and intended to be superseded by a future model generation. It is optional; V1 remains the default for new profiles. V5 supports Immediate predictions, while forgetting-curve features require V1.
+
+            ## Highlights
+
+            - Every platform bundle includes both V1 models and V5o-a, with the pinned RWKV-SRS v0.1.1 runtime. No separate model download is needed in Anki.
+            - New configurations use FP16 card/note storage and prefer GPU (Full FP16) predictions on supported hardware. Existing storage choices are preserved; CPU Fast remains available.
+            - Guided Setup includes storage-precision comparisons. Live Review History provides separate LogLoss, RMSE(bins), and AUC tables.
+            - Changing the model, history policy, or storage precision requires compatible state or a rebuild. Changing GPU prediction math does not require rebuilding state.
+
+            Download the .ankiaddon matching your operating system and CPU architecture, install it through Anki's Add-ons window, and restart Anki. Keep normal collection backups when testing experimental models.
         run: >-
           gh release create "${{ github.ref_name }}"
           qualified-release/release-assets/*.ankiaddon
@@ -155,5 +170,5 @@ jobs:
           qualified-release/assembled/RELEASE_PROVENANCE.json
           --repo "${{ github.repository }}"
           --verify-tag
-          --generate-notes
+          --notes "$RELEASE_NOTES"
           --title "RWKV4Anki ${{ github.ref_name }}"

@@ -41,6 +41,10 @@ class WindowsNativeCacheError(RuntimeError):
     pass
 
 
+class WindowsNativeLoadError(WindowsNativeCacheError):
+    """The verified cache was ready, but importing its native module failed."""
+
+
 @dataclass(frozen=True)
 class WindowsNativeCacheEntry:
     source_path: Path
@@ -89,7 +93,15 @@ def prepare_windows_native_extension(
             raise WindowsNativeCacheError(
                 f"Cached RWKV-SRS native extension failed verification: {entry.cached_path}"
             )
-        load_cached_windows_native_module(entry.cached_path)
+        try:
+            load_cached_windows_native_module(entry.cached_path)
+        except Exception as exc:
+            python_bits = 64 if sys.maxsize > 2**32 else 32
+            raise WindowsNativeLoadError(
+                f"Cached extension: {entry.cached_path}\n"
+                f"Python: {platform.python_version()} ({python_bits}-bit); "
+                f"machine: {platform.machine()}"
+            ) from exc
         return entry.cached_path
 
 

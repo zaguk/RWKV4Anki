@@ -342,13 +342,132 @@
         }
     };
 
+    const sortableValue = (row, key, kind) => {
+        let values = {};
+        try {
+            values = JSON.parse(row.dataset.rwkvSortValues || "{}");
+        } catch (_error) {
+            return null;
+        }
+        const raw = values?.[key];
+        if (raw === null || raw === undefined || raw === "") {
+            return null;
+        }
+        if (kind === "number") {
+            const numeric = Number(raw);
+            return Number.isFinite(numeric) ? numeric : null;
+        }
+        return String(raw);
+    };
+
+    const compareSortableValues = (left, right, kind, direction) => {
+        const leftMissing = left === null;
+        const rightMissing = right === null;
+        if (leftMissing || rightMissing) {
+            if (leftMissing && rightMissing) return 0;
+            return leftMissing ? 1 : -1;
+        }
+        const compared = kind === "number"
+            ? left - right
+            : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+        return direction === "descending" ? -compared : compared;
+    };
+
+    const initializeSortableTables = (container = root) => {
+        for (const table of container.querySelectorAll("[data-rwkv-sortable-table]")) {
+            const body = table.querySelector("tbody");
+            if (!body) {
+                continue;
+            }
+            const originalRows = Array.from(body.querySelectorAll("tr[data-rwkv-sort-values]"));
+            originalRows.forEach((row, index) => {
+                if (!row.hasAttribute("data-rwkv-sort-original-index")) {
+                    row.dataset.rwkvSortOriginalIndex = String(index);
+                }
+            });
+            for (const button of table.querySelectorAll("[data-rwkv-sort-key]")) {
+                if (button.hasAttribute("data-rwkv-sort-bound")) {
+                    continue;
+                }
+                button.setAttribute("data-rwkv-sort-bound", "true");
+                button.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    const key = String(button.dataset.rwkvSortKey || "");
+                    const kind = button.dataset.rwkvSortKind === "number" ? "number" : "text";
+                    const label = String(button.dataset.rwkvSortLabel || key || "column");
+                    const direction = (
+                        table.dataset.rwkvSortKey === key
+                        && table.dataset.rwkvSortDirection === "ascending"
+                    ) ? "descending" : "ascending";
+                    const rows = Array.from(
+                        body.querySelectorAll("tr[data-rwkv-sort-values]")
+                    ).map((row) => ({
+                        row,
+                        value: sortableValue(row, key, kind),
+                        originalIndex: Number(row.dataset.rwkvSortOriginalIndex || 0),
+                    }));
+                    rows.sort((left, right) => {
+                        const compared = compareSortableValues(
+                            left.value,
+                            right.value,
+                            kind,
+                            direction,
+                        );
+                        return compared || left.originalIndex - right.originalIndex;
+                    });
+                    for (const entry of rows) {
+                        body.appendChild(entry.row);
+                    }
+
+                    const sortButtons = Array.from(
+                        table.querySelectorAll("[data-rwkv-sort-key]")
+                    );
+                    for (const candidate of sortButtons) {
+                        candidate.setAttribute("aria-pressed", "false");
+                        candidate.removeAttribute("data-rwkv-sort-direction");
+                        const candidateLabel = String(
+                            candidate.dataset.rwkvSortLabel
+                            || candidate.dataset.rwkvSortKey
+                            || "column"
+                        );
+                        candidate.setAttribute(
+                            "aria-label",
+                            `Sort by ${candidateLabel}, ascending`,
+                        );
+                        const indicator = candidate.querySelector(
+                            ".rwkv-table-sort-indicator"
+                        );
+                        if (indicator) indicator.textContent = "";
+                        candidate.closest("th")?.removeAttribute("aria-sort");
+                    }
+                    table.dataset.rwkvSortKey = key;
+                    table.dataset.rwkvSortDirection = direction;
+                    button.setAttribute("aria-pressed", "true");
+                    button.setAttribute("data-rwkv-sort-direction", direction);
+                    button.setAttribute(
+                        "aria-label",
+                        `Sort by ${label}, ${direction === "ascending" ? "descending" : "ascending"}`,
+                    );
+                    button.closest("th")?.setAttribute("aria-sort", direction);
+                    const indicator = button.querySelector(".rwkv-table-sort-indicator");
+                    if (indicator) {
+                        indicator.textContent = direction === "ascending" ? "▲" : "▼";
+                    }
+                    announce(`Sorted by ${label}, ${direction}.`);
+                });
+            }
+        }
+    };
+
     /*
      * Chromium renders select and temporal-input pickers in separate native
      * popup widgets.  Qt WebEngine can repeatedly enlarge those widgets on
      * some Windows installations, leaving a growing white tail.  On
-     * Windows we keep popup controls inside this document instead.  The
-     * original form controls remain authoritative so existing Python bridges,
-     * local scripts, validation, and FormData contracts do not change.
+     * Windows we keep popup controls inside this document instead. Dates use
+     * the shared text entry/calendar on every platform: native segmented date
+     * editors emit change while typing, which can rerender a workflow before
+     * the user finishes the year. Original form controls remain authoritative
+     * for Python bridges, local scripts, and FormData.
      */
     const popupCandidates = (container, selector) => {
         const candidates = [];
@@ -523,8 +642,7 @@
 
     const sourceOptions = (source) => Array.from(source.querySelectorAll("option"));
 
-    const selectedSourceOption = (source) => {
-        const options = sourceOptions(source);
+    const selectedSourceOption = (source, options = sourceOptions(source)) => {
         return options.find((option) => String(option.value) === String(source.value))
             || options.find((option) => option.selected || option.hasAttribute("selected"))
             || options.find((option) => !option.disabled)
@@ -597,49 +715,82 @@
         record.panel = panel;
         trigger.setAttribute("aria-controls", panel.id);
 
+        let renderedOptions = [];
+        let optionControls = [];
         const refresh = () => {
             if (!source.isConnected) {
                 return;
             }
-            const selected = selectedSourceOption(source);
-            if (selected && !sourceOptions(source).some(
+            const options = sourceOptions(source);
+            const selected = selectedSourceOption(source, options);
+            if (selected && !options.some(
                 (option) => String(option.value) === String(source.value)
             )) {
                 source.value = selected.value;
             }
-            valueLabel.textContent = selected?.textContent || "Select";
-            trigger.disabled = Boolean(source.disabled);
-            trigger.setAttribute("aria-disabled", String(trigger.disabled));
-            const invalid = source.getAttribute("aria-invalid");
-            if (invalid === null) {
-                trigger.removeAttribute("aria-invalid");
-            } else {
-                trigger.setAttribute("aria-invalid", invalid);
+            const selectedLabel = selected?.textContent || "Select";
+            if (valueLabel.textContent !== selectedLabel) {
+                valueLabel.textContent = selectedLabel;
             }
-            panel.replaceChildren();
-            for (const [index, option] of sourceOptions(source).entries()) {
-                const optionControl = document.createElement("button");
-                optionControl.className = "rwkv-popup-listbox__option";
-                optionControl.type = "button";
-                optionControl.id = `${id}-option-${index}`;
-                optionControl.setAttribute("role", "option");
-                optionControl.setAttribute(
-                    "aria-selected",
-                    String(selected === option || String(option.value) === String(source.value)),
-                );
-                optionControl.disabled = Boolean(option.disabled);
-                optionControl.textContent = option.textContent || String(option.value);
-                optionControl.addEventListener("click", () => {
-                    if (optionControl.disabled) {
-                        return;
-                    }
-                    source.value = option.value;
-                    refresh();
-                    closePopupControl({ restoreFocus: true });
-                    dispatchPopupSourceEvent(source, "input");
-                    dispatchPopupSourceEvent(source, "change");
+            if (trigger.disabled !== Boolean(source.disabled)) {
+                trigger.disabled = Boolean(source.disabled);
+            }
+            if (trigger.getAttribute("aria-disabled") !== String(trigger.disabled)) {
+                trigger.setAttribute("aria-disabled", String(trigger.disabled));
+            }
+            const invalid = source.getAttribute("aria-invalid");
+            if (trigger.getAttribute("aria-invalid") !== invalid) {
+                if (invalid === null) {
+                    trigger.removeAttribute("aria-invalid");
+                } else {
+                    trigger.setAttribute("aria-invalid", invalid);
+                }
+            }
+            // Input/change events and attribute observers often report the same
+            // selection. Keep option nodes (and keyboard focus) unless the
+            // source list itself changes, instead of rebuilding it each time.
+            if (options.length !== renderedOptions.length || options.some(
+                (option, index) => option !== renderedOptions[index]
+            )) {
+                renderedOptions = options;
+                optionControls = options.map((option, index) => {
+                    const control = document.createElement("button");
+                    control.className = "rwkv-popup-listbox__option";
+                    control.type = "button";
+                    control.id = `${id}-option-${index}`;
+                    control.setAttribute("role", "option");
+                    control.addEventListener("click", () => {
+                        if (control.disabled) {
+                            return;
+                        }
+                        source.value = option.value;
+                        refresh();
+                        closePopupControl({ restoreFocus: true });
+                        dispatchPopupSourceEvent(source, "input");
+                        dispatchPopupSourceEvent(source, "change");
+                    });
+                    return control;
                 });
-                panel.appendChild(optionControl);
+                panel.replaceChildren();
+                for (const control of optionControls) {
+                    panel.appendChild(control);
+                }
+            }
+            for (const [index, option] of options.entries()) {
+                const control = optionControls[index];
+                const isSelected = String(
+                    selected === option || String(option.value) === String(source.value)
+                );
+                if (control.getAttribute("aria-selected") !== isSelected) {
+                    control.setAttribute("aria-selected", isSelected);
+                }
+                if (control.disabled !== Boolean(option.disabled)) {
+                    control.disabled = Boolean(option.disabled);
+                }
+                const text = option.textContent || String(option.value);
+                if (control.textContent !== text) {
+                    control.textContent = text;
+                }
             }
         };
         record.refresh = refresh;
@@ -765,10 +916,18 @@
         const error = temporalValidationMessage(record, normalized);
         record.proxy.setCustomValidity?.(error);
         record.proxy.setAttribute("aria-invalid", String(Boolean(error)));
+        // Keep the literal draft and caret while typing (including partial or
+        // invalid dates). Only normalize after the text edit is committed.
+        if (eventType === "change" && !error) {
+            record.proxy.value = temporalDisplayValue(record.kind, normalized);
+        }
         record.writingSource = true;
-        record.source.value = normalized === null ? "" : normalized;
-        dispatchPopupSourceEvent(record.source, eventType);
-        record.writingSource = false;
+        try {
+            record.source.value = normalized === null ? "" : normalized;
+            dispatchPopupSourceEvent(record.source, eventType);
+        } finally {
+            record.writingSource = false;
+        }
         return !error;
     };
 
@@ -781,14 +940,12 @@
         }
         record.proxy.disabled = Boolean(record.source.disabled);
         record.trigger.disabled = Boolean(record.source.disabled);
-        const invalid = record.source.getAttribute("aria-invalid");
-        if (invalid === null) {
-            record.proxy.removeAttribute("aria-invalid");
-        } else {
-            record.proxy.setAttribute("aria-invalid", invalid);
-        }
         const normalized = normalizeTemporalText(record.kind, record.proxy.value);
-        record.proxy.setCustomValidity?.(temporalValidationMessage(record, normalized));
+        const error = temporalValidationMessage(record, normalized);
+        record.proxy.setCustomValidity?.(error);
+        record.proxy.setAttribute("aria-invalid", String(
+            Boolean(error) || record.source.getAttribute("aria-invalid") === "true",
+        ));
     };
 
     const monthNames = (
@@ -986,7 +1143,10 @@
         source.removeAttribute("required");
         source.removeAttribute("min");
         source.removeAttribute("max");
-        source.removeAttribute("step");
+        // Validation belongs to the visible editor. Removing step restores the
+        // browser's default minute step, which rejects otherwise valid typed
+        // seconds in a hidden datetime-local source during form submission.
+        source.setAttribute("step", "any");
         source.required = false;
 
         const wrapper = document.createElement("div");
@@ -1103,15 +1263,16 @@
     };
 
     const initializePopupControls = (container = root) => {
-        if (!useInPagePopupControls) {
-            return;
-        }
-        for (const select of popupCandidates(container, "select")) {
-            enhanceSelectControl(select);
+        if (useInPagePopupControls) {
+            for (const select of popupCandidates(container, "select")) {
+                enhanceSelectControl(select);
+            }
         }
         for (const input of popupCandidates(
             container,
-            "input[type=date], input[type=time], input[type=datetime-local]",
+            useInPagePopupControls
+                ? "input[type=date], input[type=time], input[type=datetime-local]"
+                : "input[type=date], input[type=datetime-local]",
         )) {
             enhanceTemporalControl(input);
         }
@@ -1131,31 +1292,43 @@
     };
 
     const initializePopupControlWorkaround = () => {
-        if (!useInPagePopupControls) {
-            return;
-        }
-        root.classList.add("rwkv-in-page-popup-controls");
+        root.classList.toggle("rwkv-in-page-popup-controls", useInPagePopupControls);
         initializePopupControls(root);
         if (typeof window.MutationObserver === "function") {
             popupControlObserver = new window.MutationObserver((mutations) => {
+                const changedControls = new Set();
+                let removedNodes = false;
                 for (const mutation of mutations) {
                     if (mutation.type === "childList") {
                         for (const node of mutation.addedNodes || []) {
                             initializePopupControls(node);
                         }
                         const select = mutation.target?.closest?.("select");
-                        popupControlRecords.get(select)?.refresh?.();
+                        const record = popupControlRecords.get(select);
+                        if (record) {
+                            changedControls.add(record);
+                        }
+                        removedNodes ||= Boolean(mutation.removedNodes?.length);
                     } else if (mutation.type === "attributes") {
                         const record = popupControlRecords.get(mutation.target)
                             || popupControlRecords.get(mutation.target?.closest?.("select"));
-                        if (record?.kind === "select") {
-                            record.refresh();
-                        } else if (record) {
-                            syncTemporalFromSource(record, { syncValue: false });
+                        if (record) {
+                            changedControls.add(record);
                         }
                     }
                 }
-                cleanupPopupControls();
+                // Updating many options in one turn should scan each select
+                // once, not once per mutation (quadratic for large lists).
+                for (const record of changedControls) {
+                    if (record.kind === "select") {
+                        record.refresh();
+                    } else {
+                        syncTemporalFromSource(record, { syncValue: false });
+                    }
+                }
+                if (removedNodes) {
+                    cleanupPopupControls();
+                }
             });
             popupControlObserver.observe(root, {
                 attributes: true,
@@ -1703,6 +1876,37 @@
             ?.addEventListener("click", () => finishPrompt(false));
     }
 
+    const exclusiveBaseDisabled = new WeakMap();
+    const exclusiveActive = (control) => control.type === "checkbox"
+        ? Boolean(control.checked) : control.value !== "";
+    const syncExclusiveField = (source, clearPeer = false) => {
+        const peer = document.getElementById(source.dataset.rwkvExclusiveWith);
+        if (!peer || peer.dataset.rwkvExclusiveWith !== source.id) return;
+        if (clearPeer && !source.disabled && exclusiveActive(source)) {
+            if (peer.type === "checkbox") peer.checked = false;
+            else peer.value = "";
+        }
+        for (const [control, other] of [[source, peer], [peer, source]]) {
+            control.disabled = exclusiveBaseDisabled.get(control) || exclusiveActive(other);
+            control.setAttribute("aria-disabled", String(control.disabled));
+        }
+    };
+    const initializeExclusiveFields = () => {
+        const controls = document.querySelectorAll("[data-rwkv-exclusive-with]");
+        for (const control of controls) {
+            if (!exclusiveBaseDisabled.has(control)) {
+                exclusiveBaseDisabled.set(control, Boolean(control.disabled));
+            }
+        }
+        for (const control of controls) syncExclusiveField(control);
+    };
+    for (const kind of ["input", "change"]) {
+        document.addEventListener(kind, (event) => {
+            const source = event.target.closest("[data-rwkv-exclusive-with]");
+            if (source && !source.disabled) syncExclusiveField(source, true);
+        });
+    }
+
     const serializeForm = (form) => {
         const payload = {};
         for (const [name, value] of new FormData(form).entries()) {
@@ -1729,16 +1933,39 @@
                 payload[control.name] = control.value;
             }
         }
+        // Multi-selects always carry an array, including zero/one selection and
+        // disabled drafts. Inline listboxes retain native Ctrl/Shift behavior.
+        for (const control of form.querySelectorAll('select[multiple][name]')) {
+            payload[control.name] = sourceOptions(control)
+                .filter((option) => option.selected && !option.disabled)
+                .map((option) => option.value);
+        }
         return payload;
     };
 
-    const submitForm = (form, submitter = null, actionOverride = "") => {
-        if (!submitter?.formNoValidate && !form.reportValidity()) {
-            return false;
+    const validateTemporalDrafts = (form, { report = false } = {}) => {
+        for (const [source, record] of popupControlRecords) {
+            if (!record.proxy || source.disabled || source.closest("form") !== form) continue;
+            const normalized = normalizeTemporalText(record.kind, record.proxy.value);
+            if (temporalValidationMessage(record, normalized)) {
+                if (report) record.proxy.reportValidity?.();
+                return false;
+            }
         }
+        return true;
+    };
+
+    const submitForm = (form, submitter = null, actionOverride = "") => {
         const action = actionOverride
             || submitter?.dataset?.rwkvAction
             || form.dataset.rwkvFormAction;
+        submitter = submitter || findEnterSubmitter(form, action);
+        if (submitter?.disabled || submitter?.getAttribute("aria-disabled") === "true") {
+            return false;
+        }
+        if (!submitter?.formNoValidate && !form.reportValidity()) {
+            return false;
+        }
         const payload = {
             ...serializeForm(form),
             ...(submitter ? parsePayload(submitter) : {}),
@@ -1753,9 +1980,11 @@
             return (
                 (control.tagName === "BUTTON" && type === "submit")
                 || (control.tagName === "INPUT" && ["submit", "image"].includes(type))
-            ) && !control.disabled && control.getAttribute("aria-disabled") !== "true";
+            );
         });
-        return submitters.find((control) => control.dataset.rwkvAction === action) || null;
+        const matching = submitters.filter((control) => control.dataset.rwkvAction === action);
+        return matching.find((control) => !control.disabled
+            && control.getAttribute("aria-disabled") !== "true") || matching[0] || null;
     };
 
     const activateTab = (tab) => {
@@ -1809,6 +2038,10 @@
         }
         event.preventDefault();
         const form = button.closest("form");
+        if (button.hasAttribute("data-rwkv-serialize-form") && form
+            && !button.formNoValidate && !validateTemporalDrafts(form, { report: true })) {
+            return;
+        }
         const payload = button.hasAttribute("data-rwkv-serialize-form") && form
             ? { ...serializeForm(form), ...parsePayload(button) }
             : parsePayload(button);
@@ -1825,11 +2058,9 @@
         submitForm(form, submitter);
     });
 
-    document.addEventListener("change", (event) => {
-        const control = event.target.closest("[data-rwkv-change-action]");
-        if (!control || control.disabled || control.getAttribute("aria-disabled") === "true") {
-            return;
-        }
+    function syncEnabledTargets(control, seen = new Set()) {
+        if (seen.has(control)) return;
+        seen.add(control);
         const dependencyTargets = String(control.dataset.rwkvEnableTargets || "")
             .split(",")
             .map((value) => value.trim())
@@ -1839,9 +2070,69 @@
             if (!target) {
                 continue;
             }
-            target.disabled = !Boolean(control.checked);
+            target.disabled = control.disabled || !Boolean(control.checked);
+            if (target.disabled && target.type === "checkbox") target.checked = false;
             target.setAttribute("aria-disabled", String(target.disabled));
+            syncEnabledTargets(target, seen);
         }
+    }
+
+    const checkAllBaseDisabled = new WeakMap();
+    const checkAllTargets = (control) => String(control.dataset.rwkvCheckAllTargets || "")
+        .split(",")
+        .map(id => document.getElementById(id.trim()))
+        .filter(target => target && target !== control && target.type === "checkbox"
+            && !target.hasAttribute("data-rwkv-check-all-targets")
+            && target.closest("form") === control.closest("form"));
+    const syncCheckAllControls = () => {
+        for (const control of document.querySelectorAll("[data-rwkv-check-all-targets]")) {
+            if (!checkAllBaseDisabled.has(control)) {
+                checkAllBaseDisabled.set(control, Boolean(control.disabled));
+            }
+            const targets = checkAllTargets(control).filter(target => !target.disabled);
+            const checked = targets.filter(target => target.checked).length;
+            control.checked = targets.length > 0 && checked === targets.length;
+            control.indeterminate = checked > 0 && checked < targets.length;
+            control.disabled = checkAllBaseDisabled.get(control) || !targets.length;
+            control.setAttribute("aria-disabled", String(control.disabled));
+            control.setAttribute("aria-checked", control.indeterminate ? "mixed" : String(control.checked));
+        }
+    };
+    const changeCheckAll = (control) => {
+        const pending = new Set(checkAllTargets(control));
+        // Enabling a parent can unlock another target earlier in the list.
+        // Revisit those targets without sending intermediate form/bridge actions.
+        let changed = true;
+        while (pending.size && changed) {
+            changed = false;
+            for (const target of pending) {
+                if (target.disabled) continue;
+                target.checked = Boolean(control.checked);
+                syncEnabledTargets(target);
+                pending.delete(target);
+                changed = true;
+            }
+        }
+    };
+
+    document.addEventListener("change", (event) => {
+        const all = event.target.closest("[data-rwkv-check-all-targets]");
+        if (all && !all.disabled && all.getAttribute("aria-disabled") !== "true") {
+            changeCheckAll(all);
+            syncCheckAllControls();
+            return;
+        }
+        const checkbox = event.target.closest('input[type="checkbox"]');
+        if (checkbox && !checkbox.disabled) {
+            syncEnabledTargets(checkbox);
+            syncCheckAllControls();
+        }
+        const control = event.target.closest("[data-rwkv-change-action], [data-rwkv-enable-targets]");
+        if (!control || control.disabled || control.getAttribute("aria-disabled") === "true") {
+            return;
+        }
+        if (control !== checkbox) syncEnabledTargets(control);
+        if (!control.dataset.rwkvChangeAction) return;
         const form = control.closest("form");
         let payload;
         if (control.dataset.rwkvChangeAction === "message-checkbox-change") {
@@ -1850,6 +2141,9 @@
                 checked: Boolean(control.checked),
             };
         } else if (control.hasAttribute("data-rwkv-change-serialize-form") && form) {
+            // Auto-updates can rebuild the whole page. Leave unfinished dates
+            // editable, including when the user changes a sibling field.
+            if (!validateTemporalDrafts(form)) return;
             payload = serializeForm(form);
         } else if (control.name) {
             payload = {
@@ -1914,6 +2208,9 @@
                 const action = event.target.dataset.rwkvEnterAction
                     || form.dataset.rwkvFormAction;
                 const submitter = findEnterSubmitter(form, action);
+                if (submitter?.disabled || submitter?.getAttribute("aria-disabled") === "true") {
+                    return;
+                }
                 if (typeof form.requestSubmit === "function" && submitter) {
                     form.requestSubmit(submitter);
                 } else if (
@@ -1985,11 +2282,13 @@
     initializeGlossaryTerms();
     initializeTooltips();
     initializeDisclosures();
-    if (useInPagePopupControls) {
-        // Local workflow scripts run immediately after this shared script and
-        // may populate controls.  Enhance the settled DOM on the next frame.
-        window.requestAnimationFrame(initializePopupControlWorkaround);
-    }
+    initializeSortableTables();
+    initializeExclusiveFields();
+    syncCheckAllControls();
+    // Local workflow scripts run immediately after this shared script and
+    // may populate controls. Enhance dates everywhere, and Windows popup
+    // controls when enabled, after the initial DOM has settled.
+    window.requestAnimationFrame(initializePopupControlWorkaround);
 
     for (const overlay of document.querySelectorAll("[data-rwkv-overlay]:not([hidden])")) {
         showOverlay(overlay);
@@ -2007,10 +2306,13 @@
         activateTab,
         hideOverlay,
         initializeGlossaryTerms,
+        initializeExclusiveFields,
         initializePopupControls,
+        initializeSortableTables,
         initializeTooltips,
         send,
         serializeForm,
+        syncCheckAllControls,
         setProgress,
         showOverlay,
         syncPopupControl,

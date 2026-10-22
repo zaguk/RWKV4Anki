@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import secrets
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ from .live_review_engine import (
     LiveReviewEngine,
     _candidate_static_values,
 )
+from .model_generation import model_generation_uses_exact_timestamps, model_generation_uses_v5o
 from .review_load_policy import minimum_retention_extra_required
 from .review_rows import (
     NEW_CARD_ELAPSED,
@@ -35,6 +37,10 @@ from .review_rows import (
     rebased_day_offset_origin,
     review_row_build_context_from_rows,
 )
+from .runtime_inputs import RuntimeInputContext, input_context_for_generation
+from .timestamp_context import timestamp_ms_from_seconds
+from .v5o_history import add_v5o_source_facts
+from .v5o_review_rows import V5oInputContext
 from .vendor_bootstrap import require_rwkv_live_candidate_seed
 
 
@@ -42,6 +48,7 @@ from .vendor_bootstrap import require_rwkv_live_candidate_seed
 class LiveReviewNativePredictionJob:
     token: LivePredictionToken
     target_timestamp_seconds: float
+    target_timestamp_ms: int | None
     target_day_offset: float
     hot_card_ids: tuple[int, ...]
     hot_seeds: tuple[Any, ...]
@@ -49,6 +56,9 @@ class LiveReviewNativePredictionJob:
     exclude_card_ids: tuple[int, ...]
     exclude_refresh_card_ids: tuple[int, ...] = ()
     select_limit: int = 2
+    mixed_exclude_card_ids: tuple[int, ...] | None = None
+    mixed_priority_card_ids: tuple[int, ...] = ()
+    selection_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -126,6 +136,7 @@ class LiveReviewHistoryState:
         self._base_rows = review_data.rows
         self._base_revlogs = review_data.revlogs
         self._complete_history = bool(review_data.complete_history)
+        self.history_generation = review_data.history_generation
         self.cards = dict(review_data.cards)
         self.decks = dict(review_data.decks)
         self.last_by_card = dict(review_data.last_by_card)
@@ -182,6 +193,7 @@ class LiveReviewHistoryState:
             row_build_context=self.context,
             latest_revlog_id_by_card=dict(self.latest_revlog_id_by_card),
             complete_history=self._complete_history,
+            history_generation=self.history_generation,
         )
 
     @property
@@ -205,6 +217,8 @@ class LiveReviewHistoryState:
             normalized_card_id,
             self.decks,
         )
+        if self.history_generation == "v5o" and card != self.cards.get(normalized_card_id):
+            raise ValueError("V5 retained-card metadata changed. Rebuild the checkpoint.")
         if card is not None:
             self.cards[normalized_card_id] = card
             self._prediction_rows_by_card.pop(normalized_card_id, None)
@@ -215,13 +229,6 @@ class LiveReviewHistoryState:
             card_id=normalized_card_id,
             after_review_id=self.latest_revlog_id_by_card.get(normalized_card_id),
         )
-        for entry in entries:
-            entry_card_id = int(entry.cid)
-            review_id = int(entry.id)
-            previous_latest = self.latest_revlog_id_by_card.get(entry_card_id)
-            if previous_latest is None or review_id > previous_latest:
-                self.latest_revlog_id_by_card[entry_card_id] = review_id
-
         # Live-review state is transient and intentionally allowed to drift from
         # the durable benchmark-trimmed history for a short session. If a later
         # learning-start sequence would require rewriting old durable card state,
@@ -232,6 +239,10 @@ class LiveReviewHistoryState:
             entry_card_id = int(entry.cid)
             review_id = int(entry.id)
             snapshot = self._snapshot(entry_card_id, review_id)
+            previous_latest = self.latest_revlog_id_by_card.get(entry_card_id)
+            if previous_latest is None or review_id > previous_latest:
+                self.latest_revlog_id_by_card[entry_card_id] = review_id
+            has_previous = entry_card_id in self.context.previous_by_card
             row, self.context = append_review_row_to_context(
                 entry,
                 self.cards,
@@ -241,6 +252,8 @@ class LiveReviewHistoryState:
             )
             if row is None:
                 continue
+            if self.history_generation == "v5o":
+                add_v5o_source_facts(row, entry, has_previous=has_previous)
             self._rollback_by_review_id[review_id] = snapshot
             self._update_last_review(row)
             rows.append(row)
@@ -268,10 +281,10 @@ class LiveReviewHistoryState:
     ) -> tuple[list[dict[str, Any]], list[float]]:
         """Return reusable native rows plus aligned engine-owned elapsed values."""
 
-        target = float(target_timestamp_seconds)
-        raw_target_day = day_offset_for_timestamp(target, self.next_day_at)
+        review_id = int(float(target_timestamp_seconds) * 1_000)
+        aligned_target = review_id / 1_000.0
+        raw_target_day = day_offset_for_timestamp(aligned_target, self.next_day_at)
         target_day = raw_target_day - self.day_offset_origin
-        review_id = int(target * 1000)
         cached_rows = self._prediction_rows_by_card
         cards = self.cards
         last_by_card = self.last_by_card
@@ -313,7 +326,7 @@ class LiveReviewHistoryState:
             else:
                 if created or day_changed:
                     row["elapsed_days"] = target_day - last_review.day_offset
-                elapsed_seconds = target - last_review.timestamp_seconds
+                elapsed_seconds = (review_id - int(last_review.review_id)) / 1_000.0
                 row["elapsed_seconds"] = (
                     int(elapsed_seconds) if elapsed_seconds.is_integer() else elapsed_seconds
                 )
@@ -475,11 +488,34 @@ class LiveReviewPredictionCoordinator:
         self._runtime_session = runtime_session
         self._native_seed_factory = native_seed_factory
         self._native_profiling = bool(native_profiling)
+        self._random_selection_seed = (
+            secrets.randbits(64) if engine.settings.random_card_percent > 0 else 0
+        )
+        runtime_generation = getattr(
+            runtime_session,
+            "model_generation",
+            getattr(runtime_session, "model_version", "v1"),
+        )
+        self._uses_exact_timestamps = model_generation_uses_exact_timestamps(runtime_generation)
+        self._uses_v5o = model_generation_uses_v5o(runtime_generation)
+        runtime_input_context = getattr(runtime_session, "input_context", None)
+        expected_context_type = V5oInputContext
+        self._input_context = (
+            (
+                runtime_input_context
+                if isinstance(runtime_input_context, expected_context_type)
+                else input_context_for_generation(review_data, runtime_generation)
+            )
+            if self._uses_exact_timestamps
+            else None
+        )
         self._native_session: Any | None = None
         self._native_initial_result: Any | None = None
         self._native_start_selection: Any | None = None
         self._native_reconciliation_result: Any | None = None
         self._native_reconciliation_dropped_card_ids: tuple[int, ...] = ()
+        self._native_retention_extra = 0.0
+        self._native_process_retention_extra_stack: list[float] = []
         # Native refreshes intentionally do not return their large membership
         # tuple on the hot path. ``None`` means it can be fetched lazily from
         # the diagnostic API if (and only if) a quiet exhaustion scan needs to
@@ -524,6 +560,16 @@ class LiveReviewPredictionCoordinator:
             return None
         return dict(self._native_session.profile())
 
+    def _target_timestamp(
+        self,
+        value: float | None,
+    ) -> tuple[float, int | None]:
+        target = self.clock() if value is None else float(value)
+        if self._uses_exact_timestamps:
+            target_ms = timestamp_ms_from_seconds(target)
+            return target_ms / 1_000.0, target_ms
+        return float(target), None
+
     def activate_native_session(
         self,
         *,
@@ -548,22 +594,27 @@ class LiveReviewPredictionCoordinator:
         if order is None:
             return False
         card_ids = self.engine.candidate_universe_card_ids
+        if self._uses_v5o:
+            card_ids = tuple(cid for cid in card_ids if cid in self.history.last_by_card)
         if not card_ids:
             return False
-        target = (
-            self.clock() if target_timestamp_seconds is None else float(target_timestamp_seconds)
-        )
+        target, target_ms = self._target_timestamp(target_timestamp_seconds)
         seeds = self._native_seeds(card_ids, target_timestamp_seconds=target)
         if not seeds:
             return False
+        target_day_offset = self.history.prediction_target_day_offset(target)
         live = factory(
             seeds,
-            initial_target_timestamp_seconds=target,
-            initial_target_day_offset=self.history.prediction_target_day_offset(target),
+            **self._native_day_kwargs(target_day_offset, initial=True),
             order=order,
             refresh_limit=refresh_limit,
             profiling=self._native_profiling,
             initial_select_limit=2,
+            **self._native_target_kwargs(
+                target_timestamp_seconds=target,
+                target_timestamp_ms=target_ms,
+                initial=True,
+            ),
         )
         self._native_session = live
         initial_result = getattr(live, "initial_result", None)
@@ -578,7 +629,10 @@ class LiveReviewPredictionCoordinator:
         start_selection = self._initial_native_selection(
             live,
             initial_result,
-            seeds=seeds,
+            exclude_card_ids=self._intraday_card_ids_at_day(
+                card_ids,
+                target_day_offset=target_day_offset,
+            ),
         )
         self._native_start_selection = start_selection
         # The native constructor predicts the complete seed universe once.
@@ -612,14 +666,18 @@ class LiveReviewPredictionCoordinator:
         self._native_start_selection = None
         self._native_reconciliation_result = None
         self._native_reconciliation_dropped_card_ids = ()
+        self._native_retention_extra = 0.0
+        self._native_process_retention_extra_stack.clear()
         self._last_refresh_card_ids = ()
         self.engine.disable_native_prediction_selection()
         if live is not None:
             live.close()
 
-    def process_answer(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def process_answer(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         if self._native_session is None:
             raise RuntimeError("native live prediction session is not active")
+        process_row = self._runtime_process_row(row)
+        native_retention_extra = self._native_retention_extra
         if (
             self.engine.settings.allow_same_day_repeats
             and int(self.engine.settings.same_day_reentry_delay_reviews) > 0
@@ -630,22 +688,29 @@ class LiveReviewPredictionCoordinator:
                 None,
             )
             if callable(process_and_exclude):
-                return process_and_exclude(dict(row))
+                result = process_and_exclude(process_row)
+            else:
+                result = self._native_session.process_answer(
+                    process_row,
+                    requeue_after_prediction=True,
+                )
+                self._native_session.exclude_card(int(row["card_id"]))
+        else:
             result = self._native_session.process_answer(
-                dict(row),
-                requeue_after_prediction=True,
+                process_row,
+                requeue_after_prediction=bool(self.engine.settings.allow_same_day_repeats),
             )
-            self._native_session.exclude_card(int(row["card_id"]))
-            return result
-        return self._native_session.process_answer(
-            dict(row),
-            requeue_after_prediction=bool(self.engine.settings.allow_same_day_repeats),
-        )
+        self._native_process_retention_extra_stack.append(native_retention_extra)
+        return result
+
 
     def undo_last_process(self) -> int:
         if self._native_session is None:
             raise RuntimeError("native live prediction session is not active")
-        return int(self._native_session.undo_last_process())
+        remaining = int(self._native_session.undo_last_process())
+        if self._native_process_retention_extra_stack:
+            self._native_retention_extra = self._native_process_retention_extra_stack.pop()
+        return remaining
 
     def reconcile_candidate_universe(
         self,
@@ -658,10 +723,17 @@ class LiveReviewPredictionCoordinator:
         live = self._native_session
         if live is None:
             raise RuntimeError("native live prediction session is not active")
-        target = (
-            self.clock() if target_timestamp_seconds is None else float(target_timestamp_seconds)
-        )
+        target, target_ms = self._target_timestamp(target_timestamp_seconds)
         materialized = tuple(candidates)
+        without_history = ()
+        if self._uses_v5o:
+            without_history = tuple(
+                int(c.card_id) for c in materialized
+                if int(c.card_id) not in self.history.last_by_card
+            )
+            materialized = tuple(
+                c for c in materialized if int(c.card_id) in self.history.last_by_card
+            )
         requested_ids = {int(candidate.card_id) for candidate in materialized}
         contained_card_ids = getattr(
             self._runtime_session,
@@ -694,6 +766,8 @@ class LiveReviewPredictionCoordinator:
             supported = materialized
             dropped = ()
 
+        dropped = (*dropped, *without_history)
+
         if not supported:
             self._native_reconciliation_dropped_card_ids = dropped
             return LiveNativeCandidateReconciliation(
@@ -723,15 +797,21 @@ class LiveReviewPredictionCoordinator:
             changed_candidates,
             target_timestamp_seconds=target,
         )
+        native_retention_extra = self.engine._active_minimum_retention_extra()
         reconciled_result = reconcile_membership(
             desired_card_ids,
             seeds,
-            target_timestamp_seconds=target,
-            target_day_offset=target_day_offset,
+            **self._native_day_kwargs(target_day_offset),
             select_limit=2,
             exclude_card_ids=exclude_card_ids,
-            retention_extra=self.engine._active_minimum_retention_extra(),
+            retention_extra=native_retention_extra,
+            **self._native_target_kwargs(
+                target_timestamp_seconds=target,
+                target_timestamp_ms=target_ms,
+            ),
+            **self._rollover_kwargs(),
         )
+        self._native_retention_extra = native_retention_extra
         # Preserve the Python policy mirror before minimum-review widening can
         # change its retention-extra state. ``replace_candidate_universe()``
         # repeats this call, but the engine deliberately retains only the first
@@ -749,7 +829,6 @@ class LiveReviewPredictionCoordinator:
         selection_result = self._initial_native_selection(
             live,
             reconciled_result,
-            seeds=seeds,
             exclude_card_ids=widening_exclusions,
         )
         result = LiveNativeReconciliationResult(
@@ -769,6 +848,9 @@ class LiveReviewPredictionCoordinator:
         # mirror, then apply only the compact selections needed to build Anki's
         # next two-card buffer.
         self.engine.replace_candidate_universe(supported)
+        if self.engine.settings.random_card_percent > 0:
+            mixed = self._mixed_native_selection(live, select_limit=2)
+            result = replace(result, selected=mixed.selected, eligible_count=mixed.eligible_count)
         selected_values = self._native_values_for_selections(
             tuple(result.selected),
             target_timestamp_seconds=target,
@@ -814,11 +896,14 @@ class LiveReviewPredictionCoordinator:
         # successfully applied below.
         self._last_refresh_card_ids = ()
 
-        target = (
-            self.clock() if target_timestamp_seconds is None else float(target_timestamp_seconds)
-        )
+        target, target_ms = self._target_timestamp(target_timestamp_seconds)
         if self._native_session is not None:
             hot_card_ids = self.engine.native_refresh_hot_card_ids()
+            mixed_excluded, mixed_priority, selection_index = (
+                self.engine.native_mixed_selection_policy()
+                if self.engine.settings.random_card_percent > 0
+                else (None, (), 0)
+            )
             include_hot_card_ids = self.engine.native_hot_card_ids_pending_include()
             token = self.engine.begin_prediction(hot_card_ids)
             hot_seeds = self._native_seeds(
@@ -829,6 +914,7 @@ class LiveReviewPredictionCoordinator:
             return LiveReviewNativePredictionJob(
                 token=token,
                 target_timestamp_seconds=target,
+                target_timestamp_ms=target_ms,
                 target_day_offset=self.history.prediction_target_day_offset(target),
                 hot_card_ids=hot_card_ids,
                 hot_seeds=hot_seeds,
@@ -840,6 +926,9 @@ class LiveReviewPredictionCoordinator:
                     int(card_id) for card_id in exclude_refresh_card_ids
                 ),
                 select_limit=max(0, int(select_limit)),
+                mixed_exclude_card_ids=mixed_excluded,
+                mixed_priority_card_ids=mixed_priority,
+                selection_index=selection_index,
             )
 
         return None
@@ -962,11 +1051,22 @@ class LiveReviewPredictionCoordinator:
         review_data: ReviewData,
         context: ReviewRowBuildContext,
     ) -> None:
+        if self._uses_exact_timestamps:
+            current = self._require_input_context()
+            updated = input_context_for_generation(
+                review_data, "v5o"
+            )
+            if isinstance(current, V5oInputContext) and current.cards != updated.cards:
+                raise ValueError("V5 retained-card catalog changed. Rebuild the checkpoint.")
+            self._input_context = replace(updated, rollover_phase_ms=current.rollover_phase_ms)
         self.history = LiveReviewHistoryState(review_data)
         self.history.context = context
 
     def load_new_review_rows_for_card(self, col, card_id: int) -> list[dict[str, Any]]:
-        return self.history.load_new_review_rows_for_card(col, card_id)
+        rows = self.history.load_new_review_rows_for_card(col, card_id)
+        if self._uses_exact_timestamps:
+            self._update_input_context_for_loaded_card(int(card_id))
+        return rows
 
     def rollback_review(self, review_id: int) -> bool:
         return self.history.rollback_review(review_id)
@@ -993,16 +1093,32 @@ class LiveReviewPredictionCoordinator:
                 live.upsert_candidates(job.hot_seeds)
                 for card_id in job.include_hot_card_ids:
                     live.include_card(int(card_id))
+        native_retention_extra = self.engine._active_minimum_retention_extra()
         result = live.refresh(
-            target_timestamp_seconds=job.target_timestamp_seconds,
-            target_day_offset=job.target_day_offset,
+            **self._native_day_kwargs(job.target_day_offset),
             select_limit=job.select_limit,
             exclude_card_ids=job.exclude_card_ids,
             exclude_refresh_card_ids=job.exclude_refresh_card_ids,
-            retention_extra=self.engine._active_minimum_retention_extra(),
+            retention_extra=native_retention_extra,
+            **self._native_target_kwargs(
+                target_timestamp_seconds=job.target_timestamp_seconds,
+                target_timestamp_ms=job.target_timestamp_ms,
+            ),
+            **self._rollover_kwargs(),
         )
+        self._native_retention_extra = native_retention_extra
+        selection = result
+        if job.mixed_exclude_card_ids is not None:
+            selection = live.mixed_selection(
+                random_card_probability=self.engine.settings.random_card_percent / 100.0,
+                random_seed=self._random_selection_seed,
+                selection_index=job.selection_index,
+                select_limit=job.select_limit,
+                exclude_card_ids=job.mixed_exclude_card_ids,
+                priority_card_ids=job.mixed_priority_card_ids,
+            )
         selected_values = self._native_values_for_selections(
-            tuple(result.selected),
+            tuple(selection.selected),
             target_timestamp_seconds=job.target_timestamp_seconds,
         )
         hot_values = self._native_values_for_card_ids(job.hot_card_ids)
@@ -1036,6 +1152,7 @@ class LiveReviewPredictionCoordinator:
                 card_id=card_id,
                 predicted_retrievability=float(selection.retrievability),
                 elapsed_days=float(elapsed),
+                randomly_selected=bool(getattr(selection, "randomly_selected", False)),
             )
             for card_id, selection, elapsed in zip(
                 card_ids,
@@ -1095,12 +1212,19 @@ class LiveReviewPredictionCoordinator:
             if card_ids is not None
             else tuple(candidates_by_card)
         )
+        if self._uses_v5o:
+            normalized_ids = tuple(
+                cid for cid in normalized_ids if cid in self.history.last_by_card
+            )
         if not normalized_ids:
             return ()
         rows, _elapsed_days = self.history.prediction_inputs_for_card_ids(
             normalized_ids,
             target_timestamp_seconds=float(target_timestamp_seconds),
         )
+        if self._uses_exact_timestamps:
+            context = self._require_input_context()
+            rows = [context.live_candidate_row(row) for row in rows]
         seed_factory = self._native_seed_factory or require_rwkv_live_candidate_seed()
         random_order = (
             filtered_deck_order_from_index(self.engine.settings.order_index)
@@ -1130,6 +1254,65 @@ class LiveReviewPredictionCoordinator:
                 )
             )
         return tuple(seeds)
+
+    def _runtime_process_row(
+        self,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self._uses_exact_timestamps:
+            return dict(row)
+        return self._require_input_context().process_row(row)
+
+
+    def _update_input_context_for_loaded_card(self, card_id: int) -> None:
+        context = self._require_input_context()
+        card = self.history.cards.get(int(card_id))
+        if context.cards.get(card_id) != card:
+            raise ValueError("V5 retained-card metadata changed. Rebuild the checkpoint.")
+
+    def _rollover_kwargs(self) -> dict[str, int]:
+        if not self._uses_exact_timestamps:
+            return {}
+        return {
+            "rollover_phase_ms": self._require_input_context().rollover_phase_ms
+        }
+
+    def _native_day_kwargs(self, target: float, *, initial: bool = False) -> dict[str, float]:
+        if self._uses_v5o:
+            return {}
+        name = "initial_target_day_offset" if initial else "target_day_offset"
+        return {name: target}
+
+    def _native_target_kwargs(
+        self,
+        *,
+        target_timestamp_seconds: float,
+        target_timestamp_ms: int | None,
+        initial: bool = False,
+    ) -> dict[str, int | float]:
+        if self._uses_exact_timestamps:
+            if target_timestamp_ms is None:  # pragma: no cover - helper invariant
+                raise RuntimeError("V5o Live target timestamp is unavailable.")
+            name = (
+                "initial_target_timestamp_ms" if initial else "target_timestamp_ms"
+            )
+            values: dict[str, int | float] = {name: int(target_timestamp_ms)}
+            if initial:
+                values["initial_rollover_phase_ms"] = (
+                    self._require_input_context().rollover_phase_ms
+                )
+            return values
+        name = (
+            "initial_target_timestamp_seconds"
+            if initial
+            else "target_timestamp_seconds"
+        )
+        return {name: float(target_timestamp_seconds)}
+
+    def _require_input_context(self) -> RuntimeInputContext:
+        if self._input_context is None:  # pragma: no cover - constructor invariant
+            raise RuntimeError("The exact-timestamp Live Session input context is unavailable.")
+        return self._input_context
 
     def _native_membership_changed_candidates(
         self,
@@ -1184,21 +1367,34 @@ class LiveReviewPredictionCoordinator:
                 intraday.append(normalized)
         return tuple(intraday)
 
+    def _mixed_native_selection(
+        self, live: Any, *, select_limit: int, extra_exclusions: Iterable[int] = ()
+    ) -> Any:
+        excluded, priority, index = self.engine.native_mixed_selection_policy()
+        return live.mixed_selection(
+            random_card_probability=self.engine.settings.random_card_percent / 100.0,
+            random_seed=self._random_selection_seed,
+            selection_index=index,
+            select_limit=select_limit,
+            exclude_card_ids=(*excluded, *extra_exclusions),
+            priority_card_ids=priority,
+        )
+
     def _initial_native_selection(
         self,
         live: Any,
         initial_result: Any,
         *,
-        seeds: tuple[Any, ...],
         exclude_card_ids: Iterable[int] = (),
     ) -> Any:
         """Apply minimum-review widening to the constructor rank without inference."""
 
+        if self.engine.settings.random_card_percent > 0:
+            initial_result = self._mixed_native_selection(live, select_limit=2)
         if initial_result.selected or not self.engine._minimum_fill_active():
             return initial_result
 
         excluded = set(int(card_id) for card_id in exclude_card_ids)
-        excluded.update(_intraday_seed_card_ids(seeds))
         result = live.current_selection(
             select_limit=2,
             exclude_card_ids=excluded,
@@ -1216,10 +1412,13 @@ class LiveReviewPredictionCoordinator:
             extra = float(next_extra)
             self.engine.minimum_retention_extra = extra
             live.set_retention_extra(extra)
+            self._native_retention_extra = extra
             result = live.current_selection(
                 select_limit=2,
                 exclude_card_ids=excluded,
             )
+        if self.engine.settings.random_card_percent > 0:
+            return self._mixed_native_selection(live, select_limit=2, extra_exclusions=excluded)
         return result
 
     def _record_stale_recheck_result(
@@ -1287,19 +1486,3 @@ def _native_random_key(value: float) -> int:
         raise ValueError("Live Session random ordering key must be finite.")
     resolved = min(math.nextafter(1.0, 0.0), max(0.0, resolved))
     return min(2**64 - 1, int(resolved * 2**64))
-
-
-def _intraday_seed_card_ids(seeds: Iterable[Any]) -> tuple[int, ...]:
-    card_ids: list[int] = []
-    for seed in seeds:
-        row = getattr(seed, "row", None)
-        if row is None:
-            continue
-        try:
-            elapsed_days = float(row["elapsed_days"])
-            card_id = int(row["card_id"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if 0.0 <= elapsed_days < 1.0:
-            card_ids.append(card_id)
-    return tuple(card_ids)

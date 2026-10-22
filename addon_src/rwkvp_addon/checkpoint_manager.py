@@ -6,7 +6,7 @@ import threading
 import time
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +38,13 @@ from .constants import (
     DEFAULT_MODEL_ID,
     LIVE_REVIEW_RUST_UNDO_LIMIT,
 )
+from .model_generation import (
+    DEFAULT_MODEL_GENERATION,
+    model_generation_uses_exact_timestamps,
+    model_generation_uses_v5o,
+    normalize_model_generation,
+)
+from .model_storage import bundled_model_path, model_storage_subdirectory
 from .prediction_cache import (
     EVALUATION_CACHE_MANIFEST_KEY,
     PER_REVIEW_CACHE_SPEC,
@@ -54,7 +61,6 @@ from .prediction_cache import (
     load_latest_curves_for_cards_from_evaluation_cache,
     load_latest_curves_from_evaluation_cache,
     load_prediction_record_set,
-    prediction_cache_specs,
     predictions_for_cache_spec,
     validate_evaluation_cache_against_history,
     validate_evaluation_cache_file_binding,
@@ -74,7 +80,8 @@ from .review_type_normalization import (
     FilteredReviewNormalizationPolicy,
     checkpoint_policy_matches,
 )
-from .rwkv_backend import configured_rwkv_backend
+from .runtime_inputs import RuntimeInputContext, input_context_for_generation
+from .rwkv_backend import configured_rwkv_backend, rwkv_checkpoint_suffix
 from .rwkv_performance_modes import (
     DEFAULT_PREDICT_MANY_MODE,
     DEFAULT_PROCESS_MANY_MODE,
@@ -92,14 +99,24 @@ from .rwkv_processing import (
     _runtime_constructor_kwargs,
     new_rwkvp_runtime,
     process_review_rows_with_predictions,
+    runtime_live_candidate_row_input,
+    runtime_predict_many_input,
+    runtime_process_many_input,
+    runtime_process_row_input,
+    runtime_uses_exact_timestamps,
 )
 from .rwkv_runtime_resources import release_runtime_resources, runtime_is_rust
 from .threading_utils import detach_exception_from_thread
+from .timestamp_context import (
+    MILLISECONDS_PER_DAY,
+)
+from .v5o_review_rows import V5oInputContext
 from .vendor_bootstrap import (
     DependencyError,
     require_rwkv_checkpoint_history_consistency,
     require_rwkv_review_batch,
     require_rwkv_srs,
+    require_rwkv_v5o_review_batch,
 )
 
 if TYPE_CHECKING:
@@ -108,6 +125,8 @@ if TYPE_CHECKING:
 
 EVALUATION_CACHE_BINDING_MANIFEST_KEY = "evaluation_cache_binding"
 EVALUATION_CACHE_BINDING_VERSION = 1
+V5O_ROLLOVER_PHASE_MS_MANIFEST_KEY = "v5o_rollover_phase_ms"
+V5O_CATALOG_FINGERPRINT_MANIFEST_KEY = "v5o_catalog_fingerprint"
 
 
 class CheckpointError(RuntimeError):
@@ -184,12 +203,22 @@ class ScopedLivePredictionSession:
     def current_selection(self, **kwargs):
         return self._call(lambda live: live.current_selection(**kwargs))
 
+    def mixed_selection(self, **kwargs):
+        return self._call(lambda live: live.mixed_selection(**kwargs))
+
     def refresh(self, **kwargs):
-        return self._call(lambda live: live.refresh(**kwargs))
+        return self._call(
+            lambda live: live.refresh(**self._lease._manager._runtime_live_kwargs(kwargs))
+        )
 
     def reconcile_candidates(self, candidates: Iterable[Any], **kwargs):
         seeds = tuple(candidates)
-        return self._call(lambda live: live.reconcile_candidates(seeds, **kwargs))
+        return self._call(
+            lambda live: live.reconcile_candidates(
+                self._lease._manager._runtime_live_candidates(seeds),
+                **self._lease._manager._runtime_live_kwargs(kwargs),
+            )
+        )
 
     def reconcile_membership(
         self,
@@ -202,8 +231,8 @@ class ScopedLivePredictionSession:
         return self._call(
             lambda live: live.reconcile_membership(
                 desired_card_ids,
-                seeds,
-                **kwargs,
+                self._lease._manager._runtime_live_candidates(seeds),
+                **self._lease._manager._runtime_live_kwargs(kwargs),
             )
         )
 
@@ -212,10 +241,11 @@ class ScopedLivePredictionSession:
         review_row: dict[str, Any],
         *,
         requeue_after_prediction: bool = False,
-    ) -> tuple[float, Any]:
+    ) -> tuple[float | None, Any]:
         calculate_curves = self._lease.calculate_curves
         result = self._call(
-            lambda live: live.process_answer(
+            lambda live: self._process_answer_on_runtime(
+                live,
                 review_row,
                 requeue_after_prediction=bool(requeue_after_prediction),
                 return_curves=calculate_curves,
@@ -233,7 +263,8 @@ class ScopedLivePredictionSession:
         """Process one curve-free benchmark answer without production fallback."""
 
         result = self._call(
-            lambda live: live.process_answer(
+            lambda live: self._process_answer_on_runtime(
+                live,
                 review_row,
                 requeue_after_prediction=True,
                 return_curves=False,
@@ -248,13 +279,14 @@ class ScopedLivePredictionSession:
     def process_answer_and_exclude(
         self,
         review_row: dict[str, Any],
-    ) -> tuple[float, Any]:
+    ) -> tuple[float | None, Any]:
         """Process an answer and quarantine its candidate in one worker call."""
 
         calculate_curves = self._lease.calculate_curves
 
         def process_and_exclude(live):
-            result = live.process_answer(
+            result = self._process_answer_on_runtime(
+                live,
                 review_row,
                 requeue_after_prediction=True,
                 return_curves=calculate_curves,
@@ -271,8 +303,18 @@ class ScopedLivePredictionSession:
             self._lease._remember_undoable_curve(int(review_row["card_id"]), curve)
         return prediction, curve
 
+    def _process_answer_on_runtime(self, live, row, **kwargs):
+        manager = self._lease._manager
+        native_row = manager._runtime_live_process_row(row)
+        return live.process_answer(native_row, **kwargs)
+
+
     def undo_last_process(self) -> int:
-        remaining = int(self._call(lambda live: live.undo_last_process()))
+        def undo(live):
+            remaining = live.undo_last_process()
+            return remaining
+
+        remaining = int(self._call(undo))
         self._lease._restore_undoable_curve()
         return remaining
 
@@ -287,7 +329,13 @@ class ScopedLivePredictionSession:
 
     def upsert_candidates(self, candidates: Iterable[Any]) -> int:
         seeds = tuple(candidates)
-        return int(self._call(lambda live: live.upsert_candidates(seeds)))
+        return int(
+            self._call(
+                lambda live: live.upsert_candidates(
+                    self._lease._manager._runtime_live_candidates(seeds)
+                )
+            )
+        )
 
     def upsert_and_include_candidates(
         self,
@@ -300,7 +348,9 @@ class ScopedLivePredictionSession:
         normalized_card_ids = tuple(int(card_id) for card_id in card_ids)
 
         def upsert_and_include(live):
-            generation = int(live.upsert_candidates(seeds))
+            generation = int(
+                live.upsert_candidates(self._lease._manager._runtime_live_candidates(seeds))
+            )
             for card_id in normalized_card_ids:
                 generation = int(live.include_card(card_id))
             return generation
@@ -309,7 +359,13 @@ class ScopedLivePredictionSession:
 
     def replace_candidates(self, candidates: Iterable[Any]) -> int:
         seeds = tuple(candidates)
-        generation = int(self._call(lambda live: live.replace_candidates(seeds)))
+        generation = int(
+            self._call(
+                lambda live: live.replace_candidates(
+                    self._lease._manager._runtime_live_candidates(seeds)
+                )
+            )
+        )
         self._lease._clear_undoable_curves()
         return generation
 
@@ -416,6 +472,20 @@ class ScopedRuntimeLease:
         return self._manager.model_id
 
     @property
+    def model_generation(self) -> str:
+        return self._manager.model_generation
+
+    @property
+    def state_precision(self) -> str:
+        return self._manager.state_precision
+
+    @property
+    def input_context(self) -> RuntimeInputContext | None:
+        """Expose the checkpoint-bound exact-timestamp context (V5)."""
+
+        return self._manager._input_context
+
+    @property
     def closed(self) -> bool:
         with self._close_lock:
             return self._closed
@@ -486,8 +556,10 @@ class ScopedRuntimeLease:
         self,
         candidates: Iterable[Any],
         *,
-        initial_target_timestamp_seconds: float,
-        initial_target_day_offset: float,
+        initial_target_timestamp_seconds: float | None = None,
+        initial_target_timestamp_ms: int | None = None,
+        initial_rollover_phase_ms: int | None = None,
+        initial_target_day_offset: float | None = None,
         order: str,
         mode: str | None = None,
         batch_size: int | None = None,
@@ -500,27 +572,30 @@ class ScopedRuntimeLease:
                 raise MissingCheckpointError("This RWKV runtime scope has been closed.")
             existing = self._live_prediction_session
             token = self._token
-        if existing is not None and not existing.closed:
-            return existing
-        seeds = tuple(candidates)
-        native = self._manager._scoped_predict_many_live_session(
-            token,
-            seeds,
-            initial_target_timestamp_seconds=float(initial_target_timestamp_seconds),
-            initial_target_day_offset=float(initial_target_day_offset),
-            order=str(order),
-            mode=mode,
-            batch_size=batch_size,
-            refresh_limit=int(refresh_limit),
-            profiling=bool(profiling),
-            initial_select_limit=int(initial_select_limit),
-        )
-        live = ScopedLivePredictionSession(self, native)
-        with self._close_lock:
-            if self._closed:
-                with suppress(Exception):
-                    native.close()
-                raise MissingCheckpointError("This RWKV runtime scope has been closed.")
+            if existing is not None and not existing.closed:
+                return existing
+            # Keep creation and installation under one lease lock. Native
+            # construction can block, and otherwise two callers can both see
+            # an empty slot and orphan the first native session.
+            native = self._manager._scoped_predict_many_live_session(
+                token,
+                tuple(candidates),
+                initial_target_timestamp_seconds=(
+                    None
+                    if initial_target_timestamp_seconds is None
+                    else float(initial_target_timestamp_seconds)
+                ),
+                initial_target_timestamp_ms=initial_target_timestamp_ms,
+                initial_rollover_phase_ms=initial_rollover_phase_ms,
+                initial_target_day_offset=initial_target_day_offset,
+                order=str(order),
+                mode=mode,
+                batch_size=batch_size,
+                refresh_limit=int(refresh_limit),
+                profiling=bool(profiling),
+                initial_select_limit=int(initial_select_limit),
+            )
+            live = ScopedLivePredictionSession(self, native)
             self._live_prediction_session = live
         return live
 
@@ -528,8 +603,10 @@ class ScopedRuntimeLease:
         self,
         candidates: Iterable[Any],
         *,
-        initial_target_timestamp_seconds: float,
-        initial_target_day_offset: float,
+        initial_target_timestamp_seconds: float | None = None,
+        initial_target_timestamp_ms: int | None = None,
+        initial_rollover_phase_ms: int | None = None,
+        initial_target_day_offset: float | None = None,
         order: str,
         mode: str,
         batch_size: int | None = None,
@@ -549,30 +626,31 @@ class ScopedRuntimeLease:
                 raise MissingCheckpointError("This RWKV runtime scope has been closed.")
             existing = self._live_prediction_session
             token = self._token
-        if existing is not None and not existing.closed:
-            raise RuntimeError("This RWKV runtime scope already owns a live session.")
-        native = self._manager._scoped_benchmark_predict_many_live_session(
-            token,
-            tuple(candidates),
-            initial_target_timestamp_seconds=float(initial_target_timestamp_seconds),
-            initial_target_day_offset=float(initial_target_day_offset),
-            order=str(order),
-            mode=str(mode),
-            batch_size=batch_size,
-            refresh_limit=int(refresh_limit),
-            profiling=bool(profiling),
-            initial_select_limit=int(initial_select_limit),
-        )
-        live = ScopedLivePredictionSession(self, native)
-        with self._close_lock:
-            if self._closed:
-                with suppress(Exception):
-                    native.close()
-                raise MissingCheckpointError("This RWKV runtime scope has been closed.")
+            if existing is not None and not existing.closed:
+                raise RuntimeError("This RWKV runtime scope already owns a live session.")
+            native = self._manager._scoped_benchmark_predict_many_live_session(
+                token,
+                tuple(candidates),
+                initial_target_timestamp_seconds=(
+                    None
+                    if initial_target_timestamp_seconds is None
+                    else float(initial_target_timestamp_seconds)
+                ),
+                initial_target_timestamp_ms=initial_target_timestamp_ms,
+                initial_rollover_phase_ms=initial_rollover_phase_ms,
+                initial_target_day_offset=initial_target_day_offset,
+                order=str(order),
+                mode=str(mode),
+                batch_size=batch_size,
+                refresh_limit=int(refresh_limit),
+                profiling=bool(profiling),
+                initial_select_limit=int(initial_select_limit),
+            )
+            live = ScopedLivePredictionSession(self, native)
             self._live_prediction_session = live
         return live
 
-    def process_one(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def process_one(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         return self._manager._scoped_process_one(self._token, row)
 
     def process_simulation_one(
@@ -580,7 +658,7 @@ class ScopedRuntimeLease:
         row: dict[str, Any],
         *,
         return_curves: bool,
-    ) -> tuple[float, Any | None]:
+    ) -> tuple[float | None, Any | None]:
         """Mutate only this disposable scope with an explicit curve contract.
 
         Behavior Lab branches never merge their state into the durable checkpoint,
@@ -611,12 +689,12 @@ class ScopedRuntimeLease:
 
         return self._manager._scoped_evaluation_prediction_tail(self._token)
 
-    def undoable_process_one(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def undoable_process_one(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         result = self._manager._scoped_undoable_process_one(self._token, row)
         if self.calculate_curves:
             self._remember_undoable_curve(int(row["card_id"]), result[1])
             return result
-        return float(result[0]), None
+        return (None if result[0] is None else float(result[0])), None
 
     def undo_last_process(self) -> int:
         result = self._manager._scoped_undo_last_process(self._token)
@@ -723,6 +801,8 @@ class _RuntimeWorker:
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._lock = threading.Lock()
+        self._stopping = False
+        self._stop_result: dict[str, object] = {}
 
     def is_worker_thread(self) -> bool:
         return self._thread_id == threading.get_ident()
@@ -731,39 +811,54 @@ class _RuntimeWorker:
         if self.is_worker_thread():
             return op()
 
-        self._ensure_started()
         done = threading.Event()
         result: dict[str, object] = {}
-        self._queue.put((op, done, result))
+        with self._lock:
+            if self._stopping:
+                raise CheckpointError("The RWKV runtime worker is shutting down.")
+            self._ensure_started()
+            # Submit under the same lock as the stop sentinel. A task queued
+            # behind that sentinel would otherwise wait forever for its result.
+            self._queue.put((op, done, result))
         done.wait()
         if "exception" in result:
             raise result["exception"]
         return result.get("value")
 
-    def stop(self) -> None:
+    def stop(self, *, finalize=None) -> None:
         if self.is_worker_thread():
             return
         with self._lock:
-            thread = self._thread
+            if not self._stopping:
+                self._stopping = True
+                if finalize is not None:
+                    self._ensure_started()
+                    self._queue.put((finalize, threading.Event(), self._stop_result))
+                thread = self._thread
+                if thread is not None:
+                    self._queue.put(None)
+            else:
+                thread = self._thread
         if thread is None:
             return
-        self._queue.put(None)
         thread.join()
         with self._lock:
             if self._thread is thread:
                 self._thread = None
                 self._thread_id = None
+        if "exception" in self._stop_result:
+            raise self._stop_result["exception"]
 
     def _ensure_started(self) -> None:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._thread = threading.Thread(
-                target=self._run,
-                name="RWKV runtime",
-                daemon=True,
-            )
-            self._thread.start()
+        # The caller holds _lock through startup and submission.
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="RWKV runtime",
+            daemon=True,
+        )
+        self._thread.start()
 
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
@@ -791,14 +886,22 @@ class _DurableCheckpointWrite:
     status: str
     checkpoint_path: Path
     storage_estimate: RustCheckpointStorageEstimate | None
+    rollover_phase_ms: int | None
+    v5o_catalog_fingerprint: str | None = None
+    snapshot_store: ProfileStore | None = None
 
 
 class RWKVCheckpointManager:
+
+
     def __init__(
         self,
         store: ProfileStore,
         model_id: str = DEFAULT_MODEL_ID,
         *,
+        model_generation: str = DEFAULT_MODEL_GENERATION,
+        state_precision: str = "fp32",
+        gpu_prediction_math: str = "fp32",
         async_saves: bool = True,
         prediction_cache_specs: tuple[PredictionCacheSpec, ...] | None = None,
         predict_many_mode: str = DEFAULT_PREDICT_MANY_MODE,
@@ -808,8 +911,21 @@ class RWKVCheckpointManager:
         exclude_deleted_card_revlogs: bool = True,
         filtered_review_normalization_policy: (FilteredReviewNormalizationPolicy | None) = None,
     ) -> None:
-        self.store = store
         self.model_id = model_id
+        self.model_generation = normalize_model_generation(model_generation)
+        if state_precision not in {"fp16", "fp32"}:
+            raise ValueError("State precision must be fp16 or fp32.")
+        self.state_precision = state_precision
+        if gpu_prediction_math not in {"fp16", "fp32"}:
+            raise ValueError("GPU prediction math must be fp16 or fp32.")
+        self.gpu_prediction_math = gpu_prediction_math
+        self._scope_gpu_prediction_math: str | None = None
+        # Explicit unpublished stores must stay isolated throughout a comparison
+        # rebuild; switching generations still selects the canonical slot.
+        if normalize_model_generation(store.model_generation) != self.model_generation:
+            store = store.for_generation(self.model_generation)
+        self.store = store
+        store.ensure()
         self.async_saves = async_saves
         self.predict_many_mode = normalize_predict_many_mode(predict_many_mode)
         self.predict_many_batch_size = _positive_optional_int(predict_many_batch_size)
@@ -822,12 +938,17 @@ class RWKVCheckpointManager:
         self.filtered_review_normalization_policy = (
             filtered_review_normalization_policy or FilteredReviewNormalizationPolicy.disabled()
         )
-        self._prediction_cache_specs = _normalize_prediction_cache_specs(prediction_cache_specs)
+        self._prediction_cache_specs = self._generation_prediction_cache_specs(
+            prediction_cache_specs
+        )
         self._durable_writer = _DurableCheckpointWriter(
             store,
             model_id,
+            self.model_generation,
             self._prediction_cache_specs,
             self.filtered_review_normalization_policy,
+            self.exclude_deleted_card_revlogs,
+            state_precision=self.state_precision,
         )
         self._runtime = None
         self._loaded_path: str | None = None
@@ -845,6 +966,7 @@ class RWKVCheckpointManager:
         self._latest_curves_by_card: dict[int, Any] | None = None
         self._latest_curves_complete = False
         self._review_data_cache: ReviewData | None = None
+        self._input_context: RuntimeInputContext | None = None
         self._review_data_cache_last_review_id: int | None = None
         self._review_data_cache_latest_collection_review_id: int | None = None
         self._review_data_cache_collection_revision: CollectionRevision | None = None
@@ -861,6 +983,8 @@ class RWKVCheckpointManager:
         self._save_status: str | None = None
         self._save_error: BaseException | None = None
         self._runtime_worker: _RuntimeWorker | None = None
+        self._runtime_worker_condition = threading.Condition()
+        self._runtime_worker_unloading = False
 
     def __del__(self) -> None:
         with suppress(BaseException):
@@ -870,7 +994,7 @@ class RWKVCheckpointManager:
         self,
         specs: tuple[PredictionCacheSpec, ...],
     ) -> None:
-        normalized_specs = _normalize_prediction_cache_specs(specs)
+        normalized_specs = self._generation_prediction_cache_specs(specs)
         if normalized_specs == self._prediction_cache_specs:
             return
         if self.runtime_scope_active:
@@ -898,6 +1022,15 @@ class RWKVCheckpointManager:
             self._latest_curves_by_card = None
             self._latest_curves_complete = not self.calculate_curves
 
+    def _generation_prediction_cache_specs(
+        self,
+        specs: tuple[PredictionCacheSpec, ...] | None,
+    ) -> tuple[PredictionCacheSpec, ...]:
+        normalized = _normalize_prediction_cache_specs(specs)
+        if model_generation_uses_exact_timestamps(self.model_generation):
+            return (PER_REVIEW_CACHE_SPEC,)
+        return normalized
+
     @property
     def calculate_curves(self) -> bool:
         return PREDICT_AHEAD_CACHE_SPEC in self._prediction_cache_specs
@@ -919,7 +1052,7 @@ class RWKVCheckpointManager:
     def set_exclude_deleted_card_revlogs(self, exclude: bool) -> None:
         """Change the history policy and discard data loaded under the old policy."""
 
-        normalized = bool(exclude)
+        normalized = bool(exclude) or model_generation_uses_v5o(self.model_generation)
         if normalized == self.exclude_deleted_card_revlogs:
             return
         if self.runtime_scope_active:
@@ -933,6 +1066,7 @@ class RWKVCheckpointManager:
             )
         self.release_runtime(preserve_review_data=False)
         self.exclude_deleted_card_revlogs = normalized
+        self._durable_writer.exclude_deleted_card_revlogs = normalized
         self._review_data_cache_collection_revision = None
         self._pending_review_tail_context = None
         self._durable_status_cache_key = None
@@ -1153,7 +1287,8 @@ class RWKVCheckpointManager:
 
     def _checkpoint_lineage_is_current(self) -> bool:
         return (
-            self._checkpoint_policy_matches_config()
+            self._checkpoint_model_matches_config()
+            and self._checkpoint_policy_matches_config()
             and self._verified_for_incremental_updates
             and self._verified_checkpoint_signature is not None
             and self._verified_checkpoint_signature
@@ -1201,6 +1336,21 @@ class RWKVCheckpointManager:
         latest_collection_review_id: int | None = None,
     ) -> None:
         self._review_data_cache = review_data
+        if model_generation_uses_exact_timestamps(self.model_generation):
+            current_context = input_context_for_generation(review_data, self.model_generation)
+            durable_phase = (
+                _rollover_phase_from_manifest(self.store.manifest(), self.model_generation)
+                if self.store.active_checkpoint_path() is not None
+                else None
+            )
+            self._input_context = replace(
+                current_context,
+                rollover_phase_ms=(
+                    current_context.rollover_phase_ms if durable_phase is None else durable_phase
+                ),
+            )
+        else:
+            self._input_context = None
         self._review_data_cache_collection_revision = None
         self._review_data_cache_last_review_id = _last_review_id_from_rows(review_data.rows)
         self._review_data_cache_latest_collection_review_id = (
@@ -1229,6 +1379,19 @@ class RWKVCheckpointManager:
         returns ``False`` and lets the caller rebuild complete Python history.
         """
 
+        if model_generation_uses_v5o(self.model_generation):
+            # V1's virtual-prefix cache has no retained-history provenance.
+            return False
+        manifest = self.store.manifest()
+        if (
+            model_generation_uses_exact_timestamps(self.model_generation)
+            and _rollover_phase_from_manifest(manifest, self.model_generation) is None
+        ):
+            # A virtual prefix deliberately skips replaying durable history.
+            # Without the checkpoint's canonical phase, it cannot reconstruct
+            # the omitted retained-history rows. Fall back to complete history and rebuild the
+            # unpublished predecessor contract instead of guessing.
+            return False
         if (
             self.store.checkpoint_status() != "valid"
             or self.save_in_progress
@@ -1264,8 +1427,13 @@ class RWKVCheckpointManager:
         review_data: ReviewData,
         collection_revision: CollectionRevision,
     ) -> None:
-        """Persist a disposable cold-tail context for verified complete rows."""
+        """Persist V1's disposable cold-tail context for verified complete rows."""
 
+        if model_generation_uses_v5o(self.model_generation):
+            # This V1 cache omits V5 provenance/catalog bindings and is never
+            # accepted by its loader. Skip both writing and deferred-save
+            # queuing; in-memory revision/history proofs remain independent.
+            return
         if not review_data.complete_history:
             return
         with self._save_lock:
@@ -1340,6 +1508,12 @@ class RWKVCheckpointManager:
         return (
             status,
             manifest.get("model_id"),
+            manifest.get("model_generation"),
+            manifest.get("state_precision", "fp32"),
+            self.state_precision,
+            manifest.get("exclude_deleted_card_revlogs"),
+            self.exclude_deleted_card_revlogs,
+            manifest.get(V5O_ROLLOVER_PHASE_MS_MANIFEST_KEY),
             manifest.get(FILTERED_REVIEW_NORMALIZATION_MANIFEST_KEY),
             tuple(sorted(self.filtered_review_normalization_policy.semantic_signature().items())),
             manifest.get("processed_review_count"),
@@ -1371,23 +1545,20 @@ class RWKVCheckpointManager:
         *,
         partial_on_cancel: bool = True,
     ) -> CheckpointResult:
-        if self._active_scope_token is not None:
-            raise CheckpointBusyError(
-                "Stop the active RWKV operation or Live Session before rebuilding the checkpoint."
-            )
-        if self._should_use_runtime_worker():
-            return self._run_on_runtime_worker(
-                lambda: self._initialize_or_rebuild_impl(
-                    rows,
-                    progress,
-                    partial_on_cancel=partial_on_cancel,
+        with self._reserve_maintenance_slot("rebuilding the checkpoint"):
+            if self._should_use_runtime_worker():
+                return self._run_on_runtime_worker(
+                    lambda: self._initialize_or_rebuild_impl(
+                        rows,
+                        progress,
+                        partial_on_cancel=partial_on_cancel,
+                    )
                 )
+            return self._initialize_or_rebuild_impl(
+                rows,
+                progress,
+                partial_on_cancel=partial_on_cancel,
             )
-        return self._initialize_or_rebuild_impl(
-            rows,
-            progress,
-            partial_on_cancel=partial_on_cancel,
-        )
 
     def expected_checkpoint_storage(
         self,
@@ -1395,18 +1566,15 @@ class RWKVCheckpointManager:
     ) -> RustCheckpointStorageEstimate:
         """Plan the next full Rust checkpoint size without building its state."""
 
-        if self._active_scope_token is not None or self._runtime is not None:
-            raise CheckpointBusyError(
-                "Stop the active RWKV operation before estimating checkpoint storage."
-            )
-        counts = rust_checkpoint_identity_counts(rows)
-        if configured_rwkv_backend() != "rust":
-            return estimate_rust_checkpoint_storage_from_counts(counts)
-        if self._should_use_runtime_worker():
-            return self._run_on_runtime_worker(
-                lambda: self._expected_checkpoint_storage_impl(counts)
-            )
-        return self._expected_checkpoint_storage_impl(counts)
+        with self._reserve_maintenance_slot("estimating checkpoint storage", require_unloaded=True):
+            counts = rust_checkpoint_identity_counts(rows)
+            if configured_rwkv_backend() != "rust":
+                return estimate_rust_checkpoint_storage_from_counts(counts)
+            if self._should_use_runtime_worker():
+                return self._run_on_runtime_worker(
+                    lambda: self._expected_checkpoint_storage_impl(counts)
+                )
+            return self._expected_checkpoint_storage_impl(counts)
 
     def _expected_checkpoint_storage_impl(
         self,
@@ -1414,7 +1582,10 @@ class RWKVCheckpointManager:
     ) -> RustCheckpointStorageEstimate:
         runtime = new_rwkvp_runtime(
             model_id=self.model_id,
+            model_generation=self.model_generation,
             process_many_mode=self.process_many_mode,
+            state_precision=self.state_precision,
+            gpu_prediction_math=self.gpu_prediction_math,
         )
         try:
             expected_bytes = _runtime_expected_checkpoint_size(runtime, counts)
@@ -1434,6 +1605,7 @@ class RWKVCheckpointManager:
         allow_inconsistent: bool = False,
         force_save: bool = False,
         check_consistency: bool = True,
+        gpu_prediction_math: str | None = None,
     ) -> tuple[ScopedRuntimeLease, CheckpointResult]:
         """Load requested identities, or the complete state, for one operation.
 
@@ -1442,15 +1614,25 @@ class RWKVCheckpointManager:
         from ``rows`` by the next lease. Passing ``scope_cards=None`` requests the
         complete checkpoint state; an iterable requests only those identities plus
         identities required to replay the pending review tail.
+        ``gpu_prediction_math`` overrides arithmetic for this lease only (for
+        strict comparisons); it never changes stored state or manager settings.
         """
 
+        if gpu_prediction_math is not None and (
+            gpu_prediction_math not in {"fp16", "fp32"}
+        ):
+            raise ValueError("Unsupported scoped GPU prediction math.")
         requested_cards = None if scope_cards is None else _dedupe_scope_cards(scope_cards)
         token = object()
         self._reserve_scoped_runtime(token, progress)
 
         def open_runtime() -> CheckpointResult:
+            # Exclusive lease-local constructor choice. Never alter the manager's
+            # configured math or checkpoint identity for a disposable benchmark.
+            self._scope_gpu_prediction_math = gpu_prediction_math
+            self._runtime_operation_rows = rows
             try:
-                return self._ensure_ready_for_prediction_impl(
+                result = self._ensure_ready_for_prediction_impl(
                     rows,
                     progress,
                     allow_inconsistent=allow_inconsistent,
@@ -1458,17 +1640,26 @@ class RWKVCheckpointManager:
                     check_consistency=check_consistency,
                     scope_cards=requested_cards,
                 )
+                return result
             except BaseException:
                 try:
                     self._release_scoped_runtime_state(preserve_curves=False)
                 finally:
                     self._clear_scope_reservation(token)
                 raise
+            finally:
+                self._runtime_operation_rows = None
 
-        if self._should_use_runtime_worker():
-            result = self._run_on_runtime_worker(open_runtime)
-        else:
-            result = open_runtime()
+        try:
+            if self._should_use_runtime_worker():
+                result = self._run_on_runtime_worker(open_runtime)
+            else:
+                result = open_runtime()
+        except BaseException:
+            # Submission itself can fail during worker shutdown, before the
+            # operation's runtime cleanup has had a chance to run.
+            self._clear_scope_reservation(token)
+            raise
         return ScopedRuntimeLease(self, token), result
 
     def reserve_runtime_slot(self, progress: ProgressReporter) -> RuntimeSlotLease:
@@ -1518,6 +1709,31 @@ class RWKVCheckpointManager:
             self._active_scope_token = token
             self._active_scope_requester_thread_id = requester_thread_id
 
+    def _reserve_maintenance_slot(
+        self,
+        action: str,
+        *,
+        require_unloaded: bool = False,
+    ) -> RuntimeSlotLease:
+        """Claim native operation capacity before submitting any background work.
+
+        Rebuilds and size probes initially own only a local runtime, so neither
+        ``runtime_loaded`` nor ``save_in_progress`` identifies their lifetime.
+        Use the same atomic reservation as scoped loads and comparisons to keep
+        settings changes fail-fast and prevent overlapping large states.
+        """
+        token = object()
+        with self._scope_condition:
+            if self._active_scope_token is not None or (
+                require_unloaded and self._runtime is not None
+            ):
+                raise CheckpointBusyError(
+                    f"Stop the active RWKV operation or Live Session before {action}."
+                )
+            self._active_scope_token = token
+            self._active_scope_requester_thread_id = threading.get_ident()
+        return RuntimeSlotLease(self, token)
+
     def _clear_scope_reservation(self, token: object | None = None) -> bool:
         with self._scope_condition:
             if token is not None and token is not self._active_scope_token:
@@ -1535,12 +1751,43 @@ class RWKVCheckpointManager:
         partial_on_cancel: bool = True,
     ) -> CheckpointResult:
         self.wait_for_pending_save()
+        if model_generation_uses_v5o(self.model_generation) and self.store.active_checkpoint_path():
+            # Retained-catalog replacement must leave the old durable state
+            # authoritative until the complete replacement can be published.
+            partial_on_cancel = False
         self._release_loaded_runtime()
-        runtime = new_rwkvp_runtime(
-            model_id=self.model_id,
-            process_many_mode=self.process_many_mode,
-        )
-        self._remember_runtime_metadata(runtime)
+        previous_input_context = self._input_context
+        if model_generation_uses_exact_timestamps(self.model_generation):
+            # A deliberate rebuild is the explicit boundary at which a changed
+            # timezone/rollover setting may establish a new canonical phase.
+            if self._review_data_cache is None:
+                raise CheckpointError("This generation requires review context before rebuilding.")
+            self._input_context = input_context_for_generation(
+                self._review_data_cache, self.model_generation
+            )
+        runtime = None
+        try:
+            runtime = new_rwkvp_runtime(
+                model_id=self.model_id,
+                model_generation=self.model_generation,
+                process_many_mode=self.process_many_mode,
+                state_precision=self.state_precision,
+                gpu_prediction_math=self.gpu_prediction_math,
+            )
+            if isinstance(self._input_context, V5oInputContext):
+                # Persist the complete inventory, including unreviewed cards,
+                # without allocating their causal identities before an answer.
+                runtime.rebuild_retained_history(
+                    [], cards=self._input_context.catalog_rows(),
+                    rollover_phase_ms=self._input_context.rollover_phase_ms,
+                    mode="fast",
+                )
+            self._remember_runtime_metadata(runtime)
+        except BaseException:
+            if runtime is not None:
+                _release_runtime_resources(runtime)
+            self._input_context = previous_input_context
+            raise
         prediction_records = PredictionRecordSet.empty()
         latest_curves_by_card: dict[int, Any] | None = {} if self.calculate_curves else None
         try:
@@ -1553,35 +1800,69 @@ class RWKVCheckpointManager:
                 latest_curves_by_card=latest_curves_by_card,
                 process_many_mode=self.process_many_mode,
                 calculate_curves=self.calculate_curves,
+                input_context=self._input_context,
             )
+            check_cancelled = getattr(progress, "check_cancelled", None)
+            if check_cancelled is not None:
+                check_cancelled()
         except CancelledError:
-            if partial_on_cancel:
-                self._latest_curves_by_card = latest_curves_by_card
-                self._latest_curves_complete = True
-                processed_count = len(prediction_records.immediate_predictions)
-                self._save_checkpoint_and_cache(
-                    runtime,
-                    rows[:processed_count],
-                    prediction_records.slice(processed_count),
-                    status="partial",
-                    checkpoint_path=self.store.partial_checkpoint_path,
-                    progress=ProgressReporter(),
-                )
+            partial_saved = False
+            try:
+                if partial_on_cancel:
+                    self._latest_curves_by_card = latest_curves_by_card
+                    self._latest_curves_complete = True
+                    processed_count = len(prediction_records.immediate_predictions)
+                    self._save_checkpoint_and_cache(
+                        runtime,
+                        rows[:processed_count],
+                        prediction_records.slice(processed_count),
+                        status="partial",
+                        checkpoint_path=self.store.partial_checkpoint_path,
+                        progress=ProgressReporter(),
+                    )
+                    partial_saved = True
+            finally:
+                self._release_rebuild_runtime(runtime)
+                if not partial_saved:
+                    self._input_context = previous_input_context
             raise
         except BaseException:
-            _release_runtime_resources(runtime)
+            self._release_rebuild_runtime(runtime)
+            self._input_context = previous_input_context
             raise
 
         self._latest_curves_by_card = latest_curves_by_card
         self._latest_curves_complete = True
-        return self._save_checkpoint_and_cache(
-            runtime,
-            rows,
-            prediction_records,
-            status="valid",
-            checkpoint_path=self.store.latest_checkpoint_path,
-            progress=progress,
-        )
+        try:
+            return self._save_checkpoint_and_cache(
+                runtime,
+                rows,
+                prediction_records,
+                status="valid",
+                checkpoint_path=self.store.latest_checkpoint_path,
+                progress=progress,
+            )
+        except BaseException:
+            self._release_rebuild_runtime(runtime)
+            self._input_context = previous_input_context
+            raise
+
+    def _release_rebuild_runtime(
+        self,
+        runtime: Any,
+    ) -> None:
+        """Release a newly built runtime on cancellation or failed handoff."""
+
+        if self._runtime is runtime:
+            # A non-Rust background save may have accepted ownership before the
+            # caller was cancelled. Let it stop touching the runtime first.
+            with suppress(CheckpointError):
+                self.wait_for_pending_save()
+            self._release_loaded_runtime()
+            self._clear_runtime_state(preserve_review_data=True)
+            return
+        _release_runtime_resources(runtime)
+        self._clear_runtime_state(preserve_review_data=True)
 
     def ensure_ready_for_prediction(
         self,
@@ -1592,37 +1873,36 @@ class RWKVCheckpointManager:
         force_save: bool = False,
         check_consistency: bool = True,
     ) -> CheckpointResult:
-        if self._active_scope_token is not None:
-            raise CheckpointBusyError(
-                "Stop the active RWKV operation or Live Session before replacing "
-                "its checkpoint state."
-            )
-        if self._should_use_runtime_worker():
-            return self._run_on_runtime_worker(
-                lambda: self._ensure_ready_for_prediction_impl(
-                    rows,
-                    progress,
-                    allow_inconsistent=allow_inconsistent,
-                    force_save=force_save,
-                    check_consistency=check_consistency,
+        with self._reserve_maintenance_slot("replacing its checkpoint state"):
+            if self._should_use_runtime_worker():
+                return self._run_on_runtime_worker(
+                    lambda: self._ensure_ready_for_prediction_impl(
+                        rows,
+                        progress,
+                        allow_inconsistent=allow_inconsistent,
+                        force_save=force_save,
+                        check_consistency=check_consistency,
+                    )
                 )
+            return self._ensure_ready_for_prediction_impl(
+                rows,
+                progress,
+                allow_inconsistent=allow_inconsistent,
+                force_save=force_save,
+                check_consistency=check_consistency,
             )
-        return self._ensure_ready_for_prediction_impl(
-            rows,
-            progress,
-            allow_inconsistent=allow_inconsistent,
-            force_save=force_save,
-            check_consistency=check_consistency,
-        )
 
     def check_integrity(
         self,
         rows: list[dict[str, Any]],
         progress: ProgressReporter,
     ) -> CheckpointResult:
-        if self._should_use_runtime_worker():
-            return self._run_on_runtime_worker(lambda: self._check_integrity_impl(rows, progress))
-        return self._check_integrity_impl(rows, progress)
+        with self._reserve_maintenance_slot("checking checkpoint history"):
+            if self._should_use_runtime_worker():
+                return self._run_on_runtime_worker(
+                    lambda: self._check_integrity_impl(rows, progress)
+                )
+            return self._check_integrity_impl(rows, progress)
 
     def _check_integrity_impl(
         self,
@@ -1630,10 +1910,6 @@ class RWKVCheckpointManager:
         progress: ProgressReporter,
     ) -> CheckpointResult:
         self._raise_background_save_error()
-        if self._active_scope_token is not None:
-            raise CheckpointBusyError(
-                "Stop the active RWKV operation or Live Session before checking checkpoint history."
-            )
         if configured_rwkv_backend() == "rust":
             checkpoint_path = self.store.active_checkpoint_path()
             if checkpoint_path is not None:
@@ -1653,7 +1929,12 @@ class RWKVCheckpointManager:
         try:
             durable_checkpoint_path = self.store.active_checkpoint_path()
             update_checkpoint_consistency(progress, "Checking checkpoint integrity")
-            consistent = self._is_consistent(runtime, rows)
+            consistent = self._is_consistent(
+                runtime,
+                rows,
+                input_context=self._input_context,
+                model_generation=self.model_generation,
+            )
             if not consistent:
                 reloaded_runtime = self._reload_runtime_from_durable_checkpoint(
                     progress,
@@ -1664,7 +1945,12 @@ class RWKVCheckpointManager:
                         progress,
                         "Rechecking durable checkpoint integrity",
                     )
-                    consistent = self._is_consistent(runtime, rows)
+                    consistent = self._is_consistent(
+                        runtime,
+                        rows,
+                        input_context=self._input_context,
+                        model_generation=self.model_generation,
+                    )
             if not consistent:
                 self._invalidate_history_verification()
                 self._durable_writer.write_manifest(
@@ -1692,6 +1978,7 @@ class RWKVCheckpointManager:
         rows: list[dict[str, Any]],
         progress: ProgressReporter,
     ) -> CheckpointResult:
+        self._require_v5o_catalog_matches()
         checkpoint_path = self.store.active_checkpoint_path()
         if checkpoint_path is None:
             raise MissingCheckpointError("Initialize an RWKV checkpoint first.")
@@ -1699,19 +1986,29 @@ class RWKVCheckpointManager:
         try:
             metadata = read_rust_checkpoint_metadata(checkpoint_path)
             try:
-                ReviewBatch = require_rwkv_review_batch(backend="rust")
                 check_checkpoint_history = require_rwkv_checkpoint_history_consistency(
                     backend="rust"
                 )
             except DependencyError:
                 # Preserve compatibility with test doubles and an older staged
                 # dependency. Current release bundles always take the native path.
-                consistent = checkpoint_history_is_consistent(metadata, rows)
+                consistency_rows = self._checkpoint_consistency_rows(metadata, rows)
+                consistent = checkpoint_history_is_consistent(metadata, consistency_rows)
             else:
+                if metadata.model_version in {"v5o"}:
+                    context = self._require_input_context()
+                    batch_type = require_rwkv_v5o_review_batch(backend="rust")
+                    consistency_input = batch_type.from_columns(
+                        kind="answer",
+                        columns=context.process_columns(rows),
+                    )
+                else:
+                    ReviewBatch = require_rwkv_review_batch(backend="rust")
+                    consistency_input = native_review_batch_for_rows(ReviewBatch, rows)
                 consistent = bool(
                     check_checkpoint_history(
                         checkpoint_path,
-                        native_review_batch_for_rows(ReviewBatch, rows),
+                        consistency_input,
                     )
                 )
         except CheckpointMetadataError as exc:
@@ -1784,7 +2081,12 @@ class RWKVCheckpointManager:
                 consistent = True
             else:
                 update_checkpoint_consistency(progress, "Checking checkpoint consistency")
-                consistent = self._is_consistent(runtime, rows)
+                consistent = self._is_consistent(
+                    runtime,
+                    rows,
+                    input_context=self._input_context,
+                    model_generation=self.model_generation,
+                )
                 if not consistent:
                     reloaded_runtime = self._reload_runtime_from_durable_checkpoint(
                         progress,
@@ -1795,7 +2097,12 @@ class RWKVCheckpointManager:
                             progress,
                             "Rechecking durable checkpoint consistency",
                         )
-                        consistent = self._is_consistent(runtime, rows)
+                        consistent = self._is_consistent(
+                            runtime,
+                            rows,
+                            input_context=self._input_context,
+                            model_generation=self.model_generation,
+                        )
         else:
             if not self._checkpoint_lineage_is_current():
                 raise CheckpointError(
@@ -1944,7 +2251,7 @@ class RWKVCheckpointManager:
             return self._durable_writer.write_manifest(
                 runtime,
                 status,
-                self.store.latest_checkpoint_path,
+                self.store.active_checkpoint_path(),
             )
 
         return CheckpointResult(
@@ -1982,7 +2289,7 @@ class RWKVCheckpointManager:
             allow_gpu=allow_gpu,
         )
 
-    def process_one(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def process_one(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         """Process one review on the loaded runtime without durable cache bookkeeping.
 
         This is intended for live-review transient state. Durable checkpoint and
@@ -1993,66 +2300,119 @@ class RWKVCheckpointManager:
             return self._run_on_runtime_worker(lambda: self._process_one_impl(row))
         return self._process_one_impl(row)
 
-    def _process_one_impl(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def _process_one_impl(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
-        return _normalized_scalar_process_result(
+        process_row = runtime_process_row_input(
+            self._runtime,
+            row,
+            input_context=self._input_context,
+            model_generation=self.model_generation,
+        )
+
+        result = _normalized_scalar_process_result(
             self._runtime.process(
-                row,
+                process_row,
                 return_curves=self.calculate_curves,
             ),
             return_curves=self.calculate_curves,
         )
+        return result
 
     def _process_simulation_one_impl(
         self,
         row: dict[str, Any],
         *,
         return_curves: bool,
-    ) -> tuple[float, Any | None]:
+    ) -> tuple[float | None, Any | None]:
+        if model_generation_uses_v5o(self.model_generation):
+            raise ValueError("Behavior Lab is unavailable for V5.")
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
-        result = self._runtime.process(row, return_curves=bool(return_curves))
-        if return_curves:
-            prediction, curve = result
-            return float(prediction), curve
-        return float(result), None
+        process_row = runtime_process_row_input(
+            self._runtime,
+            row,
+            input_context=self._input_context,
+            model_generation=self.model_generation,
+        )
+        effective_return_curves = bool(return_curves) and not runtime_uses_exact_timestamps(
+            self._runtime,
+            model_generation=self.model_generation,
+        )
+        result = self._runtime.process(
+            process_row,
+            return_curves=effective_return_curves,
+        )
+        return _normalized_scalar_process_result(
+            result,
+            return_curves=effective_return_curves,
+        )
 
     def _process_simulation_many_impl(
         self,
         rows: list[dict[str, Any]],
     ) -> list[float]:
+        if model_generation_uses_v5o(self.model_generation):
+            raise ValueError("Behavior Lab is unavailable for V5.")
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
         if not rows:
             return []
         process_many = getattr(self._runtime, "process_many", None)
         if callable(process_many):
+            process_input = runtime_process_many_input(
+                self._runtime,
+                rows,
+                input_context=self._input_context,
+                model_generation=self.model_generation,
+            )
             return [
                 float(value)
                 for value in process_many(
-                    rows,
+                    process_input,
                     return_curves=False,
                 )
             ]
-        return [float(self._runtime.process(row, return_curves=False)) for row in rows]
+        return [
+            float(
+                self._runtime.process(
+                    runtime_process_row_input(
+                        self._runtime,
+                        row,
+                        input_context=self._input_context,
+                        model_generation=self.model_generation,
+                    ),
+                    return_curves=False,
+                )
+            )
+            for row in rows
+        ]
 
-    def undoable_process_one(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def undoable_process_one(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         """Process one live-review row and keep Rust-side state undoable."""
         if self._should_use_runtime_worker():
             return self._run_on_runtime_worker(lambda: self._undoable_process_one_impl(row))
         return self._undoable_process_one_impl(row)
 
-    def _undoable_process_one_impl(self, row: dict[str, Any]) -> tuple[float, Any]:
+    def _undoable_process_one_impl(self, row: dict[str, Any]) -> tuple[float | None, Any]:
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
-        return _normalized_scalar_process_result(
+        process_row = runtime_process_row_input(
+            self._runtime,
+            row,
+            input_context=self._input_context,
+            model_generation=self.model_generation,
+        )
+
+        result = _normalized_scalar_process_result(
             self._runtime.undoable_process(
-                row,
+                process_row,
                 return_curves=self.calculate_curves,
             ),
             return_curves=self.calculate_curves,
         )
+
+        return result
 
     def undo_last_process(self) -> int:
         """Undo the latest live-review runtime process and return remaining depth."""
@@ -2063,7 +2423,8 @@ class RWKVCheckpointManager:
     def _undo_last_process_impl(self) -> int:
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
-        return int(self._runtime.undo_last_process())
+        depth = int(self._runtime.undo_last_process())
+        return depth
 
     def current_undo_depth(self) -> int:
         if self._should_use_runtime_worker():
@@ -2084,6 +2445,8 @@ class RWKVCheckpointManager:
     ) -> list[float]:
         if self._runtime is None:
             raise MissingCheckpointError("No RWKV runtime is loaded.")
+        if not rows:
+            return []
         mode = self._effective_predict_many_mode
         if predict_many_uses_gpu(mode):
             if allow_gpu and self._loaded_runtime_gpu_is_ready():
@@ -2097,6 +2460,8 @@ class RWKVCheckpointManager:
                     batch_size=batch_size,
                     mode="gpu",
                     fallback_mode=PREDICT_MANY_FAST_MODE,
+                    input_context=self._input_context,
+                    model_generation=self.model_generation,
                 )
             # Small interactive callers may deliberately skip GPU dispatch,
             # and a failed availability probe has not mutated prediction state.
@@ -2106,7 +2471,73 @@ class RWKVCheckpointManager:
             rows,
             batch_size=batch_size,
             mode="fast" if predict_many_uses_fast(mode) else "oracle",
+            input_context=self._input_context,
+            model_generation=self.model_generation,
         )
+
+    def _runtime_live_process_row(
+        self,
+        row: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if self._runtime is None:
+            raise MissingCheckpointError("No RWKV runtime is loaded.")
+        return runtime_process_row_input(
+            self._runtime,
+            row,
+            input_context=self._input_context,
+            model_generation=self.model_generation,
+        )
+
+    def _runtime_live_candidates(self, candidates: Iterable[Any]) -> tuple[Any, ...]:
+        if self._runtime is None:
+            raise MissingCheckpointError("No RWKV runtime is loaded.")
+        materialized = tuple(candidates)
+        if not runtime_uses_exact_timestamps(
+            self._runtime,
+            model_generation=self.model_generation,
+        ):
+            return materialized
+        converted: list[Any] = []
+        for seed in materialized:
+            row = getattr(seed, "row", None)
+            if row is None:
+                raise TypeError("RWKV Live Session candidates must expose a row.")
+            converted.append(
+                replace(
+                    seed,
+                    row=runtime_live_candidate_row_input(
+                        self._runtime,
+                        row,
+                        input_context=self._input_context,
+                        model_generation=self.model_generation,
+                    ),
+                )
+            )
+        return tuple(converted)
+
+    def _runtime_live_kwargs(self, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        values = dict(kwargs)
+        runtime = self._runtime
+        if runtime is None:
+            raise MissingCheckpointError("No RWKV runtime is loaded.")
+        if runtime_uses_exact_timestamps(runtime, model_generation=self.model_generation):
+            if values.get("target_timestamp_seconds") is not None:
+                raise ValueError(
+                    "V5o Live prediction accepts target_timestamp_ms, not target_timestamp_seconds."
+                )
+            values.pop("target_timestamp_seconds", None)
+            if values.get("target_timestamp_ms") is None:
+                raise ValueError("V5o Live prediction requires target_timestamp_ms.")
+            values["rollover_phase_ms"] = self._require_input_context().rollover_phase_ms
+        else:
+            if values.get("target_timestamp_ms") is not None:
+                raise ValueError(
+                    "V1 Live prediction accepts target_timestamp_seconds, not target_timestamp_ms."
+                )
+            values.pop("target_timestamp_ms", None)
+            if values.get("target_timestamp_seconds") is None:
+                raise ValueError("V1 Live prediction requires target_timestamp_seconds.")
+        return values
 
     def _effective_predict_many_batch_size(self, batch_size: int | None) -> int | None:
         if batch_size is not None:
@@ -2185,8 +2616,10 @@ class RWKVCheckpointManager:
         token: object,
         candidates: tuple[Any, ...],
         *,
-        initial_target_timestamp_seconds: float,
-        initial_target_day_offset: float,
+        initial_target_timestamp_seconds: float | None,
+        initial_target_timestamp_ms: int | None,
+        initial_rollover_phase_ms: int | None,
+        initial_target_day_offset: float | None = None,
         order: str,
         mode: str | None,
         batch_size: int | None,
@@ -2199,6 +2632,8 @@ class RWKVCheckpointManager:
             lambda: self._predict_many_live_session_impl(
                 candidates,
                 initial_target_timestamp_seconds=initial_target_timestamp_seconds,
+                initial_target_timestamp_ms=initial_target_timestamp_ms,
+                initial_rollover_phase_ms=initial_rollover_phase_ms,
                 initial_target_day_offset=initial_target_day_offset,
                 order=order,
                 mode=mode,
@@ -2215,8 +2650,10 @@ class RWKVCheckpointManager:
         token: object,
         candidates: tuple[Any, ...],
         *,
-        initial_target_timestamp_seconds: float,
-        initial_target_day_offset: float,
+        initial_target_timestamp_seconds: float | None,
+        initial_target_timestamp_ms: int | None,
+        initial_rollover_phase_ms: int | None,
+        initial_target_day_offset: float | None = None,
         order: str,
         mode: str,
         batch_size: int | None,
@@ -2229,6 +2666,8 @@ class RWKVCheckpointManager:
             lambda: self._predict_many_live_session_impl(
                 candidates,
                 initial_target_timestamp_seconds=initial_target_timestamp_seconds,
+                initial_target_timestamp_ms=initial_target_timestamp_ms,
+                initial_rollover_phase_ms=initial_rollover_phase_ms,
                 initial_target_day_offset=initial_target_day_offset,
                 order=order,
                 mode=mode,
@@ -2244,8 +2683,10 @@ class RWKVCheckpointManager:
         self,
         candidates: tuple[Any, ...],
         *,
-        initial_target_timestamp_seconds: float,
-        initial_target_day_offset: float,
+        initial_target_timestamp_seconds: float | None,
+        initial_target_timestamp_ms: int | None,
+        initial_rollover_phase_ms: int | None,
+        initial_target_day_offset: float | None = None,
         order: str,
         mode: str | None,
         batch_size: int | None,
@@ -2262,6 +2703,31 @@ class RWKVCheckpointManager:
             raise RuntimeError(
                 "The bundled RWKV-SRS runtime does not provide predict_many_live_session()."
             )
+        if runtime_uses_exact_timestamps(runtime, model_generation=self.model_generation):
+            if initial_target_timestamp_seconds is not None:
+                raise ValueError(
+                    "V5o Live prediction accepts initial_target_timestamp_ms, "
+                    "not initial_target_timestamp_seconds."
+                )
+            if initial_target_timestamp_ms is None:
+                raise ValueError("V5o Live prediction requires initial_target_timestamp_ms.")
+            target_kwargs: dict[str, Any] = {
+                "initial_target_timestamp_ms": initial_target_timestamp_ms,
+                "initial_rollover_phase_ms": (self._require_input_context().rollover_phase_ms),
+            }
+        else:
+            if initial_target_timestamp_ms is not None:
+                raise ValueError(
+                    "V1 Live prediction accepts initial_target_timestamp_seconds, "
+                    "not initial_target_timestamp_ms."
+                )
+            if initial_target_timestamp_seconds is None:
+                raise ValueError("V1 Live prediction requires initial_target_timestamp_seconds.")
+            if initial_rollover_phase_ms is not None:
+                raise ValueError("V1 Live prediction does not accept initial_rollover_phase_ms.")
+            target_kwargs = {
+                "initial_target_timestamp_seconds": float(initial_target_timestamp_seconds),
+            }
 
         selected_mode = (
             normalize_predict_many_mode(mode)
@@ -2276,24 +2742,27 @@ class RWKVCheckpointManager:
                 )
             # A failed production preflight should not prevent review startup.
             selected_mode = PREDICT_MANY_FAST_MODE
-
+        if strict_gpu and predict_many_uses_gpu(selected_mode):
+            self._require_benchmark_gpu_math()
         resolved_batch_size = self._effective_predict_many_batch_size(batch_size)
         kwargs: dict[str, Any] = {
-            "initial_target_timestamp_seconds": float(initial_target_timestamp_seconds),
-            "initial_target_day_offset": float(initial_target_day_offset),
             "order": str(order),
             "mode": str(selected_mode),
             "batch_size": resolved_batch_size,
             "refresh_limit": int(refresh_limit),
             "profiling": bool(profiling),
             "initial_select_limit": int(initial_select_limit),
+            **target_kwargs,
         }
+        if not model_generation_uses_v5o(self.model_generation):
+            kwargs["initial_target_day_offset"] = float(initial_target_day_offset)
         if predict_many_uses_gpu(selected_mode) and not strict_gpu:
             # The native session applies this to construction and every later
             # refresh/reconciliation. Its switch to Fast is sticky, preserving
             # candidate rank and paired undo state.
             kwargs["fallback_mode"] = PREDICT_MANY_FAST_MODE
-        return factory(candidates, **kwargs)
+        seeds = self._runtime_live_candidates(candidates)
+        return factory(seeds, **kwargs)
 
     def _benchmark_predict_many_impl(
         self,
@@ -2310,18 +2779,38 @@ class RWKVCheckpointManager:
         if normalized_mode == "gpu" and not self._loaded_runtime_gpu_is_ready():
             reason = self._runtime_gpu_failure or "GPU prediction is unavailable."
             raise RuntimeError(f"GPU predict_many speed test is unavailable: {reason}")
+        if normalized_mode == "gpu":
+            self._require_benchmark_gpu_math()
         return _call_runtime_predict_many(
             self._runtime,
             rows,
             batch_size=_positive_optional_int(batch_size),
             mode=normalized_mode,
+            input_context=self._input_context,
+            model_generation=self.model_generation,
         )
+
+    def _require_benchmark_gpu_math(self) -> None:
+        requested = self._scope_gpu_prediction_math or self.gpu_prediction_math
+        if getattr(self._runtime, "gpu_prediction_math", "fp32") != requested:
+            raise RuntimeError("The benchmark runtime did not honor its GPU arithmetic choice.")
+        initialize = getattr(self._runtime, "initialize_gpu", None)
+        if not callable(initialize):
+            raise RuntimeError("GPU benchmarks require native GPU profile validation.")
+        profile = initialize("predict")
+        if profile.get("prediction_math") != requested:
+            label = "GPU (Full FP16)" if requested == "fp16" else "GPU"
+            raise RuntimeError(
+                f"{label} is unavailable; refusing to benchmark "
+                "a different kernel under the requested label. "
+                + str(profile.get("prediction_math_fallback_reason") or "Kernel unavailable.")
+            )
 
     def _scoped_process_one(
         self,
         token: object,
         row: dict[str, Any],
-    ) -> tuple[float, Any]:
+    ) -> tuple[float | None, Any]:
         return self._run_scoped_call(token, lambda: self._process_one_impl(row))
 
     def _scoped_process_simulation_one(
@@ -2330,7 +2819,7 @@ class RWKVCheckpointManager:
         row: dict[str, Any],
         *,
         return_curves: bool,
-    ) -> tuple[float, Any | None]:
+    ) -> tuple[float | None, Any | None]:
         return self._run_scoped_call(
             token,
             lambda: self._process_simulation_one_impl(
@@ -2353,7 +2842,7 @@ class RWKVCheckpointManager:
         self,
         token: object,
         row: dict[str, Any],
-    ) -> tuple[float, Any]:
+    ) -> tuple[float | None, Any]:
         return self._run_scoped_call(
             token,
             lambda: self._undoable_process_one_impl(row),
@@ -2456,19 +2945,43 @@ class RWKVCheckpointManager:
         with suppress(CheckpointError):
             self.wait_for_pending_save()
         preserve_selected_curves = preserve_curves and not self._latest_curves_complete
-        self._release_loaded_runtime()
-        self._clear_runtime_state(
-            preserve_review_data=True,
-            preserve_curves=preserve_selected_curves,
-        )
+        try:
+            self._release_loaded_runtime()
+            self._clear_runtime_state(
+                preserve_review_data=True,
+                preserve_curves=preserve_selected_curves,
+            )
+        finally:
+            self._scope_gpu_prediction_math = None
 
     def unload(self) -> None:
-        if self._runtime_worker is not None and not self._runtime_worker.is_worker_thread():
-            self._runtime_worker.call(self._unload_impl)
-            self._runtime_worker.stop()
-            self._runtime_worker = None
+        with self._runtime_worker_condition:
+            worker = self._runtime_worker
+            on_worker = worker is not None and worker.is_worker_thread()
+            if not on_worker:
+                if self._runtime_worker_unloading:
+                    # A concurrent caller owns teardown. Wait for that teardown
+                    # without touching any replacement worker opened afterward.
+                    while self._runtime_worker_unloading:
+                        self._runtime_worker_condition.wait()
+                    return
+                self._runtime_worker_unloading = True
+        if on_worker:
+            self._unload_impl()
             return
-        self._unload_impl()
+        try:
+            if worker is None:
+                self._unload_impl()
+            else:
+                # Reject new work before queuing cleanup; previously work could
+                # reopen native state between cleanup and the stop sentinel.
+                worker.stop(finalize=self._unload_impl)
+        finally:
+            with self._runtime_worker_condition:
+                if self._runtime_worker is worker:
+                    self._runtime_worker = None
+                self._runtime_worker_unloading = False
+                self._runtime_worker_condition.notify_all()
 
     def _unload_impl(self) -> None:
         with suppress(CheckpointError):
@@ -2477,6 +2990,7 @@ class RWKVCheckpointManager:
             self._release_loaded_runtime()
             self._clear_runtime_state(preserve_review_data=False)
         finally:
+            self._scope_gpu_prediction_math = None
             self._clear_scope_reservation()
 
     def release_runtime(self, *, preserve_review_data: bool = True) -> None:
@@ -2517,6 +3031,7 @@ class RWKVCheckpointManager:
         if not preserve_review_data:
             self._invalidate_history_verification()
             self._review_data_cache = None
+            self._input_context = None
             self._review_data_cache_last_review_id = None
             self._review_data_cache_latest_collection_review_id = None
 
@@ -2527,11 +3042,29 @@ class RWKVCheckpointManager:
         cards: list[dict[str, Any]] | None = None,
     ):
         checkpoint_path = self.store.active_checkpoint_path()
+        self._require_checkpoint_selection_matches()
+        self._require_v5o_catalog_matches()
+        if cards is not None and isinstance(self._input_context, V5oInputContext):
+            catalog = self._input_context.cards
+            # Native selective scopes need the retained hierarchy as well as
+            # card IDs, even though V5 query and Live seed rows are ID-only.
+            cards = [
+                {
+                    "card_id": int(row["card_id"]),
+                    **{
+                        field: getattr(catalog[int(row["card_id"])], field)
+                        for field in ("note_id", "deck_id", "preset_id", "card_creation_ms")
+                    },
+                }
+                for row in cards
+            ]
         scope_key = _scope_key(cards)
         if (
             self._runtime is not None
             and (checkpoint_path is None or self._loaded_path == str(checkpoint_path))
             and self._loaded_scope_key == scope_key
+            and getattr(self._runtime, "gpu_prediction_math", "fp32")
+            == (self._scope_gpu_prediction_math or self.gpu_prediction_math)
         ):
             return self._runtime
         if checkpoint_path is None:
@@ -2547,6 +3080,8 @@ class RWKVCheckpointManager:
             **_runtime_constructor_kwargs(
                 configured_rwkv_backend(),
                 process_many_mode=self.process_many_mode,
+                state_precision=self.state_precision,
+                gpu_prediction_math=self._scope_gpu_prediction_math or self.gpu_prediction_math,
             ),
         )
         self._release_loaded_runtime()
@@ -2567,6 +3102,7 @@ class RWKVCheckpointManager:
         progress: ProgressReporter,
     ):
         checkpoint_path = self.store.active_checkpoint_path()
+        self._require_checkpoint_selection_matches()
         if checkpoint_path is None:
             return self._runtime
         self._raise_if_legacy_rust_checkpoint_path(checkpoint_path)
@@ -2580,6 +3116,8 @@ class RWKVCheckpointManager:
             **_runtime_constructor_kwargs(
                 configured_rwkv_backend(),
                 process_many_mode=self.process_many_mode,
+                state_precision=self.state_precision,
+                gpu_prediction_math=self._scope_gpu_prediction_math or self.gpu_prediction_math,
             ),
         )
         self._release_loaded_runtime()
@@ -2604,7 +3142,28 @@ class RWKVCheckpointManager:
             metadata = read_rust_checkpoint_metadata(checkpoint_path)
         except CheckpointMetadataError:
             return False
-        return metadata.storage_version < CURRENT_RUST_CHECKPOINT_STORAGE_VERSION
+        return self._rust_checkpoint_rebuild_reason(metadata) is not None
+
+    def _require_checkpoint_selection_matches(self) -> None:
+        # Never silently quantize a pre-existing FP32 trajectory, even though
+        # native loading supports that conversion. Both toggle directions must
+        # replay the complete history using the selected recurrent precision.
+        if (
+            self.store.active_checkpoint_path() is not None
+            and self.store.manifest().get("state_precision", "fp32") != self.state_precision
+        ):
+            raise LegacyCheckpointError(
+                "Card/note state precision changed. Rebuild the checkpoint from Anki's "
+                "review history before using RWKV."
+            )
+        if (
+            self.store.active_checkpoint_path() is not None
+            and not self._checkpoint_model_matches_config()
+        ):
+            raise LegacyCheckpointError(
+                "The selected RWKV model or generation changed. Rebuild the checkpoint "
+                "from Anki's review history before using RWKV."
+            )
 
     def _raise_if_legacy_rust_checkpoint_path(self, checkpoint_path: Path) -> None:
         if configured_rwkv_backend() != "rust":
@@ -2615,14 +3174,83 @@ class RWKVCheckpointManager:
             return
         self._raise_if_legacy_rust_checkpoint(metadata)
 
-    @staticmethod
-    def _raise_if_legacy_rust_checkpoint(metadata: RustCheckpointMetadata) -> None:
-        if metadata.storage_version >= CURRENT_RUST_CHECKPOINT_STORAGE_VERSION:
-            return
-        raise LegacyCheckpointError(
-            "This RWKV checkpoint uses the obsolete Rust binary-v1 storage "
-            "format. Rebuild it from Anki's review history before using RWKV."
+    def _raise_if_legacy_rust_checkpoint(
+        self,
+        metadata: RustCheckpointMetadata,
+    ) -> None:
+        reason = self._rust_checkpoint_rebuild_reason(metadata)
+        if reason is not None:
+            raise LegacyCheckpointError(reason)
+
+    def _rust_checkpoint_rebuild_reason(
+        self,
+        metadata: RustCheckpointMetadata,
+    ) -> str | None:
+        if metadata.state_precision != self.state_precision:
+            return (
+                "This RWKV checkpoint uses a different card/note state precision. "
+                "Rebuild it from Anki's review history after changing FP16/FP32."
+            )
+        if metadata.storage_version < CURRENT_RUST_CHECKPOINT_STORAGE_VERSION:
+            return (
+                "This RWKV checkpoint uses the obsolete Rust binary-v1 storage "
+                "format. Rebuild it from Anki's review history before using RWKV."
+            )
+        if (
+            metadata.model_version in {"v5o"}
+            and _rollover_phase_from_manifest(self.store.manifest(), self.model_generation) is None
+        ):
+            return (
+                "This checkpoint predates its generation's canonical rollover-phase contract. "
+                "Rebuild it from Anki's review history before using RWKV."
+            )
+        if self._checkpoint_model_reference_requires_rebuild(metadata):
+            return (
+                "This RWKV checkpoint's saved model reference is unavailable to "
+                "the bundled Rust runtime. This can happen after the v1/v2 model "
+                "layout migration. Rebuild it from Anki's review history before "
+                "using RWKV."
+            )
+        return None
+
+    def _checkpoint_model_reference_requires_rebuild(
+        self,
+        metadata: RustCheckpointMetadata,
+    ) -> bool:
+        """Detect checkpoint references the bundled runtime cannot relocate.
+
+        The runtime resolves a checkpoint ``model_id`` only in the old
+        flat ``pretrained/`` directory. New runtimes are constructed with an
+        explicit generation-scoped path, so only checkpoints created before
+        that switch retain a name-only reference. Rebuilding from authoritative
+        review history is safer than rewriting the native checkpoint format.
+        """
+
+        configured_model_path = bundled_model_path(
+            self.model_id,
+            model_generation=self.model_generation,
         )
+        if configured_model_path is None:
+            return False
+
+        model_id = metadata.values.get("model_id")
+        if model_id is not None:
+            if not isinstance(model_id, str) or model_id != self.model_id:
+                return False
+            generation_directory = model_storage_subdirectory(self.model_generation)
+            if configured_model_path.parent.name != generation_directory:
+                # A legacy flat bundle remains resolvable by the frozen runtime.
+                return False
+            legacy_flat_path = configured_model_path.parent.parent / f"{model_id}.safetensors"
+            return not legacy_flat_path.is_file()
+
+        model_path = metadata.values.get("model_path")
+        if model_path is None:
+            return False
+        try:
+            return not Path(model_path).is_file()
+        except (OSError, TypeError, ValueError):
+            return True
 
     def _process_pending(
         self,
@@ -2641,6 +3269,7 @@ class RWKVCheckpointManager:
                 latest_curves_by_card=self._latest_curves_by_card,
                 process_many_mode=self.process_many_mode,
                 calculate_curves=self.calculate_curves,
+                input_context=self._input_context,
             )
         except CancelledError:
             if prediction_records.immediate_predictions:
@@ -2784,6 +3413,12 @@ class RWKVCheckpointManager:
             raise CheckpointCacheBindingError(
                 "RWKV evaluation cache checkpoint binding is unsupported. Rebuild "
                 "the checkpoint to recreate it."
+            )
+
+        if binding.get("state_precision", "fp32") != self.state_precision:
+            raise CheckpointCacheBindingError(
+                "RWKV evaluation cache belongs to a different state precision. "
+                "Rebuild the checkpoint to recreate aligned predictions."
             )
 
         checkpoint_path = self.store.active_checkpoint_path()
@@ -2931,6 +3566,18 @@ class RWKVCheckpointManager:
             update_checkpoint_curve_data(progress, "Loading complete RWKV curve data")
             self._ensure_latest_curves_loaded(rows)
         storage_estimate = _rust_checkpoint_storage_estimate(runtime, rows)
+        self._durable_writer.cleanup_snapshots(runtime)
+        _remove_stale_checkpoint_tmp(checkpoint_path)
+        _ensure_checkpoint_write_has_disk_space(
+            runtime,
+            checkpoint_path,
+            rows,
+            storage_estimate=storage_estimate,
+        )
+        staged = self.store.create_checkpoint_snapshot()
+        checkpoint_path = (
+            staged.partial_checkpoint_path if status == "partial" else staged.latest_checkpoint_path
+        )
         write = _DurableCheckpointWrite(
             runtime=runtime,
             rows=rows,
@@ -2940,17 +3587,22 @@ class RWKVCheckpointManager:
             status=status,
             checkpoint_path=checkpoint_path,
             storage_estimate=storage_estimate,
+            rollover_phase_ms=(
+                self._require_input_context().rollover_phase_ms
+                if model_generation_uses_exact_timestamps(self.model_generation)
+                else None
+            ),
+            v5o_catalog_fingerprint=(
+                self._input_context.catalog_fingerprint()
+                if isinstance(self._input_context, V5oInputContext) else None
+            ),
+            snapshot_store=staged,
         )
         result = self._durable_writer.result_for(runtime, status, checkpoint_path)
-        _remove_stale_checkpoint_tmp(checkpoint_path)
-        _ensure_checkpoint_write_has_disk_space(
-            runtime,
-            checkpoint_path,
-            rows,
-            storage_estimate=storage_estimate,
-        )
         self._runtime = runtime
-        self._loaded_path = str(checkpoint_path)
+        # Until publication this runtime still represents an unsaved tail on
+        # the old durable lineage, even if native save advances its backing path.
+        self._loaded_path = str(self.store.active_checkpoint_path() or checkpoint_path)
         self._remember_runtime_metadata(runtime)
         self._runtime_dirty = True
         self._unsaved_prediction_records = prediction_records.slice_from(durable_prefix_count)
@@ -2960,7 +3612,8 @@ class RWKVCheckpointManager:
             progress.update(1, 1, "RWKV checkpoint write is running in the background")
             return result
 
-        self._durable_writer.write(write)
+        result = self._durable_writer.write(write)
+        self._loaded_path = result.checkpoint_path
         self._runtime_dirty = False
         self._clear_unsaved_prediction_records()
         self._remember_runtime_metadata(runtime)
@@ -2980,7 +3633,7 @@ class RWKVCheckpointManager:
             error: BaseException | None = None
             pending_review_tail_context: tuple[ReviewData, CollectionRevision] | None = None
             try:
-                self._durable_writer.write(write)
+                result = self._durable_writer.write(write)
             except BaseException as exc:
                 error = detach_exception_from_thread(exc)
             with self._save_lock:
@@ -2992,7 +3645,7 @@ class RWKVCheckpointManager:
                     if error is None:
                         self._runtime_dirty = False
                         self._clear_unsaved_prediction_records()
-                        self._loaded_path = str(write.checkpoint_path)
+                        self._loaded_path = result.checkpoint_path
                         self._evaluation_cache_validation = None
                         self._mark_history_verified(write.rows)
                         pending_review_tail_context = self._pending_review_tail_context
@@ -3015,12 +3668,20 @@ class RWKVCheckpointManager:
         return configured_rwkv_backend() == "rust" and not self._on_runtime_worker()
 
     def _run_on_runtime_worker(self, op):
-        if self._runtime_worker is None:
-            self._runtime_worker = _RuntimeWorker()
-        return self._runtime_worker.call(op)
+        with self._runtime_worker_condition:
+            worker = self._runtime_worker
+            if self._runtime_worker_unloading and (
+                worker is None or not worker.is_worker_thread()
+            ):
+                raise CheckpointError("The RWKV runtime worker is shutting down.")
+            if worker is None:
+                worker = _RuntimeWorker()
+                self._runtime_worker = worker
+        return worker.call(op)
 
     def _on_runtime_worker(self) -> bool:
-        return self._runtime_worker is not None and self._runtime_worker.is_worker_thread()
+        worker = self._runtime_worker
+        return worker is not None and worker.is_worker_thread()
 
     def _remember_runtime_metadata(self, runtime) -> None:
         self._runtime_processed_review_count = int(getattr(runtime, "processed_review_count", 0))
@@ -3085,17 +3746,50 @@ class RWKVCheckpointManager:
     ) -> bool:
         manifest = self.store.manifest() if manifest is None else manifest
         manifest_model = manifest.get("model_id")
-        return manifest_model is None or str(manifest_model) == self.model_id
+        manifest_generation = manifest.get("model_generation")
+        generation_matches = (
+            self.model_generation == DEFAULT_MODEL_GENERATION
+            if manifest_generation is None
+            else manifest_generation == self.model_generation
+        )
+        return (
+            manifest.get("state_precision", "fp32") == self.state_precision
+            and generation_matches
+            and (manifest_model is None or str(manifest_model) == self.model_id)
+        )
 
     def _checkpoint_policy_matches_config(
         self,
         manifest: Mapping[str, Any] | None = None,
     ) -> bool:
         manifest = self.store.manifest() if manifest is None else manifest
+        deleted_policy = manifest.get("exclude_deleted_card_revlogs")
+        if deleted_policy is not None and deleted_policy != self.exclude_deleted_card_revlogs:
+            return False
+        if isinstance(self._input_context, V5oInputContext) and (
+            manifest.get(V5O_CATALOG_FINGERPRINT_MANIFEST_KEY)
+            != self._input_context.catalog_fingerprint()
+        ):
+            return False
         return checkpoint_policy_matches(
             manifest,
             self.filtered_review_normalization_policy,
         )
+
+    def _require_v5o_catalog_matches(self) -> None:
+        if not model_generation_uses_v5o(self.model_generation):
+            return
+        context = self._require_input_context()
+        if not isinstance(context, V5oInputContext):
+            raise CheckpointError("V5 requires its retained-history catalog before loading state.")
+        manifest = self.store.manifest()
+        if self.store.active_checkpoint_path() is not None and (
+            manifest.get(V5O_CATALOG_FINGERPRINT_MANIFEST_KEY) != context.catalog_fingerprint()
+        ):
+            raise InconsistentCheckpointError(
+                "V5's retained card catalog changed or is missing. Rebuild the complete "
+                "checkpoint from current Anki history before using predictions."
+            )
 
     def _invalid_checkpoint_acknowledged(self) -> bool:
         manifest = self.store.manifest()
@@ -3118,15 +3812,98 @@ class RWKVCheckpointManager:
         self.store.write_manifest(manifest)
 
     @staticmethod
-    def _is_consistent(runtime, rows: list[dict[str, Any]]) -> bool:
+    def _is_consistent(
+        runtime,
+        rows: list[dict[str, Any]],
+        *,
+        input_context: RuntimeInputContext | None = None,
+        model_generation: str = DEFAULT_MODEL_GENERATION,
+    ) -> bool:
         try:
-            consistency_input: object = rows
-            if bool(getattr(runtime, "supports_native_review_batch_consistency", False)):
+            if not runtime_uses_exact_timestamps(
+                runtime,
+                model_generation=model_generation,
+            ) and bool(getattr(runtime, "supports_native_review_batch_consistency", False)):
                 ReviewBatch = require_rwkv_review_batch(backend="rust")
                 consistency_input = native_review_batch_for_rows(ReviewBatch, rows)
+            else:
+                consistency_input = runtime_process_many_input(
+                    runtime,
+                    rows,
+                    input_context=input_context,
+                    model_generation=model_generation,
+                )
             return bool(runtime.check_history_consistency(consistency_input))
         except Exception:
             return False
+
+    def _checkpoint_consistency_rows(
+        self,
+        metadata: RustCheckpointMetadata,
+        rows: list[dict[str, Any]],
+    ) -> Iterable[Mapping[str, Any]]:
+        if metadata.model_version not in {"v5o"}:
+            return rows
+        return tuple(self._require_input_context().process_row(row) for row in rows)
+
+    def _require_input_context(self) -> RuntimeInputContext:
+        if self._input_context is None:
+            raise CheckpointError(
+                "This generation requires review timestamp context. Reload review data before "
+                "using this checkpoint."
+            )
+        return self._input_context
+
+
+def write_comparison_checkpoint(
+    store: ProfileStore,
+    runtime: Any,
+    rows,
+    records: PredictionRecordSet,
+    *,
+    model_id: str,
+    model_generation: str,
+    context: RuntimeInputContext | None,
+    normalization_policy: FilteredReviewNormalizationPolicy,
+    exclude_deleted_card_revlogs: bool = True,
+) -> None:
+    """Save an already-built complete comparison state in an unpublished slot.
+
+    Use the normal durable writer so cache digests, native history, catalog and
+    rollover contracts remain identical to a normal checkpoint build.
+    """
+    if store.checkpoint_directory is None:
+        raise ValueError("Comparison checkpoints must be staged before publication")
+    store.ensure()
+    specs = (PER_REVIEW_CACHE_SPEC,)
+    writer = _DurableCheckpointWriter(
+        store, model_id, model_generation, specs, normalization_policy,
+        exclude_deleted_card_revlogs,
+        state_precision=getattr(runtime, "state_precision", "fp32"),
+    )
+    estimate = _rust_checkpoint_storage_estimate(runtime, rows)
+    writer.cleanup_snapshots(runtime)
+    _ensure_checkpoint_write_has_disk_space(
+        runtime, store.latest_checkpoint_path, rows, storage_estimate=estimate
+    )
+    writer.write(_DurableCheckpointWrite(
+        runtime=runtime,
+        rows=rows,
+        prediction_records=records,
+        prediction_cache_specs=specs,
+        latest_curves_by_card=None,
+        status="valid",
+        checkpoint_path=store.latest_checkpoint_path,
+        storage_estimate=estimate,
+        rollover_phase_ms=(
+            context.rollover_phase_ms
+            if model_generation_uses_exact_timestamps(model_generation) and context is not None
+            else None
+        ),
+        v5o_catalog_fingerprint=(
+            context.catalog_fingerprint() if isinstance(context, V5oInputContext) else None
+        ),
+    ))
 
 
 class _DurableCheckpointWriter:
@@ -3134,13 +3911,20 @@ class _DurableCheckpointWriter:
         self,
         store: ProfileStore,
         model_id: str,
+        model_generation: str,
         prediction_cache_specs: tuple[PredictionCacheSpec, ...],
         filtered_review_normalization_policy: FilteredReviewNormalizationPolicy,
+        exclude_deleted_card_revlogs: bool | None = None,
+        *,
+        state_precision: str = "fp32",
     ) -> None:
         self.store = store
         self.model_id = model_id
+        self.model_generation = normalize_model_generation(model_generation)
         self.prediction_cache_specs = prediction_cache_specs
         self.filtered_review_normalization_policy = filtered_review_normalization_policy
+        self.exclude_deleted_card_revlogs = exclude_deleted_card_revlogs
+        self.state_precision = state_precision
 
     def result_for(self, runtime, status: str, checkpoint_path) -> CheckpointResult:
         return CheckpointResult(
@@ -3150,32 +3934,73 @@ class _DurableCheckpointWriter:
             checkpoint_path=str(checkpoint_path or self.store.active_checkpoint_path() or ""),
         )
 
+    def cleanup_snapshots(self, runtime, *, keep_paths: Iterable[Path] = ()) -> None:
+        """Reclaim abandoned writes only while preserving live native backing."""
+        protected = list(keep_paths)
+        backing_path = getattr(runtime, "_backing_checkpoint_path", None)
+        if backing_path is not None:
+            protected.append(Path(backing_path))
+        with suppress(OSError):
+            self.store.cleanup_checkpoint_snapshots(keep_paths=protected)
+
     def write(self, write: _DurableCheckpointWrite) -> CheckpointResult:
-        _write_checkpoint_atomic(
-            write.runtime,
-            write.checkpoint_path,
-            write.rows,
-            storage_estimate=write.storage_estimate,
+        if int(getattr(write.runtime, "processed_review_count", 0)) != len(write.rows):
+            raise CheckpointError("Checkpoint state and evaluation rows have different lengths.")
+        # The manifest is the commit point for the complete checkpoint/cache
+        # pair. Native scoped saves remember their destination as a backing
+        # path: allocate its final name now and never rename it after saving.
+        # A failed publication may still back a live runtime, so leave that
+        # unpublished snapshot until the next safe write/cleanup boundary.
+        self.cleanup_snapshots(write.runtime, keep_paths=(write.checkpoint_path,))
+        staged = write.snapshot_store or self.store.create_checkpoint_snapshot()
+        writer = _DurableCheckpointWriter(
+            staged, self.model_id, self.model_generation, self.prediction_cache_specs,
+            self.filtered_review_normalization_policy, self.exclude_deleted_card_revlogs,
+            state_precision=self.state_precision,
         )
         partial = write.status == "partial"
+        checkpoint_path = (
+            staged.partial_checkpoint_path if partial else staged.latest_checkpoint_path
+        )
+        # Materialize the cache before the native disk-space check. The guard
+        # then measures actual remaining free space while both the old snapshot
+        # and new cache exist, rather than guessing at SQLite/curve sizes.
         write_evaluation_cache(
-            _evaluation_cache_path(self.store, partial=partial),
+            _evaluation_cache_path(staged, partial=partial),
             write.rows,
             write.prediction_records,
             write.prediction_cache_specs,
             model_id=self.model_id,
             latest_curves_by_card=write.latest_curves_by_card,
         )
-        result = self.write_manifest(
+        _write_checkpoint_atomic(
+            write.runtime,
+            checkpoint_path,
+            write.rows,
+            storage_estimate=write.storage_estimate,
+        )
+        fingerprint = _checkpoint_history_fingerprint(checkpoint_path)
+        if fingerprint is not None and (
+            fingerprint["processed_review_count"] != len(write.rows)
+            or fingerprint["last_review_id"] != getattr(write.runtime, "last_review_id", None)
+        ):
+            raise CheckpointError("Saved checkpoint history does not match its evaluation rows.")
+        result = writer.write_manifest(
             write.runtime,
             write.status,
-            write.checkpoint_path,
+            checkpoint_path,
             day_offset_origin=_day_offset_origin_from_rows(write.rows),
             evaluation_cache_written=True,
+            rollover_phase_ms=write.rollover_phase_ms,
+            v5o_catalog_fingerprint=write.v5o_catalog_fingerprint,
+            previous_manifest=self.store.manifest(),
         )
-        if write.status == "valid":
-            self._remove_partial_durable_files()
-            self._remove_legacy_durable_cache_files()
+        if self.store.publish_checkpoint_snapshot(staged):
+            # Publication succeeded. Cleanup is only garbage collection: failure
+            # must not turn a committed save into a reported save failure.
+            with suppress(OSError):
+                self.store.cleanup_checkpoint_snapshots()
+            self._remove_legacy_durable_files()
         return result
 
     def write_manifest(
@@ -3186,62 +4011,101 @@ class _DurableCheckpointWriter:
         *,
         day_offset_origin: int | None = None,
         evaluation_cache_written: bool = False,
+        rollover_phase_ms: int | None = None,
+        v5o_catalog_fingerprint: str | None = None,
+        previous_manifest: dict[str, Any] | None = None,
     ) -> CheckpointResult:
         result = self.result_for(runtime, status, checkpoint_path)
-        old_manifest = self.store.manifest()
+        old_manifest = self.store.manifest() if previous_manifest is None else previous_manifest
         partial = status == "partial"
         evaluation_cache_path = _existing_evaluation_cache_path_for_manifest(
             self.store,
             partial=partial,
         )
+        if not evaluation_cache_written and old_manifest.get(EVALUATION_CACHE_MANIFEST_KEY):
+            # A status-only invalidation may describe a partial snapshot. Its
+            # files do not change names when status changes to "invalid".
+            evaluation_cache_path = old_manifest[EVALUATION_CACHE_MANIFEST_KEY]
         evaluation_cache_binding = old_manifest.get(EVALUATION_CACHE_BINDING_MANIFEST_KEY)
         if evaluation_cache_written:
             evaluation_cache_binding = _evaluation_cache_binding(
                 checkpoint_path=(Path(result.checkpoint_path) if result.checkpoint_path else None),
                 cache_path=Path(evaluation_cache_path) if evaluation_cache_path else None,
             )
-        self.store.write_manifest(
-            {
-                "status": status,
-                "model_id": self.model_id,
-                FILTERED_REVIEW_NORMALIZATION_MANIFEST_KEY: (
-                    self.filtered_review_normalization_policy.semantic_signature()
-                ),
-                "checkpoint_path": result.checkpoint_path,
-                EVALUATION_CACHE_MANIFEST_KEY: evaluation_cache_path,
-                EVALUATION_CACHE_BINDING_MANIFEST_KEY: evaluation_cache_binding,
-                "prediction_cache_path": None,
-                "predict_ahead_prediction_cache_path": None,
-                "predict_ahead_curve_cache_path": None,
-                "processed_review_count": result.processed_review_count,
-                "last_review_id": result.last_review_id,
-                "day_offset_origin": (
-                    int(day_offset_origin)
-                    if day_offset_origin is not None
-                    else old_manifest.get("day_offset_origin")
-                ),
-                "updated_at": int(time.time()),
-                "inconsistent_acknowledged": (
-                    bool(old_manifest.get("inconsistent_acknowledged"))
-                    if status == "invalid"
-                    else False
-                ),
-            }
-        )
+        manifest = {
+            "status": status,
+            "model_id": self.model_id,
+            "model_generation": self.model_generation,
+            "state_precision": self.state_precision,
+            "exclude_deleted_card_revlogs": self.exclude_deleted_card_revlogs,
+            FILTERED_REVIEW_NORMALIZATION_MANIFEST_KEY: (
+                self.filtered_review_normalization_policy.semantic_signature()
+            ),
+            "checkpoint_path": result.checkpoint_path,
+            EVALUATION_CACHE_MANIFEST_KEY: evaluation_cache_path,
+            EVALUATION_CACHE_BINDING_MANIFEST_KEY: evaluation_cache_binding,
+            "prediction_cache_path": None,
+            "predict_ahead_prediction_cache_path": None,
+            "predict_ahead_curve_cache_path": None,
+            "processed_review_count": result.processed_review_count,
+            "last_review_id": result.last_review_id,
+            "day_offset_origin": (
+                int(day_offset_origin)
+                if day_offset_origin is not None
+                else old_manifest.get("day_offset_origin")
+            ),
+            "updated_at": int(time.time()),
+            "inconsistent_acknowledged": (
+                bool(old_manifest.get("inconsistent_acknowledged"))
+                if status == "invalid"
+                else False
+            ),
+        }
+        if model_generation_uses_exact_timestamps(self.model_generation):
+            rollover_phase_ms = (
+                rollover_phase_ms
+                if rollover_phase_ms is not None
+                else _rollover_phase_from_manifest(old_manifest, self.model_generation)
+            )
+            if rollover_phase_ms is not None:
+                manifest[V5O_ROLLOVER_PHASE_MS_MANIFEST_KEY] = int(
+                    rollover_phase_ms
+                )
+        if model_generation_uses_v5o(self.model_generation):
+            manifest[V5O_CATALOG_FINGERPRINT_MANIFEST_KEY] = (
+                v5o_catalog_fingerprint or old_manifest.get(V5O_CATALOG_FINGERPRINT_MANIFEST_KEY)
+            )
+        # Status-only updates must keep pointing at the same immutable snapshot.
+        # A newly staged manifest gets its own ID at publication, never the old
+        # snapshot's ID.
+        if previous_manifest is None and "snapshot_id" in old_manifest:
+            manifest["snapshot_id"] = old_manifest["snapshot_id"]
+        self.store.write_manifest(manifest)
         return result
 
-    def _remove_partial_durable_files(self) -> None:
+    def _remove_legacy_durable_files(self) -> None:
+        # Snapshot-aware store properties now select the newly committed files.
+        # Clean only the old, explicitly known flat-layout files, not arbitrary
+        # files in the profile or the selected snapshot.
+        directory = self.store.checkpoints_dir
+        cache_directory = directory / "evaluation_cache"
+        cache_is_link = cache_directory.is_symlink() or (
+            hasattr(cache_directory, "is_junction") and cache_directory.is_junction()
+        )
         for path in (
-            self.store.partial_checkpoint_path,
-            self.store.partial_evaluation_cache_path,
-            self.store.partial_predict_ahead_curve_cache_path,
-            *(spec.path(self.store, partial=True) for spec in prediction_cache_specs()),
+            directory / f"latest{rwkv_checkpoint_suffix()}",
+            directory / f"partial{rwkv_checkpoint_suffix()}",
+            *(cache_directory / name for name in (
+                "rwkv_evaluation_cache.sqlite",
+                "rwkv_evaluation_cache.partial.sqlite",
+                "rwkv_review_predictions.jsonl.gz",
+                "rwkv_review_predictions.partial.jsonl.gz",
+                "rwkv_predict_ahead_predictions.jsonl.gz",
+                "rwkv_predict_ahead_predictions.partial.jsonl.gz",
+                "rwkv_predict_ahead_curves.pkl",
+                "rwkv_predict_ahead_curves.partial.pkl",
+            ) if not cache_is_link),
         ):
-            with suppress(Exception):
-                path.unlink(missing_ok=True)
-
-    def _remove_legacy_durable_cache_files(self) -> None:
-        for path in _legacy_evaluation_cache_paths(self.store):
             with suppress(Exception):
                 path.unlink(missing_ok=True)
 
@@ -3324,6 +4188,11 @@ def _runtime_expected_checkpoint_size(
     runtime,
     counts: RustCheckpointIdentityCounts,
 ) -> int | None:
+    if getattr(runtime, "model_version", None) == "v5o":
+        # API 76's public facade describes a model-specific helper, but its
+        # native dispatch still rejects V5. Retain the conservative FP32-sized
+        # fallback even for FP16 until upstream exposes a working V5 estimate.
+        return None
     expected_checkpoint_size = getattr(runtime, "expected_checkpoint_size", None)
     if not callable(expected_checkpoint_size):
         return None
@@ -3374,12 +4243,17 @@ def _evaluation_cache_binding(
     if fingerprint is None or cache_path is None:
         return None
     try:
+        precision = read_rust_checkpoint_metadata(checkpoint_path).state_precision
+    except CheckpointMetadataError:
+        return None
+    try:
         cache_sha256, cache_size = evaluation_cache_file_digest(cache_path)
     except PredictionCacheError:
         return None
     return {
         "version": EVALUATION_CACHE_BINDING_VERSION,
         "algorithm": "sha256",
+        "state_precision": precision,
         "cache_sha256": cache_sha256,
         "cache_size": cache_size,
         "checkpoint_history_fingerprint": fingerprint,
@@ -3490,7 +4364,7 @@ def _normalized_scalar_process_result(
     result: Any,
     *,
     return_curves: bool,
-) -> tuple[float, Any | None]:
+) -> tuple[float | None, Any | None]:
     """Keep every add-on live mutation on one stable result contract.
 
     Current RWKV-SRS returns a float when curves are disabled and a
@@ -3506,7 +4380,7 @@ def _normalized_scalar_process_result(
         prediction, curve = result
         return float(prediction), curve
     prediction = result[0] if isinstance(result, tuple) and result else result
-    return float(prediction), None
+    return None if prediction is None else float(prediction), None
 
 
 def _positive_int_or_default(value: Any, default: int) -> int:
@@ -3534,6 +4408,8 @@ def _call_runtime_predict_many(
     batch_size: int | None,
     mode: str,
     fallback_mode: str | None = None,
+    input_context: RuntimeInputContext | None = None,
+    model_generation: str | None = None,
 ) -> list[float]:
     kwargs: dict[str, Any] = {
         "mode": str(mode),
@@ -3541,7 +4417,19 @@ def _call_runtime_predict_many(
     }
     if fallback_mode is not None:
         kwargs["fallback_mode"] = str(fallback_mode)
-    return list(runtime.predict_many(rows, **kwargs))
+    prediction_input = runtime_predict_many_input(
+        runtime,
+        rows,
+        input_context=input_context,
+        model_generation=model_generation,
+    )
+
+    predictions = list(runtime.predict_many(prediction_input, **kwargs))
+    if len(predictions) != len(rows):
+        raise RuntimeError(
+            f"RWKV-SRS predict_many() returned {len(predictions)} results for {len(rows)} rows."
+        )
+    return predictions
 
 
 def _last_review_id_from_rows(rows: list[dict[str, Any]]) -> int | None:
@@ -3561,6 +4449,23 @@ def _optional_int(value) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+
+
+
+
+def _rollover_phase_from_manifest(manifest: Mapping[str, Any], generation: str) -> int | None:
+    value = manifest.get(V5O_ROLLOVER_PHASE_MS_MANIFEST_KEY)
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        phase = value
+    elif isinstance(value, float) and value.is_integer():
+        phase = int(value)
+    else:
+        return None
+    return phase if 0 <= phase < MILLISECONDS_PER_DAY else None
 
 
 def _checkpoint_file_signature(

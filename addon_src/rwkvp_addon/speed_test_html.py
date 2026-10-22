@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import math
 
 from .report_html import (
@@ -8,12 +7,13 @@ from .report_html import (
     MetricTone,
     ReportMetricStyle,
     ranked_metric_style,
-    render_report_document,
-    render_report_metric_cell,
     report_palette,
     semantic_metric_style,
 )
+from .report_payload import metric_cell, report_document, value_cell
+from .rwkv_performance_modes import prediction_mode_label
 from .speed_test import (
+    PREDICT_MANY_SPEED_TEST_ORACLE_MAX_CARDS,
     LivePredictionSpeedTestResult,
     PredictManySpeedMeasurement,
     PredictManySpeedTestResult,
@@ -30,22 +30,23 @@ def render_predict_many_speed_test_html(
     generation: int = 1,
 ) -> str:
     modes = result.modes
-    headers = "\n".join(
+    measurements = {(item.card_count, item.mode): item for item in result.measurements}
+    headers = [
         _mode_header(
             mode,
-            batch_size=result.measurement(result.card_counts[0], mode).batch_size,
+            batch_size=next(item.batch_size for item in result.measurements if item.mode == mode),
             show_batch_detail=True,
         )
         for mode in modes
-    )
-    rows = "\n".join(
+    ]
+    rows = [
         _predict_row(
             card_count,
-            tuple(result.measurement(card_count, mode) for mode in modes),
+            tuple(measurements.get((card_count, mode)) for mode in modes),
             is_dark=is_dark,
         )
         for card_count in result.card_counts
-    )
+    ]
     cap_note = (
         f"The collection has {result.collection_card_count:,} cards; "
         f"{result.eligible_card_count:,} have processed RWKV state and are eligible "
@@ -54,25 +55,18 @@ def render_predict_many_speed_test_html(
     return _document(
         title="Prediction Throughput Speed Test",
         subtitle=f"Model: {result.model_id}",
-        table=f"""
-<table class="rwkv-data-table speed-table">
-    <thead>
-        <tr>
-            <th scope="col" class="row-header">Cards</th>
-            {headers}
-        </tr>
-    </thead>
-    <tbody>
-        {rows}
-    </tbody>
-</table>
-""".strip(),
+        table=dict(cssClass="speed-table", headers=[
+            {"text": "Cards", "cssClass": "row-header"}, *headers,
+        ], rows=rows),
         notes=(
             cap_note,
+            f"Oracle stops at {PREDICT_MANY_SPEED_TEST_ORACLE_MAX_CARDS:,} cards; "
+            "Fast and both GPU modes run the larger sizes. Gray EXPERIMENT NOT RUN "
+            "cells have no timing and are excluded from the heatmap ranking.",
             "Cards without processed RWKV state are excluded because RWKV-SRS routes "
             "them through the scalar Oracle fallback; including them would not measure "
             "Fast or GPU inference.",
-            f"Each cell is the average of {result.repetitions} warmed native Live "
+            f"Each measured cell is the average of {result.repetitions} warmed native Live "
             "Session cycles. Checkpoint loading, native-session construction, its "
             "initial full prediction/index build, and one warm-up cycle are excluded.",
             "Each measured cycle processes and requeues one representative answer, "
@@ -94,10 +88,10 @@ def render_process_many_speed_test_html(
     is_dark: bool = False,
     generation: int = 1,
 ) -> str:
-    headers = "\n".join(_mode_header(mode) for mode in result.modes)
+    headers = [_mode_header(mode) for mode in result.modes]
     measurements = tuple(result.measurement(mode) for mode in result.modes)
     values = tuple(item.reviews_per_minute for item in measurements)
-    cells = "\n".join(
+    cells = [
         _process_cell(
             item,
             values=values,
@@ -105,7 +99,7 @@ def render_process_many_speed_test_html(
             is_dark=is_dark,
         )
         for item in measurements
-    )
+    ]
     cap_note = (
         f"The collection has {result.available_review_count:,} processable reviews; "
         f"each available mode uses up to {result.review_count:,} reviews."
@@ -113,22 +107,9 @@ def render_process_many_speed_test_html(
     return _document(
         title="State Building Speed Test",
         subtitle=f"Model: {result.model_id}",
-        table=f"""
-<table class="rwkv-data-table speed-table">
-    <thead>
-        <tr>
-            <th scope="col" class="row-header">Sample</th>
-            {headers}
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <th scope="row" class="row-header">One run</th>
-            {cells}
-        </tr>
-    </tbody>
-</table>
-""".strip(),
+        table=dict(cssClass="speed-table", headers=[
+            {"text": "Sample", "cssClass": "row-header"}, *headers,
+        ], rows=[{"cells": [value_cell("One run", header=True, css_class="row-header"), *cells]}]),
         notes=(
             cap_note,
             "Each mode processes its stated review count once in a fresh runtime on "
@@ -161,10 +142,10 @@ def render_curve_speed_test_html(
         with_curves_seconds=with_curves.average_seconds,
         without_curves_seconds=without_curves.average_seconds,
     )
-    cells = "\n".join(
+    cells = [
         _curve_cell(item, values=values, is_dark=is_dark)
         for item in (with_curves, without_curves)
-    )
+    ]
     duration_comparison = _curve_duration_comparison(
         with_curves_seconds=with_curves.average_seconds,
         without_curves_seconds=without_curves.average_seconds,
@@ -184,21 +165,20 @@ def render_curve_speed_test_html(
             f"Model: {result.model_id} · "
             f"Mode: {_mode_label(result.mode)}"
         ),
-        table=f"""
-<table class="rwkv-data-table speed-table">
-    <thead><tr>
-        <th class="row-header">Reviews</th><th>With curves</th><th>Without curves</th>
-    </tr></thead>
-    <tbody><tr><th class="row-header number">{result.review_count:,}</th>{cells}</tr></tbody>
-</table>
-<div class="curve-comparison {comparison.css_class}"
-     data-rwkv-metric-tone="{comparison_style.tone.value}"
-     style="background-color: {comparison_style.background}; color: {comparison_style.foreground}">
-    <span>Turning curves off</span>
-    <strong>{comparison.percent_text} speed {comparison.direction}</strong>
-    <small>based on average reviews/min</small>
-</div>
-""".strip(),
+        table=dict(cssClass="speed-table", headers=[
+            {"text": "Reviews", "cssClass": "row-header"},
+            {"text": "With curves"}, {"text": "Without curves"},
+        ], rows=[{"cells": [
+            value_cell(f"{result.review_count:,}", header=True, css_class="row-header number"),
+            *cells,
+        ]}]),
+        callout=dict(
+            cssClass=comparison.css_class, tone=comparison_style.tone.value,
+            background=comparison_style.background, foreground=comparison_style.foreground,
+            label="Turning curves off",
+            primary=f"{comparison.percent_text} speed {comparison.direction}",
+            detail="based on average reviews/min",
+        ),
         notes=(
             f"The collection has {result.available_review_count:,} processable reviews; "
             f"this comparison used {result.review_count:,}.",
@@ -234,7 +214,7 @@ def render_live_prediction_speed_test_html(
         "currently have processed RWKV state."
     )
     batch = "automatic" if result.batch_size is None else f"{result.batch_size:,}"
-    metric_cell = render_report_metric_cell(
+    metric = metric_cell(
         _format_duration(result.average_seconds),
         (f"{_format_rate(result.cards_per_second)} cards/s",),
         classes=("metric", "heat"),
@@ -246,18 +226,12 @@ def render_live_prediction_speed_test_html(
             f"Model: {result.model_id} · "
             f"Mode: {_mode_label(result.mode)} · Batch: {batch}"
         ),
-        table=f"""
-<table class="rwkv-data-table speed-table">
-    <thead><tr>
-        <th class="row-header">Cards</th>
-        <th>{html.escape(_mode_label(result.mode))}</th>
-    </tr></thead>
-    <tbody><tr>
-        <th class="row-header number">{result.card_count:,}</th>
-        {metric_cell}
-    </tr></tbody>
-</table>
-""".strip(),
+        table=dict(cssClass="speed-table", headers=[
+            {"text": "Cards", "cssClass": "row-header"}, {"text": _mode_label(result.mode)},
+        ], rows=[{"cells": [
+            value_cell(f"{result.card_count:,}", header=True, css_class="row-header number"),
+            metric,
+        ]}]),
         notes=(
             cap_note,
             f"The average covers {result.repetitions} warmed native Live Session "
@@ -276,28 +250,35 @@ def render_live_prediction_speed_test_html(
 
 def _predict_row(
     card_count: int,
-    measurements: tuple[PredictManySpeedMeasurement, ...],
+    measurements: tuple[PredictManySpeedMeasurement | None, ...],
     *,
     is_dark: bool,
-) -> str:
-    values = tuple(item.average_seconds for item in measurements)
-    cells = "\n".join(
+) -> dict:
+    values = tuple(item.average_seconds for item in measurements if item is not None)
+    cells = [
         _predict_cell(item, values=values, is_dark=is_dark) for item in measurements
-    )
-    return f"""
-<tr>
-    <th scope="row" class="row-header number">{card_count:,}</th>
-    {cells}
-</tr>
-""".strip()
+    ]
+    return {"cells": [
+        value_cell(f"{card_count:,}", header=True, css_class="row-header number"), *cells,
+    ]}
 
 
 def _predict_cell(
-    measurement: PredictManySpeedMeasurement,
+    measurement: PredictManySpeedMeasurement | None,
     *,
     values: tuple[float, ...],
     is_dark: bool,
-) -> str:
+) -> dict:
+    if measurement is None:
+        return metric_cell(
+            "EXPERIMENT NOT RUN", (),
+            classes=("metric", "heat"),
+            style=semantic_metric_style(
+                MetricTone.NEUTRAL,
+                palette=report_palette(is_dark=is_dark, neutral="gray"),
+                css_class="not-run",
+            ),
+        )
     style = ranked_metric_style(
         measurement.average_seconds,
         values,
@@ -306,7 +287,7 @@ def _predict_cell(
         best_class="fastest",
         worst_class="slowest",
     )
-    return render_report_metric_cell(
+    return metric_cell(
         _format_duration(measurement.average_seconds),
         (f"{_format_rate(measurement.cards_per_second)} cards/s",),
         classes=("metric", "heat"),
@@ -320,7 +301,7 @@ def _process_cell(
     values: tuple[float, ...],
     available_review_count: int,
     is_dark: bool,
-) -> str:
+) -> dict:
     style = ranked_metric_style(
         measurement.reviews_per_minute,
         values,
@@ -332,7 +313,7 @@ def _process_cell(
     estimated = _format_estimated_duration(
         measurement.estimated_seconds_for(available_review_count)
     )
-    return render_report_metric_cell(
+    return metric_cell(
         _format_duration(measurement.duration_seconds),
         (
             f"{measurement.review_count:,} reviews",
@@ -349,7 +330,7 @@ def _curve_cell(
     *,
     values: tuple[float, ...],
     is_dark: bool,
-) -> str:
+) -> dict:
     style = ranked_metric_style(
         measurement.average_seconds,
         values,
@@ -358,7 +339,7 @@ def _curve_cell(
         best_class="fastest",
         worst_class="slowest",
     )
-    return render_report_metric_cell(
+    return metric_cell(
         _format_duration(measurement.average_seconds),
         (f"{_format_rate(measurement.reviews_per_minute)} reviews/min",),
         classes=("metric", "heat"),
@@ -371,37 +352,34 @@ def _mode_header(
     *,
     batch_size: int | None = None,
     show_batch_detail: bool = False,
-) -> str:
+) -> dict:
     detail = ""
     if show_batch_detail and batch_size is not None:
-        detail = f'<span class="header-detail">batch {batch_size:,}</span>'
+        detail = f"batch {batch_size:,}"
     elif show_batch_detail:
-        detail = '<span class="header-detail">batch automatic</span>'
-    return (
-        '<th scope="col" class="mode-header">'
-        f"{html.escape(_mode_label(mode))}{detail}</th>"
-    )
+        detail = "batch automatic"
+    return dict(text=_mode_label(mode), cssClass="mode-header", detail=detail)
 
 
 def _document(
     *,
     title: str,
     subtitle: str,
-    table: str,
+    table: dict,
     notes: tuple[str, ...],
     is_dark: bool,
     generation: int,
+    callout: dict | None = None,
 ) -> str:
-    return render_report_document(
+    return report_document(
         title=title,
         subtitle=subtitle,
-        report_html=table,
+        sections=[{"table": table, "callout": callout}],
         notes=notes,
-        card_aria_label=f"{title} results",
-        root_extra_classes="rwkv-speed-test",
+        card_label=f"{title} results",
+        root_classes="rwkv-speed-test",
         generation=generation,
         is_dark=is_dark,
-        include_close_footer=False,
     )
 
 
@@ -525,4 +503,4 @@ def _latency_style(seconds: float, *, is_dark: bool) -> ReportMetricStyle:
 
 
 def _mode_label(mode: str) -> str:
-    return "GPU" if mode == "gpu" else mode.title()
+    return prediction_mode_label(mode)

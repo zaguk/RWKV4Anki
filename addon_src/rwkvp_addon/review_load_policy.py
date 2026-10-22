@@ -9,6 +9,16 @@ DEFAULT_MINIMUM_RETENTION_STEP = 0.02
 CandidateT = TypeVar("CandidateT")
 
 
+def validate_random_card_percent(value: object) -> float:
+    try:
+        percent = float(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Random card % must be a number between 0 and 100.") from exc
+    if isinstance(value, bool) or not math.isfinite(percent) or not 0 <= percent <= 100:
+        raise ValueError("Random card % must be a number between 0 and 100.")
+    return percent
+
+
 def prediction_below_retention(
     predicted_retrievability: float,
     desired_retention: float,

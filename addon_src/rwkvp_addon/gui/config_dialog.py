@@ -18,10 +18,15 @@ from ..addon_config import (
     MODEL_CONFIG_KEY,
     PREDICT_MANY_MODE_CONFIG_KEY,
     PROCESS_MANY_MODE_CONFIG_KEY,
+    addon_config_for_mw,
     available_model_ids,
+    calculate_forgetting_curves,
+    configured_model_generation,
     default_addon_config,
+    gpu_prediction_math,
     normalized_addon_config,
     predict_many_batch_size,
+    state_precision,
     write_addon_config_for_mw,
 )
 from ..anki_api import profile_name
@@ -41,6 +46,7 @@ from ..config_options import (
     restart_required_option_labels,
 )
 from ..initial_setup import mark_initial_setup_seen_for_mw
+from ..model_generation import MODEL_GENERATIONS, model_generation_supports_curves
 from ..profile_store import ProfileStore
 from ..review_type_normalization import (
     FilteredReviewNormalizationPolicy,
@@ -53,7 +59,9 @@ from ..review_type_normalization import (
 from ..rwkv_performance_modes import (
     available_predict_many_modes,
     available_process_many_modes,
+    prediction_mode_label,
 )
+from ..setup_wizard_benchmarks import SETUP_MODE_REPETITIONS, PredictionRefreshSearchResult
 from ..speed_test import speed_test_checkpoint_is_usable
 from ..vendor_bootstrap import rwkv_gpu_available
 from .web_message import (
@@ -118,10 +126,15 @@ class RWKVConfigDialog(QDialog):
         self._visible_options = visible_config_options(
             predict_gpu_available=self._predict_gpu_available
         )
+        self._model_choices_by_generation = {
+            generation: available_model_ids(generation)
+            for generation in MODEL_GENERATIONS
+        }
         self._choices = _choices_for_options(
             self._visible_options,
             predict_gpu_available=self._predict_gpu_available,
             process_gpu_available=self._process_gpu_available,
+            model_choices_by_generation=self._model_choices_by_generation,
         )
         self._speed_test_checkpoint_usable = _speed_test_checkpoint_available(self._mw)
         self._profile_store = ProfileStore.for_profile(profile_name(self._mw))
@@ -177,6 +190,7 @@ class RWKVConfigDialog(QDialog):
                 "predictions",
                 "curves",
                 "live-predictions",
+                "auto-live-predictions",
             )
         }
         self._comparison_buttons = {
@@ -186,7 +200,7 @@ class RWKVConfigDialog(QDialog):
                 action="comparison",
                 enabled=True,
             )
-            for name in ("models", "deleted-reviews")
+            for name in ("generations", "models", "state-precision", "gpu-math", "deleted-reviews")
         }
         from .setup_wizard_controller import SetupWizardController
 
@@ -194,7 +208,7 @@ class RWKVConfigDialog(QDialog):
             self,
             predict_gpu_available=self._predict_gpu_available,
             process_gpu_available=self._process_gpu_available,
-            model_ids=tuple(self._choices.get((MODEL_CONFIG_KEY,), ())),
+            model_ids_by_generation=self._model_choices_by_generation,
         )
         parent_destroyed = getattr(dialog_parent, "destroyed", None)
         if parent_destroyed is not None:
@@ -226,6 +240,7 @@ class RWKVConfigDialog(QDialog):
                 initial_setup=self._standalone_setup_host,
                 apply_enabled=self._apply_enabled,
                 generation=self._render_generation,
+                model_choices_by_generation=self._model_choices_by_generation,
             ),
             context=self,
         )
@@ -373,9 +388,22 @@ class RWKVConfigDialog(QDialog):
             return
         button = buttons.get(name)
         if button is not None:
-            button.setEnabled(True)
+            button.setEnabled(
+                not (
+                    action == "speed-test"
+                    and name == "curves"
+                    and not model_generation_supports_curves(
+                        configured_model_generation(self._draft)
+                    )
+                )
+            )
 
     def _run_speed_test(self, name: str) -> None:
+        if (
+            name == "curves"
+            and not model_generation_supports_curves(configured_model_generation(self._draft))
+        ):
+            return
         button = self._speed_test_buttons.get(name)
         if button is None or not button.isEnabled():
             return
@@ -391,7 +419,10 @@ class RWKVConfigDialog(QDialog):
                 parent=self,
                 button=button,
                 gpu_available=self._process_gpu_available,
-                calculate_curves=bool(self._draft[CALCULATE_FORGETTING_CURVES_CONFIG_KEY]),
+                calculate_curves=calculate_forgetting_curves(self._draft),
+                model_id=str(self._draft[MODEL_CONFIG_KEY]),
+                model_generation=configured_model_generation(self._draft),
+                state_precision=state_precision(self._draft),
             )
             return
         if name == "predictions":
@@ -410,21 +441,67 @@ class RWKVConfigDialog(QDialog):
                 parent=self,
                 button=button,
                 mode=str(self._draft[PROCESS_MANY_MODE_CONFIG_KEY]),
+                model_id=str(self._draft[MODEL_CONFIG_KEY]),
+                model_generation=configured_model_generation(self._draft),
+                state_precision=state_precision(self._draft),
             )
             return
-        if name == "live-predictions":
+        if name in {"live-predictions", "auto-live-predictions"}:
             mode = str(self._draft[PREDICT_MANY_MODE_CONFIG_KEY])
+            generation = self._render_generation
+            auto_options = (
+                {"on_auto_count": lambda result: self._auto_prediction_count_finished(
+                    result, generation=generation,
+                )}
+                if name == "auto-live-predictions" else {}
+            )
             show_live_prediction_speed_test(
                 parent=self,
                 button=button,
                 mode=mode,
                 card_count=int(self._draft[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY]),
                 batch_size=predict_many_batch_size(self._draft, mode),
+                **auto_options,
             )
+
+    def _auto_prediction_count_finished(
+        self, result: PredictionRefreshSearchResult, *, generation: int,
+    ) -> None:
+        if self._cleaned_up or generation != self._render_generation:
+            return
+        count = result.selected_card_count
+        self._draft[LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY] = count
+        self._set_apply_enabled(self._draft != self._config)
+        duration = result.measurement(count).duration_seconds
+        message = (
+            f"Auto selected {count:,} cards using {prediction_mode_label(result.mode)} "
+            f"({float(duration) * 1000:.1f} ms slowest of {SETUP_MODE_REPETITIONS} runs). "
+            "Use Apply or OK to save."
+        )
+        self.web.eval(
+            f"document.querySelector('[data-rwkv-generation=\"{generation}\"]') && "
+            "window.rwkvSetAutoPredictionCount && window.rwkvSetAutoPredictionCount("
+            f"{count}, {json.dumps(message)});"
+        )
 
     def _run_comparison(self, name: str) -> None:
         button = self._comparison_buttons.get(name)
         if button is None or not button.isEnabled():
+            return
+        if name == "gpu-math":
+            from .gpu_math_comparison_dialog import show_gpu_math_comparison
+
+            show_gpu_math_comparison(
+                parent=self, button=button, config=self._draft,
+                gpu_available=self._predict_gpu_available,
+            )
+            return
+        if name == "state-precision":
+            from .precision_comparison_dialog import show_state_precision_comparison
+
+            show_state_precision_comparison(
+                parent=self, button=button, config=dict(self._draft),
+            )
             return
         from .state_comparison_dialog import (
             show_deleted_reviews_comparison,
@@ -432,13 +509,29 @@ class RWKVConfigDialog(QDialog):
         )
 
         include_deleted = not bool(self._draft[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY])
+        if name == "generations":
+            from ..addon_config import retain_multiple_model_generations
+            from .state_comparison_dialog import show_generations_comparison
+
+            show_generations_comparison(
+                parent=self, button=button,
+                model_ids_by_generation=self._model_choices_by_generation,
+                current_model_generation=configured_model_generation(self._draft),
+                include_deleted_reviews=include_deleted,
+                retain_generations=retain_multiple_model_generations(self._draft),
+                state_precision=state_precision(self._draft),
+            )
+            return
         if name == "models":
+            generation = configured_model_generation(self._draft)
             show_models_comparison(
                 parent=self,
                 button=button,
-                model_ids=tuple(self._choices.get((MODEL_CONFIG_KEY,), ())),
+                model_ids=self._model_choices_by_generation[generation],
                 current_model_id=str(self._draft[MODEL_CONFIG_KEY]),
+                model_generation=generation,
                 include_deleted_reviews=include_deleted,
+                state_precision=state_precision(self._draft),
             )
             return
         if name == "deleted-reviews":
@@ -446,7 +539,9 @@ class RWKVConfigDialog(QDialog):
                 parent=self,
                 button=button,
                 model_id=str(self._draft[MODEL_CONFIG_KEY]),
+                model_generation=configured_model_generation(self._draft),
                 current_includes_deleted_reviews=include_deleted,
+                state_precision=state_precision(self._draft),
             )
 
     def apply(self, *, notify_restart: bool = True) -> bool:
@@ -486,7 +581,8 @@ class RWKVConfigDialog(QDialog):
         if _manager_setting_change_is_blocked(self._mw, persisted, updated):
             show_web_warning(
                 "Stop the active RWKV operation, Live Session, or checkpoint save "
-                "before changing State Building Mode or deleted-card history. "
+                "before changing State Building Mode, state precision, GPU prediction math, "
+                "or deleted-card history. "
                 "Your settings have not been changed.",
                 title="RWKV Settings",
                 parent=self,
@@ -536,7 +632,16 @@ class RWKVConfigDialog(QDialog):
         if restart_labels:
             rendered = "\n".join(f"• {label}" for label in restart_labels)
             notices.append("Restart Anki for these changes to take effect:\n\n" + rendered)
-        if rebuild_labels and checkpoint_exists:
+        generation_changed = configured_model_generation(persisted) != configured_model_generation(
+            updated
+        )
+        if generation_changed:
+            notices.append(
+                "RWKV now uses the selected generation's own checkpoint. A compatible saved "
+                "checkpoint is reused. If that generation has no usable checkpoint, open "
+                "RWKV > Manage Checkpoint to initialize or rebuild it."
+            )
+        elif rebuild_labels and checkpoint_exists:
             rendered = "\n".join(f"• {label}" for label in rebuild_labels)
             notices.append(
                 "Rebuild the RWKV checkpoint before using it with these changes:\n\n"
@@ -877,11 +982,7 @@ def _active_dialog_parent():
 
 
 def _read_config(parent) -> dict[str, Any]:
-    addon_manager = getattr(parent, "addonManager", None)
-    if addon_manager is None:
-        return {}
-    addon = addon_manager.addonFromModule(__name__)
-    return dict(addon_manager.getConfig(addon) or {})
+    return addon_config_for_mw(parent)
 
 
 def _choices_for_options(
@@ -889,13 +990,28 @@ def _choices_for_options(
     *,
     predict_gpu_available: bool,
     process_gpu_available: bool,
+    model_choices_by_generation: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[tuple[str, ...], tuple[str, ...]]:
+    generation_models = (
+        {
+            generation: available_model_ids(generation)
+            for generation in MODEL_GENERATIONS
+        }
+        if model_choices_by_generation is None
+        else model_choices_by_generation
+    )
     choices: dict[tuple[str, ...], tuple[str, ...]] = {}
     for option in options:
         if option.value_type != "choice":
             continue
-        if option.key_path == ("model",):
-            value = available_model_ids()
+        if option.key_path == (MODEL_CONFIG_KEY,):
+            value = tuple(
+                dict.fromkeys(
+                    model_id
+                    for generation in MODEL_GENERATIONS
+                    for model_id in generation_models.get(generation, ())
+                )
+            )
         elif option.key_path == (PREDICT_MANY_MODE_CONFIG_KEY,):
             value = available_predict_many_modes(gpu_available=predict_gpu_available)
         elif option.key_path == (PROCESS_MANY_MODE_CONFIG_KEY,):
@@ -940,13 +1056,21 @@ def _model_change_is_blocked(
     current: Mapping[str, Any],
     updated: Mapping[str, Any],
 ) -> bool:
-    if str(current.get("model") or "") == str(updated.get("model") or ""):
+    if (
+        str(current.get(MODEL_CONFIG_KEY) or "")
+        == str(updated.get(MODEL_CONFIG_KEY) or "")
+        and configured_model_generation(current)
+        == configured_model_generation(updated)
+    ):
         return False
     try:
         from ..runtime import manager_for_mw
 
         manager = manager_for_mw(parent)
-        return bool(getattr(manager, "runtime_scope_active", False))
+        return bool(
+            getattr(manager, "runtime_scope_active", False)
+            or getattr(manager, "save_in_progress", False)
+        )
     except Exception:
         return False
 
@@ -983,7 +1107,9 @@ def _manager_setting_change_is_blocked(
     deleted_history_changed = current.get(EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY) != updated.get(
         EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY
     )
-    if not process_changed and not deleted_history_changed:
+    precision_changed = state_precision(current) != state_precision(updated)
+    math_changed = gpu_prediction_math(current) != gpu_prediction_math(updated)
+    if not any((process_changed, deleted_history_changed, precision_changed, math_changed)):
         return False
     try:
         from ..runtime import manager_for_mw

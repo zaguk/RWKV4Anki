@@ -8,6 +8,7 @@ from typing import Any
 from .adaptive_retention import AdaptiveRetentionSettings
 from .anki_api import DeckRetention
 from .filtered_deck import retentions_with_desired_values
+from .review_load_policy import validate_random_card_percent
 from .study_session_html import render_study_session_dialog_html
 from .web_dialog_bridge import BridgePayloadError, WebDialogCommand
 from .web_dialog_controller import BaseWebDialogController, CloseReason
@@ -43,7 +44,9 @@ class StudySessionFormSpec:
     same_day_action: str
     same_day_label: str
     same_day_description: str
+    order_description: str = "Controls how selected cards are placed in the study queue."
     split_same_day_action: bool = False
+    random_card_available: bool = False
 
     def __post_init__(self) -> None:
         if self.maximum_value < 1:
@@ -72,6 +75,7 @@ class StudySessionDraft:
     adaptive_flat: str = "0"
     adaptive_s_multi: str = "0"
     adaptive_d_multi: str = "0"
+    random_card_percent: str = "0"
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,7 @@ class StudySessionRequest:
     same_day_only: bool
     extra_search: str
     adaptive_retention_settings: AdaptiveRetentionSettings | None
+    random_card_percent: float = 0.0
 
     def saved_settings(self, spec: StudySessionFormSpec) -> dict[str, Any]:
         saved: dict[str, Any] = {
@@ -92,6 +97,8 @@ class StudySessionRequest:
         }
         if self.extra_search:
             saved["search_filter"] = self.extra_search
+        if spec.random_card_available:
+            saved["random_card_percent"] = self.random_card_percent
         if self.adaptive_retention_settings is not None:
             adaptive = self.adaptive_retention_settings
             saved[ADAPTIVE_RETENTION_SETTINGS_KEY] = {
@@ -370,10 +377,17 @@ class StudySessionFormController(BaseWebDialogController):
             same_day_only=bool(same_day_only),
             extra_search=self.draft.search_filter.strip(),
             adaptive_retention_settings=adaptive,
+            random_card_percent=(
+                validate_random_card_percent(self.draft.random_card_percent)
+                if self.spec.random_card_available
+                else 0.0
+            ),
         )
 
     def _apply_form_payload(self, payload: Mapping[str, Any]) -> None:
         expected = _form_keys(len(self.retentions), self.adaptive_available)
+        if self.spec.random_card_available:
+            expected.add("random_card_percent")
         actual = set(payload)
         if actual != expected:
             missing = sorted(expected - actual)
@@ -401,6 +415,7 @@ class StudySessionFormController(BaseWebDialogController):
             minimum=payload["minimum"],
             maximum=payload["maximum"],
             order_index=payload["order_index"],
+            random_card_percent=payload.get("random_card_percent", "0"),
             desired_retentions=tuple(
                 payload[f"desired_retention[{index}]"] for index in range(len(self.retentions))
             ),
@@ -445,6 +460,7 @@ def _draft_from_saved(
     )
     return replace(
         draft,
+        random_card_percent=_saved_random_card_percent(saved.get("random_card_percent", 0)),
         search_filter=(str(saved["search_filter"]) if "search_filter" in saved else ""),
         minimum=str(
             _bounded_int(
@@ -474,6 +490,13 @@ def _draft_from_saved(
         adaptive_s_multi=_number_text(adaptive.s_multi),
         adaptive_d_multi=_number_text(adaptive.d_multi),
     )
+
+
+def _saved_random_card_percent(value: object) -> str:
+    try:
+        return _number_text(validate_random_card_percent(value))
+    except ValueError:
+        return "0"
 
 
 def _default_draft(

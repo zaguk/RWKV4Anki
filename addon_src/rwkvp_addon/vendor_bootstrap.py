@@ -11,6 +11,7 @@ from .rwkv_backend import (
     rwkv_backend_scope,
 )
 from .windows_native_cache import (
+    WindowsNativeLoadError,
     prepare_windows_native_extension,
 )
 
@@ -36,6 +37,17 @@ def require_rwkv_srs(*, backend: str | None = None):
         _prepare_native_backend(selected_backend)
         try:
             from rwkv_srs import RWKV_SRS
+            if selected_backend == "rust":
+                from rwkv_srs._native import native_api_version
+
+                if native_api_version() < 80:
+                    raise DependencyError(
+                        "RWKV4Anki requires a matching RWKV-SRS native API 80+ bundle "
+                        "for checkpoint loading and saving. Reinstall the current add-on bundle "
+                        "and restart Anki."
+                    )
+        except DependencyError:
+            raise
         except Exception as exc:  # pragma: no cover - depends on Anki runtime binaries
             raise DependencyError(
                 "RWKV-SRS could not be imported. The add-on vendors rwkv_srs, but "
@@ -77,6 +89,25 @@ def require_rwkv_review_batch(*, backend: str | None = None):
                 "RWKV-SRS native review-batch support could not be imported."
             ) from exc
         return ReviewBatch
+
+
+def require_rwkv_v5o_review_batch(*, backend: str | None = None):
+    """Load the distinct V5 transport from a matching API 76+ native payload."""
+
+    with rwkv_backend_scope(backend) as selected_backend:
+        ensure_vendor_paths()
+        _prepare_native_backend(selected_backend)
+        try:
+            from rwkv_srs import V5oReviewBatch
+            from rwkv_srs._native import native_api_version
+
+            if native_api_version() < 76:
+                raise RuntimeError("V5 requires RWKV-SRS native API 76 or newer")
+        except Exception as exc:  # pragma: no cover - depends on bundled native assets
+            raise DependencyError("V5 requires a matching RWKV-SRS API 76+ bundle.") from exc
+        return V5oReviewBatch
+
+
 
 
 def require_rwkv_checkpoint_history_consistency(*, backend: str | None = None):
@@ -172,6 +203,29 @@ def _prepare_native_backend(selected_backend: str) -> None:
     try:
         prepare_windows_native_extension()
     except Exception as exc:
-        raise DependencyError(
-            "RWKV-SRS could not prepare its verified Windows native-extension cache."
-        ) from exc
+        summary = (
+            "RWKV-SRS verified its Windows native-extension cache, but could not "
+            "load the native module."
+            if isinstance(exc, WindowsNativeLoadError)
+            else "RWKV-SRS could not prepare its verified Windows native-extension cache."
+        )
+        # Background workers detach exception chains to release their runtime
+        # frames. Preserve the diagnostic as text before that happens: setup
+        # and checkpoint failure dialogs intentionally display only str(exc).
+        raise DependencyError(f"{summary}\n\n{_native_failure_details(exc)}") from exc
+
+
+def _native_failure_details(exc: BaseException) -> str:
+    details = []
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        description = str(current).strip()
+        name = type(current).__name__
+        details.append(f"{name}: {description}" if description else name)
+        if current.__cause__ is not None:
+            current = current.__cause__
+        else:
+            current = None if current.__suppress_context__ else current.__context__
+    return "\nCaused by: ".join(details)

@@ -18,6 +18,7 @@ from ..dataset_export import (
     open_checkpoint_runtime_from_load,
 )
 from ..live_prediction_benchmark import open_live_prediction_benchmark_session
+from ..model_generation import DEFAULT_MODEL_GENERATION
 from ..process_many_benchmark import benchmark_process_many_rows
 from ..process_speed_cache import (
     cache_process_many_curve_speed_test,
@@ -29,6 +30,14 @@ from ..review_rows import (
     prediction_rows_for_card_ids,
 )
 from ..runtime import manager_for_mw, store_for_mw
+from ..runtime_inputs import RuntimeInputContext, input_context_for_generation
+from ..rwkv_performance_modes import prediction_mode_math
+from ..setup_wizard_benchmarks import (
+    SETUP_MODE_REPETITIONS,
+    SETUP_PREDICTION_COUNT_LIMIT,
+    PredictionRefreshSearchResult,
+    search_prediction_refresh_count,
+)
 from ..speed_test import (
     PREDICT_MANY_SPEED_TEST_SIZES,
     capped_curve_speed_test_rows,
@@ -46,6 +55,9 @@ from ..speed_test_html import (
     render_live_prediction_speed_test_html,
     render_predict_many_speed_test_html,
     render_process_many_speed_test_html,
+)
+from ..timestamp_context import (
+    millisecond_aligned_timestamp_seconds,
 )
 from ..web_dialog_controller import CloseOnlyReportController
 from .checkpoint_failure import handle_checkpoint_failure
@@ -69,6 +81,7 @@ class _PredictSpeedTestInput:
 class _ProcessSpeedTestInput:
     rows: tuple[dict[str, Any], ...]
     available_review_count: int
+    input_context: RuntimeInputContext | None = None
 
 
 class SpeedTestResultsDialog(WebDialogHost):
@@ -161,9 +174,11 @@ def show_predict_many_speed_test(
         )
         maximum = max(PREDICT_MANY_SPEED_TEST_SIZES)
         latest_review = latest_collection_review_timestamp_seconds(col)
-        target_timestamp = max(
-            time.time(),
-            0.0 if latest_review is None else float(latest_review),
+        target_timestamp = millisecond_aligned_timestamp_seconds(
+            max(
+                time.time(),
+                0.0 if latest_review is None else float(latest_review),
+            )
         )
         return _PredictSpeedTestInput(
             review_load=review_load,
@@ -185,29 +200,53 @@ def show_predict_many_speed_test(
                     input_data.card_ids,
                     input_data.review_load.review_data,
                 ),
+                gpu_prediction_math="fp32",
             )
             rows = prediction_rows_for_card_ids(
                 input_data.card_ids,
                 readiness.review_data,
                 target_timestamp_seconds=input_data.target_timestamp_seconds,
             )
+            input_context = _input_context_for_runtime(
+                readiness.review_data,
+                lease,
+            )
+            current_math = "fp32"
+
+            def open_session(batch, mode, batch_size, refresh_limit):
+                nonlocal lease, current_math
+                requested_math = prediction_mode_math(mode)
+                if current_math != requested_math:
+                    lease.close()
+                    lease = None
+                    _readiness, lease = open_checkpoint_runtime_from_load(
+                        manager,
+                        input_data.review_load,
+                        progress,
+                        scope_cards=checkpoint_scope_cards_for_card_ids(
+                            input_data.card_ids, input_data.review_load.review_data,
+                        ),
+                        gpu_prediction_math=requested_math,
+                    )
+                    current_math = requested_math
+                return open_live_prediction_benchmark_session(
+                    lease, batch, mode=mode, batch_size=batch_size,
+                    refresh_limit=refresh_limit,
+                    target_timestamp_seconds=input_data.target_timestamp_seconds,
+                    input_context=input_context,
+                )
+
             return run_predict_many_speed_test(
                 rows,
                 collection_card_count=input_data.collection_card_count,
                 eligible_card_count=input_data.eligible_card_count,
                 model_id=lease.model_id,
-                modes=speed_test_modes(gpu_available=gpu_available),
-                batch_sizes=batch_sizes,
-                open_session=lambda batch, mode, batch_size, refresh_limit: (
-                    open_live_prediction_benchmark_session(
-                        lease,
-                        batch,
-                        mode=mode,
-                        batch_size=batch_size,
-                        refresh_limit=refresh_limit,
-                        target_timestamp_seconds=input_data.target_timestamp_seconds,
-                    )
+                modes=speed_test_modes(
+                    gpu_available=gpu_available,
+                    model_generation=_requested_model_generation(None, manager),
                 ),
+                batch_sizes=batch_sizes,
+                open_session=open_session,
                 progress=progress,
             )
         finally:
@@ -263,9 +302,15 @@ def show_process_many_speed_test(
     button,
     gpu_available: bool,
     calculate_curves: bool,
+    model_id: str | None = None,
+    model_generation: str | None = None,
+    state_precision: str | None = None,
 ) -> None:
     manager = manager_for_mw(mw)
     store = store_for_mw(mw)
+    selected_model_id = str(model_id or manager.model_id)
+    selected_generation = _requested_model_generation(model_generation, manager)
+    selected_precision = state_precision or getattr(manager, "state_precision", "fp32")
 
     def collect_op(col, progress, _previous):
         _require_usable_checkpoint(manager)
@@ -275,12 +320,17 @@ def show_process_many_speed_test(
             manager,
             progress,
             allow_incremental=True,
+            model_generation=selected_generation,
         )
         update_checkpoint_collection_data(progress, "Preparing review rows for speed test")
         review_rows = review_load.review_data.rows
         return _ProcessSpeedTestInput(
             rows=tuple(capped_process_speed_test_rows(review_rows)),
             available_review_count=len(review_rows),
+            input_context=_input_context_for_generation(
+                review_load.review_data,
+                selected_generation,
+            ),
         )
 
     def benchmark_op(_col, progress, previous):
@@ -291,14 +341,17 @@ def show_process_many_speed_test(
             result = run_process_many_speed_test(
                 review_count=len(input_data.rows),
                 available_review_count=input_data.available_review_count,
-                model_id=manager.model_id,
+                model_id=selected_model_id,
                 return_curves=bool(calculate_curves),
                 modes=modes,
                 run_mode=lambda mode, review_count: benchmark_process_many_rows(
                     input_data.rows[:review_count],
-                    model_id=manager.model_id,
+                    model_id=selected_model_id,
+                    model_generation=selected_generation,
+                    state_precision=selected_precision,
                     mode=mode,
                     return_curves=bool(calculate_curves),
+                    input_context=input_data.input_context,
                 ),
                 progress=progress,
             )
@@ -310,6 +363,7 @@ def show_process_many_speed_test(
             cache_process_many_speed_test(
                 process_many_speed_cache_path(store.cache_dir),
                 result,
+                state_precision=selected_precision,
             )
         return result
 
@@ -333,6 +387,9 @@ def show_process_many_speed_test(
                 button=button,
                 gpu_available=gpu_available,
                 calculate_curves=calculate_curves,
+                model_id=selected_model_id,
+                model_generation=selected_generation,
+                state_precision=selected_precision,
             ),
             parent=parent,
         )
@@ -357,9 +414,15 @@ def show_curve_calculation_speed_test(
     parent,
     button,
     mode: str,
+    model_id: str | None = None,
+    model_generation: str | None = None,
+    state_precision: str | None = None,
 ) -> None:
     manager = manager_for_mw(mw)
     store = store_for_mw(mw)
+    selected_model_id = str(model_id or manager.model_id)
+    selected_generation = _requested_model_generation(model_generation, manager)
+    selected_precision = state_precision or getattr(manager, "state_precision", "fp32")
 
     def collect_op(col, progress, _previous):
         _require_usable_checkpoint(manager)
@@ -369,6 +432,7 @@ def show_curve_calculation_speed_test(
             manager,
             progress,
             allow_incremental=True,
+            model_generation=selected_generation,
         )
         update_checkpoint_collection_data(
             progress,
@@ -378,6 +442,10 @@ def show_curve_calculation_speed_test(
         return _ProcessSpeedTestInput(
             rows=tuple(capped_curve_speed_test_rows(review_rows)),
             available_review_count=len(review_rows),
+            input_context=_input_context_for_generation(
+                review_load.review_data,
+                selected_generation,
+            ),
         )
 
     def benchmark_op(_col, progress, previous):
@@ -387,13 +455,16 @@ def show_curve_calculation_speed_test(
             result = run_process_many_curve_speed_test(
                 review_count=len(input_data.rows),
                 available_review_count=input_data.available_review_count,
-                model_id=manager.model_id,
+                model_id=selected_model_id,
                 mode=mode,
                 run_once=lambda return_curves: benchmark_process_many_rows(
                     input_data.rows,
-                    model_id=manager.model_id,
+                    model_id=selected_model_id,
+                    model_generation=selected_generation,
+                    state_precision=selected_precision,
                     mode=mode,
                     return_curves=return_curves,
+                    input_context=input_data.input_context,
                 ),
                 progress=progress,
             )
@@ -406,6 +477,7 @@ def show_curve_calculation_speed_test(
             cache_process_many_curve_speed_test(
                 process_many_speed_cache_path(store.cache_dir),
                 result,
+                state_precision=selected_precision,
             )
         return result
 
@@ -428,6 +500,9 @@ def show_curve_calculation_speed_test(
                 parent=parent,
                 button=button,
                 mode=mode,
+                model_id=selected_model_id,
+                model_generation=selected_generation,
+                state_precision=selected_precision,
             ),
             parent=parent,
         )
@@ -454,10 +529,15 @@ def show_live_prediction_speed_test(
     mode: str,
     card_count: int,
     batch_size: int | None,
+    on_auto_count: Callable[[PredictionRefreshSearchResult], None] | None = None,
 ) -> None:
     manager = manager_for_mw(mw)
     store = store_for_mw(mw)
     requested_card_count = max(1, int(card_count))
+    scope_limit = SETUP_PREDICTION_COUNT_LIMIT if on_auto_count else requested_card_count
+    title = "Auto Cards Checked Between Reviews" if on_auto_count else (
+        "Between-Review Prediction Speed Test"
+    )
 
     def collect_op(col, progress, _previous):
         _require_usable_checkpoint(manager)
@@ -478,13 +558,15 @@ def show_live_prediction_speed_test(
             review_load.review_data.last_by_card,
         )
         latest_review = latest_collection_review_timestamp_seconds(col)
-        target_timestamp = max(
-            time.time(),
-            0.0 if latest_review is None else float(latest_review),
+        target_timestamp = millisecond_aligned_timestamp_seconds(
+            max(
+                time.time(),
+                0.0 if latest_review is None else float(latest_review),
+            )
         )
         return _PredictSpeedTestInput(
             review_load=review_load,
-            card_ids=eligible_card_ids[:requested_card_count],
+            card_ids=eligible_card_ids[:scope_limit],
             collection_card_count=len(all_card_ids),
             eligible_card_count=len(eligible_card_ids),
             target_timestamp_seconds=target_timestamp,
@@ -502,12 +584,39 @@ def show_live_prediction_speed_test(
                     input_data.card_ids,
                     input_data.review_load.review_data,
                 ),
+                gpu_prediction_math=prediction_mode_math(mode),
             )
             rows = prediction_rows_for_card_ids(
                 input_data.card_ids,
                 readiness.review_data,
                 target_timestamp_seconds=input_data.target_timestamp_seconds,
             )
+            input_context = _input_context_for_runtime(
+                readiness.review_data,
+                lease,
+            )
+
+            def open_session(batch, selected_mode, _selected_batch_size, refresh_limit):
+                return open_live_prediction_benchmark_session(
+                    lease,
+                    batch,
+                    mode=selected_mode,
+                    batch_size=batch_size,
+                    refresh_limit=refresh_limit,
+                    target_timestamp_seconds=input_data.target_timestamp_seconds,
+                    input_context=input_context,
+                )
+
+            if on_auto_count is not None:
+                return search_prediction_refresh_count(
+                    rows,
+                    eligible_card_count=input_data.eligible_card_count,
+                    mode=mode,
+                    open_session=open_session,
+                    progress=progress,
+                    repetitions=SETUP_MODE_REPETITIONS,
+                    require_under_target=True,
+                )
             return run_live_prediction_speed_test(
                 rows,
                 requested_card_count=requested_card_count,
@@ -515,16 +624,7 @@ def show_live_prediction_speed_test(
                 model_id=lease.model_id,
                 mode=mode,
                 batch_size=batch_size,
-                open_session=lambda batch, selected_mode, selected_batch_size, refresh_limit: (
-                    open_live_prediction_benchmark_session(
-                        lease,
-                        batch,
-                        mode=selected_mode,
-                        batch_size=selected_batch_size,
-                        refresh_limit=refresh_limit,
-                        target_timestamp_seconds=input_data.target_timestamp_seconds,
-                    )
-                ),
+                open_session=open_session,
                 progress=progress,
             )
         finally:
@@ -532,6 +632,10 @@ def show_live_prediction_speed_test(
                 lease.close()
 
     def success(result) -> None:
+        if on_auto_count is not None:
+            if _result_parent_is_visible(parent):
+                on_auto_count(result)
+            return
         is_dark = _is_dark_widget(parent)
         _show_results_after_progress_cleanup(
             parent,
@@ -552,6 +656,7 @@ def show_live_prediction_speed_test(
                 mode=mode,
                 card_count=requested_card_count,
                 batch_size=batch_size,
+                on_auto_count=on_auto_count,
             ),
             parent=parent,
         )
@@ -559,7 +664,7 @@ def show_live_prediction_speed_test(
     run_action_with_progress_stages(
         button=button,
         parent=parent,
-        title="Between-Review Prediction Speed Test",
+        title=title,
         label="Preparing Live Session prediction speed test",
         stages=[
             ProgressStage(collect_op, uses_collection=True),
@@ -569,6 +674,31 @@ def show_live_prediction_speed_test(
         on_failure=failure,
         on_finish=lambda: _finish_speed_test(button),
     )
+
+
+def _input_context_for_runtime(review_data, runtime) -> RuntimeInputContext | None:
+    generation = getattr(
+        runtime,
+        "model_generation",
+        getattr(runtime, "model_version", "v1"),
+    )
+    bound = getattr(runtime, "input_context", None)
+    return bound or input_context_for_generation(review_data, generation)
+
+
+def _requested_model_generation(value: str | None, runtime) -> str:
+    return str(
+        getattr(runtime, "model_generation", DEFAULT_MODEL_GENERATION)
+        if value is None
+        else value
+    )
+
+
+def _input_context_for_generation(
+    review_data,
+    model_generation: str,
+) -> RuntimeInputContext | None:
+    return input_context_for_generation(review_data, model_generation)
 
 
 def _require_usable_checkpoint(manager) -> None:

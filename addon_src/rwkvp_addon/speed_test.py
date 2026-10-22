@@ -10,9 +10,15 @@ from .live_prediction_benchmark import (
     LivePredictionBenchmarkFactory,
     validate_live_prediction_refresh_count,
 )
-from .rwkv_performance_modes import PREDICT_MANY_MODES, PROCESS_MANY_MODES
+from .rwkv_performance_modes import (
+    PREDICTION_MODE_CHOICES,
+    PROCESS_MANY_MODES,
+    predict_many_uses_gpu,
+    prediction_mode_label,
+)
 
-PREDICT_MANY_SPEED_TEST_SIZES = (256, 512, 1024, 2048, 4096, 8192)
+PREDICT_MANY_SPEED_TEST_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+PREDICT_MANY_SPEED_TEST_ORACLE_MAX_CARDS = 4096
 PREDICT_MANY_SPEED_TEST_REPETITIONS = 5
 PROCESS_MANY_SPEED_TEST_MAX_REVIEWS = 60_000
 CURVE_SPEED_TEST_MAX_REVIEWS = 10_000
@@ -236,13 +242,14 @@ def speed_test_modes(
     *,
     gpu_available: bool,
     process: bool = False,
+    model_generation: str = "v1",
 ) -> tuple[str, ...]:
-    supported = PROCESS_MANY_MODES if process else PREDICT_MANY_MODES
-    preferred_order = ("fast", "gpu") if process else ("oracle", "fast", "gpu")
+    supported = PROCESS_MANY_MODES if process else PREDICTION_MODE_CHOICES
+    preferred_order = ("fast", "gpu") if process else ("oracle", "fast", "gpu", "gpu_fp16")
     return tuple(
         mode
         for mode in preferred_order
-        if mode in supported and (mode != "gpu" or gpu_available)
+        if mode in supported and (not predict_many_uses_gpu(mode) or gpu_available)
     )
 
 
@@ -264,21 +271,31 @@ def run_predict_many_speed_test(
         raise ValueError(
             "The collection has no cards with processed RWKV state to benchmark."
         )
-    if len(rows) < max(sizes):
-        raise ValueError(
-            f"Only {len(rows)} prediction rows were prepared for a {max(sizes)}-card test."
-        )
     repetitions = int(repetitions)
     if repetitions <= 0:
         raise ValueError("Predict-many speed-test repetitions must be positive.")
-    normalized_modes = _validated_modes(modes, PREDICT_MANY_MODES)
-    total = len(normalized_modes) * len(sizes) * (repetitions + 1)
+    normalized_modes = _validated_modes(modes, PREDICTION_MODE_CHOICES)
+    sizes_by_mode = {
+        mode: tuple(
+            size for size in sizes
+            if mode != "oracle" or size <= PREDICT_MANY_SPEED_TEST_ORACLE_MAX_CARDS
+        )
+        for mode in normalized_modes
+    }
+    maximum = max(size for mode_sizes in sizes_by_mode.values() for size in mode_sizes)
+    if len(rows) < maximum:
+        raise ValueError(
+            f"Only {len(rows)} prediction rows were prepared for a {maximum}-card test."
+        )
+    total = sum(len(mode_sizes) for mode_sizes in sizes_by_mode.values()) * (repetitions + 1)
     completed = 0
     measurements: list[PredictManySpeedMeasurement] = []
 
-    for card_count in sizes:
-        batch = list(rows[:card_count])
-        for mode in normalized_modes:
+    # Keep one arithmetic owner across sizes; changing math requires reopening
+    # a scoped runtime, never mutating a resident GPU cache.
+    for mode in normalized_modes:
+        for card_count in sizes_by_mode[mode]:
+            batch = list(rows[:card_count])
             batch_size = _positive_optional_int(batch_sizes.get(mode))
             durations: list[float] = []
             label = (
@@ -466,7 +483,7 @@ def run_live_prediction_speed_test(
         raise ValueError(
             f"Only {len(rows)} prediction rows were prepared for a {card_count}-card test."
         )
-    normalized_mode = _validated_modes((mode,), PREDICT_MANY_MODES)[0]
+    normalized_mode = _validated_modes((mode,), PREDICTION_MODE_CHOICES)[0]
     repetitions = int(repetitions)
     if repetitions <= 0:
         raise ValueError("Live prediction speed-test repetitions must be positive.")
@@ -550,4 +567,4 @@ def _positive_optional_int(value: int | None) -> int | None:
 
 
 def _mode_label(mode: str) -> str:
-    return "GPU" if mode == "gpu" else mode.title()
+    return prediction_mode_label(mode)

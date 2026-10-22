@@ -3,4 +3,8 @@
 rwkv-models.lock.json text eol=lf
 rwkv-srs.lock.json text eol=lf
 release/public/release.yml text eol=lf
+frontend/** text eol=lf
+addon_src/rwkvp_addon/frontend/** text eol=lf
+# The compiler emits significant whitespace inside JavaScript template literals.
+addon_src/rwkvp_addon/frontend/ui.js whitespace=-blank-at-eol
 

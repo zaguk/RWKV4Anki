@@ -16,8 +16,13 @@ from .addon_config import (
     CURVE_RESCHEDULING_CONFIG_KEY,
     ENABLE_RWKV_IMMEDIATE_CONFIG_KEY,
     EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY,
+    EXPERIMENTAL_BEHAVIOR_LAB_CONFIG_KEY,
     EXPERIMENTAL_SHORT_TERM_RESCHEDULING_CONFIG_KEY,
     MODEL_CONFIG_KEY,
+    MODEL_GENERATION_CONFIG_KEY,
+    PREDICT_MANY_MODE_CONFIG_KEY,
+    USE_FP16_STATE_CONFIG_KEY,
+    state_precision,
 )
 from .config_options import (
     CONFIG_OPTIONS,
@@ -26,7 +31,11 @@ from .config_options import (
     restart_required_option_labels,
 )
 from .metrics import MetricResult
-from .rwkv_performance_modes import PREDICT_MANY_FAST_MODE
+from .model_generation import (
+    model_generation_label,
+    model_generation_supports_curves,
+)
+from .rwkv_performance_modes import PREDICT_MANY_FAST_MODE, prediction_mode_label
 
 # Accuracy-tuning decisions use exactly the precision shown to the user.  This
 # prevents invisible fifth-or-later decimal differences from changing a setup
@@ -74,6 +83,8 @@ class OptimizationDurationEstimate:
     model_comparison_seconds: float | None
     deleted_reviews_comparison_seconds: float | None
     matrix_comparison_seconds: float | None
+    generation_processing_reviews: int = 0
+    generation_comparison_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -94,12 +105,14 @@ def apply_setup_feature_choices(
     The input mapping is the transaction's immutable baseline. Experimental
     curve-dependent features are disabled when curves are disabled, rather than
     merely becoming temporarily ineffective and unexpectedly reappearing later.
-    Behavior Lab and unrelated settings are deliberately left alone.
+    Behavior Lab remains independent of the curve switch on V1, but is cleared
+    for V5 until its simulation inputs and outputs support that generation.
     """
 
     updated = deepcopy(dict(config))
     immediate = bool(immediate_enabled)
-    curves = bool(curves_enabled)
+    supports_curves = model_generation_supports_curves(config.get(MODEL_GENERATION_CONFIG_KEY))
+    curves = bool(curves_enabled) and supports_curves
 
     updated[ENABLE_RWKV_IMMEDIATE_CONFIG_KEY] = immediate
     updated[ACTIVE_REVIEW_PROTOTYPE_CONFIG_KEY] = immediate
@@ -112,6 +125,8 @@ def apply_setup_feature_choices(
         updated[ADAPTIVE_DESIRED_RETENTION_CONFIG_KEY] = False
         updated[CURVE_RESCHEDULING_CONFIG_KEY] = False
         updated[EXPERIMENTAL_SHORT_TERM_RESCHEDULING_CONFIG_KEY] = False
+    if not supports_curves:
+        updated[EXPERIMENTAL_BEHAVIOR_LAB_CONFIG_KEY] = False
 
     return updated
 
@@ -168,6 +183,20 @@ def checkpoint_rebuild_reasons(
     """Return setting changes that make the existing checkpoint insufficient."""
 
     reasons: list[CheckpointRebuildReason] = []
+    if _path_value(current, (MODEL_GENERATION_CONFIG_KEY,)) != _path_value(
+        updated,
+        (MODEL_GENERATION_CONFIG_KEY,),
+    ):
+        reasons.append(
+            CheckpointRebuildReason(
+                key_path=(MODEL_GENERATION_CONFIG_KEY,),
+                label="RWKV Generation",
+                explanation=(
+                    "The model generation changed; RWKV will use that generation's "
+                    "own checkpoint if it is compatible with the selected settings."
+                ),
+            )
+        )
     if _path_value(current, (MODEL_CONFIG_KEY,)) != _path_value(updated, (MODEL_CONFIG_KEY,)):
         reasons.append(
             CheckpointRebuildReason(
@@ -187,6 +216,18 @@ def checkpoint_rebuild_reasons(
                 explanation=(
                     "The review-history inclusion policy changed; rebuild so the "
                     "checkpoint uses the selected history."
+                ),
+            )
+        )
+
+    if state_precision(current) != state_precision(updated):
+        reasons.append(
+            CheckpointRebuildReason(
+                key_path=(USE_FP16_STATE_CONFIG_KEY,),
+                label="Use FP16 for Card/Note State",
+                explanation=(
+                    "Card/note storage precision changed; rebuild the complete "
+                    "review history to use the selected precision."
                 ),
             )
         )
@@ -351,13 +392,13 @@ def select_metric_winner(
         if checkpoint_sizes_by_key is not None
         else {}
     )
-    if len(finalists) > 1 and normalized_sizes and all(
-        normalized_sizes.get(key) is not None for key in finalists
+    if (
+        len(finalists) > 1
+        and normalized_sizes
+        and all(normalized_sizes.get(key) is not None for key in finalists)
     ):
         minimum_size = min(int(normalized_sizes[key]) for key in finalists)
-        size_finalists = tuple(
-            key for key in finalists if normalized_sizes[key] == minimum_size
-        )
+        size_finalists = tuple(key for key in finalists if normalized_sizes[key] == minimum_size)
         if len(size_finalists) < len(finalists):
             reason = "checkpoint-size"
         finalists = size_finalists
@@ -372,11 +413,7 @@ def select_metric_winner(
         key=lambda key: (
             _metric_display_value(float(valid[key].log_loss)),
             _metric_display_value(float(valid[key].rmse_bins)),
-            (
-                normalized_sizes.get(key)
-                if normalized_sizes.get(key) is not None
-                else math.inf
-            ),
+            (normalized_sizes.get(key) if normalized_sizes.get(key) is not None else math.inf),
             0 if key == default else 1,
             valid_order[key],
         ),
@@ -422,6 +459,8 @@ def estimate_optimization_durations(
     *,
     reviews_per_minute: float | None,
     model_count: int,
+    generation_count: int = 0,
+    all_generation_model_count: int | None = None,
     model_review_count: int,
     without_deleted_review_count: int,
     with_deleted_review_count: int,
@@ -433,6 +472,18 @@ def estimate_optimization_durations(
         model_review_count,
         "model_review_count",
     )
+    normalized_generation_count = _nonnegative_int(
+        generation_count,
+        "generation_count",
+    )
+    normalized_all_generation_model_count = (
+        normalized_model_count
+        if all_generation_model_count is None
+        else _nonnegative_int(
+            all_generation_model_count,
+            "all_generation_model_count",
+        )
+    )
     without_deleted = _nonnegative_int(
         without_deleted_review_count,
         "without_deleted_review_count",
@@ -442,29 +493,35 @@ def estimate_optimization_durations(
         "with_deleted_review_count",
     )
     model_work = normalized_model_count * normalized_model_reviews
+    generation_work = normalized_generation_count * normalized_model_reviews
     deleted_work = without_deleted + with_deleted
-    matrix_work = normalized_model_count * deleted_work
+    matrix_work = normalized_all_generation_model_count * deleted_work
     rate = _positive_finite_float(reviews_per_minute)
     if rate is None:
         return OptimizationDurationEstimate(
             reviews_per_minute=None,
             model_processing_reviews=model_work,
+            generation_processing_reviews=generation_work,
             deleted_reviews_processing_reviews=deleted_work,
             matrix_processing_reviews=matrix_work,
             model_comparison_seconds=None,
+            generation_comparison_seconds=None,
             deleted_reviews_comparison_seconds=None,
             matrix_comparison_seconds=None,
         )
 
     model_seconds = model_work * 60.0 / rate
+    generation_seconds = generation_work * 60.0 / rate
     deleted_seconds = deleted_work * 60.0 / rate
     matrix_seconds = matrix_work * 60.0 / rate
     return OptimizationDurationEstimate(
         reviews_per_minute=rate,
         model_processing_reviews=model_work,
+        generation_processing_reviews=generation_work,
         deleted_reviews_processing_reviews=deleted_work,
         matrix_processing_reviews=matrix_work,
         model_comparison_seconds=model_seconds,
+        generation_comparison_seconds=generation_seconds,
         deleted_reviews_comparison_seconds=deleted_seconds,
         matrix_comparison_seconds=matrix_seconds,
     )
@@ -492,6 +549,10 @@ def _display_option_value(option: ConfigOption, value: object) -> str:
     if option.key_path == (MODEL_CONFIG_KEY,):
         return str(display_value or "")
     choice = str(display_value or "")
+    if option.key_path == (MODEL_GENERATION_CONFIG_KEY,):
+        return model_generation_label(choice)
+    if option.key_path == (PREDICT_MANY_MODE_CONFIG_KEY,):
+        return prediction_mode_label(choice)
     return "GPU" if choice.casefold() == "gpu" else choice.replace("_", " ").title()
 
 

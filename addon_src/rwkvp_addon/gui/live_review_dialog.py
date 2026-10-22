@@ -121,6 +121,7 @@ class LiveReviewDialog(WebDialogHost):
             same_day_only=request.same_day_only,
             extra_search=request.extra_search,
             adaptive_retention_settings=request.adaptive_retention_settings,
+            random_card_percent=request.random_card_percent,
         )
         return True
 
@@ -170,6 +171,7 @@ def _live_review_form_spec() -> StudySessionFormSpec:
         same_day_label="Start Same-Day-Only Live Session",
         same_day_description=LIVE_REVIEW_SAME_DAY_ONLY_TOOLTIP,
         split_same_day_action=True,
+        random_card_available=True,
     )
 
 

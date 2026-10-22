@@ -3,12 +3,17 @@ from __future__ import annotations
 PREDICT_MANY_ORACLE_MODE = "oracle"
 PREDICT_MANY_FAST_MODE = "fast"
 PREDICT_MANY_GPU_MODE = "gpu"
+# Presentation/config choice, not a native predict_many mode. Arithmetic is
+# selected when constructing the runtime; native calls still receive "gpu".
+PREDICT_MANY_FULL_FP16_MODE = "gpu_fp16"
 PREDICT_MANY_MODES = (
     PREDICT_MANY_GPU_MODE,
     PREDICT_MANY_FAST_MODE,
     PREDICT_MANY_ORACLE_MODE,
 )
 DEFAULT_PREDICT_MANY_MODE = PREDICT_MANY_FAST_MODE
+PREDICTION_MODE_CHOICES = (PREDICT_MANY_FULL_FP16_MODE, *PREDICT_MANY_MODES)
+DEFAULT_PREDICTION_MODE = PREDICT_MANY_FULL_FP16_MODE
 _LEGACY_PREDICT_MANY_LIGHTNING_MODE = "lightning"
 
 # These mirror rwkv-srs's public automatic policies. They are used only to
@@ -45,17 +50,42 @@ def normalize_process_many_mode(value: object) -> str:
 
 
 def predict_many_uses_fast(mode: object) -> bool:
-    return normalize_predict_many_mode(mode) == PREDICT_MANY_FAST_MODE
+    return native_prediction_mode(mode) == PREDICT_MANY_FAST_MODE
 
 
 def predict_many_uses_gpu(mode: object) -> bool:
-    return normalize_predict_many_mode(mode) == PREDICT_MANY_GPU_MODE
+    return native_prediction_mode(mode) == PREDICT_MANY_GPU_MODE
 
 
-def available_predict_many_modes(*, gpu_available: bool) -> tuple[str, ...]:
+def available_predict_many_modes(
+    *, gpu_available: bool, model_generation: str = "v1",
+) -> tuple[str, ...]:
+    choices = PREDICTION_MODE_CHOICES
     if gpu_available:
-        return PREDICT_MANY_MODES
-    return tuple(mode for mode in PREDICT_MANY_MODES if mode != PREDICT_MANY_GPU_MODE)
+        return choices
+    return tuple(mode for mode in choices if not predict_many_uses_gpu(mode))
+
+
+def normalize_prediction_mode(value: object) -> str:
+    if str(value or "").strip().lower() == PREDICT_MANY_FULL_FP16_MODE:
+        return PREDICT_MANY_FULL_FP16_MODE
+    return normalize_predict_many_mode(value)
+
+
+def native_prediction_mode(value: object) -> str:
+    mode = normalize_prediction_mode(value)
+    return PREDICT_MANY_GPU_MODE if mode == PREDICT_MANY_FULL_FP16_MODE else mode
+
+
+def prediction_mode_math(value: object) -> str:
+    return "fp16" if normalize_prediction_mode(value) == PREDICT_MANY_FULL_FP16_MODE else "fp32"
+
+
+def prediction_mode_label(value: object) -> str:
+    mode = str(value)
+    if mode == PREDICT_MANY_FULL_FP16_MODE:
+        return "GPU (Full FP16)"
+    return "GPU" if mode == PREDICT_MANY_GPU_MODE else mode.replace("_", " ").title()
 
 
 def available_process_many_modes(*, gpu_available: bool) -> tuple[str, ...]:
@@ -68,7 +98,7 @@ def prediction_progress_chunk_size(
     mode: object,
     batch_size_override: int | None = None,
 ) -> int:
-    normalized = normalize_predict_many_mode(mode)
+    normalized = native_prediction_mode(mode)
     override = _positive_optional_int(batch_size_override)
     if normalized == PREDICT_MANY_GPU_MODE:
         return override or GPU_PREDICTION_PROGRESS_CHUNK_SIZE

@@ -39,8 +39,9 @@ def handle_checkpoint_failure(
             parent=parent,
             title="RWKV",
             message=(
-                "This RWKV checkpoint uses the obsolete binary-v1 format and cannot "
-                "be used by this add-on. Rebuild it from Anki's review history now?"
+                "This RWKV checkpoint uses an obsolete storage format or model "
+                "reference and cannot be used by this add-on. Rebuild it from "
+                "Anki's review history now?"
             ),
             confirm_label="Rebuild Checkpoint",
             destructive=True,
@@ -141,7 +142,7 @@ def require_checkpoint_for_use(parent, *, manager=None) -> bool:
         return False
     if manager.status() == "legacy":
         handle_checkpoint_failure(
-            LegacyCheckpointError("The obsolete RWKV binary-v1 checkpoint must be rebuilt."),
+            LegacyCheckpointError("The obsolete RWKV checkpoint must be rebuilt."),
             lambda: None,
             parent=parent,
         )

@@ -19,6 +19,7 @@ layout.txt
 .uv-cache/
 .venv/
 venv/
+node_modules/
 
 # Generated vendored release contents
 vendor/

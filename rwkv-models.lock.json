@@ -1,15 +1,23 @@
 {
   "models": [
     {
+      "generation": "v1",
       "name": "RWKV_trained_on_101_4999.safetensors",
       "sha256": "fa35cd87ee3589ad7457d54f844c90cb94d19d56e5104df04aa5fb0dcf28c4e9",
-      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/main/tests/fixtures/models/RWKV_trained_on_101_4999.safetensors"
+      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/1992120a130a58ff037234eca4245d90fc9937c2/tests/fixtures/models/RWKV_trained_on_101_4999.safetensors"
     },
     {
+      "generation": "v1",
       "name": "RWKV_trained_on_5000_10000.safetensors",
       "sha256": "0b1566d8159464fc512c8cb49525aefd3f84c9baaacdf0ea2e8d7a398729d91a",
-      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/main/tests/fixtures/models/RWKV_trained_on_5000_10000.safetensors"
+      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/1992120a130a58ff037234eca4245d90fc9937c2/tests/fixtures/models/RWKV_trained_on_5000_10000.safetensors"
+    },
+    {
+      "generation": "v5",
+      "name": "v5o-a.safetensors",
+      "sha256": "cbd926611b31642e4041421b8cc3b8d800f0bcf5c28db39d4a852f0488d35a9d",
+      "url": "https://raw.githubusercontent.com/zaguk/rwkv-srs/1992120a130a58ff037234eca4245d90fc9937c2/tests/fixtures/models/rwkv-p-v5o/model/v5o-a.safetensors"
     }
   ],
-  "schema_version": 1
+  "schema_version": 2
 }

@@ -11,19 +11,19 @@ from .compact_review_data import (
     concatenate_revlog_rows,
     set_first_raw_day_offset,
 )
+from .model_generation import model_generation_uses_v5o
 from .prediction_cache import PredictionTailSnapshot
 from .profile_store import ProfileStore
 from .review_rows import (
     CardInfo,
     DeckInfo,
     IncrementalLearningSequenceTrimResult,
-    LastReviewInfo,
     ReviewData,
     ReviewRowBuildContext,
     build_compact_review_history,
     build_review_rows_with_context,
     build_revlog_rows,
-    last_review_scalar_values,
+    extend_last_review_map,
     load_research_dataset,
     rebased_day_offset_origin,
     review_data_from_dataset,
@@ -100,6 +100,8 @@ def export_review_data(
     *,
     exclude_deleted_card_revlogs: bool = True,
     filtered_review_normalization_policy: FilteredReviewNormalizationPolicy | None = None,
+    dataset_callback=None,
+    model_generation: str | None = None,
 ) -> ReviewData:
     normalization_policy = filtered_review_normalization_policy or _policy_for_store_or_disabled(
         store
@@ -108,11 +110,14 @@ def export_review_data(
     target = store.cache_dir / f"research-dataset-{int(time.time())}.pb"
     col.export_dataset_for_research(str(target))
     dataset = load_research_dataset(target)
+    if dataset_callback is not None:
+        dataset_callback(dataset)
     return review_data_from_dataset(
         dataset,
         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
         trim_learning_sequences=True,
         filtered_review_normalization_policy=normalization_policy,
+        **_generation_history_kwargs(model_generation),
     )
 
 
@@ -121,6 +126,7 @@ def load_review_data_directly(
     *,
     exclude_deleted_card_revlogs: bool = True,
     filtered_review_normalization_policy: FilteredReviewNormalizationPolicy | None = None,
+    model_generation: str | None = None,
 ) -> ReviewData:
     """Read Anki review data directly from collection APIs/DB without protobuf export.
 
@@ -144,6 +150,15 @@ def load_review_data_directly(
         col,
         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
     )
+    if model_generation_uses_v5o(model_generation):
+        from .v5o_history import build_v5o_review_data
+
+        return build_v5o_review_data(
+            revlog_entries, cards, decks, next_day_at,
+            exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
+            filtered_review_normalization_policy=normalization_policy,
+            input_is_chronological=True,
+        )
     history = build_compact_review_history(
         revlog_entries,
         cards,
@@ -181,6 +196,13 @@ def load_incremental_review_data_directly(
         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
     )
     context = _incremental_context_from_base(base, next_day_at=next_day_at)
+    if base.history_generation == "v5o":
+        from .v5o_history import build_v5o_review_data
+
+        return build_v5o_review_data(
+            tail_revlog_entries, cards, decks, next_day_at, base=base, context=context,
+            exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
+        )
     trim = _incremental_learning_sequence_trim_or_raise(
         tail_revlog_entries,
         context,
@@ -283,6 +305,20 @@ def load_incremental_review_data_for_card_directly(
             filtered_review_normalization_policy=(base.filtered_review_normalization_policy),
             filtered_review_phase_by_card={},
         )
+    if base.history_generation == "v5o":
+        from .v5o_history import build_v5o_review_data
+
+        review_data = build_v5o_review_data(
+            tail_revlog_entries, cards, decks, next_day_at,
+            base=base, context=resolved_context,
+            exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
+        )
+        return IncrementalCardReviewDataLoad(
+            review_data=review_data,
+            review_rows=review_data.rows[len(base.rows):],
+            revlog_rows=review_data.revlogs[len(base.revlogs):],
+            context=review_data.row_build_context,
+        )
     trim = _incremental_learning_sequence_trim_or_raise(
         tail_revlog_entries,
         resolved_context,
@@ -349,7 +385,16 @@ def load_review_data_for_checkpoint(
     force_export: bool = False,
     allow_incremental: bool = False,
     allow_persisted_tail_context: bool = False,
+    model_generation: str | None = None,
 ) -> ReviewDataLoad:
+    manager_generation = getattr(manager, "model_generation", None)
+    generation = manager_generation if model_generation is None else model_generation
+    history_kwargs = _generation_history_kwargs(generation)
+    # Disposable setup/speed builders may use a generation different from the
+    # saved checkpoint. A V5 history can never borrow a V1 prepared prefix.
+    if bool(history_kwargs) != bool(_generation_history_kwargs(manager_generation)):
+        force_export = True
+        allow_persisted_tail_context = False
     exclude_deleted_card_revlogs = bool(getattr(manager, "exclude_deleted_card_revlogs", True))
     normalization_policy = getattr(manager, "filtered_review_normalization_policy", None)
     if normalization_policy is None:
@@ -396,6 +441,10 @@ def load_review_data_for_checkpoint(
                         since_revlog_id=since_revlog_id,
                         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
                     )
+                except MemoryError:
+                    # A larger full-history allocation cannot recover an
+                    # exhausted incremental loader; let the operation unwind.
+                    raise
                 except Exception:
                     update_checkpoint_review_history(progress, "Preparing review history")
                     review_data = load_review_data_from_collection(
@@ -403,6 +452,7 @@ def load_review_data_for_checkpoint(
                         store,
                         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
                         filtered_review_normalization_policy=normalization_policy,
+                        **history_kwargs,
                     )
                     update_checkpoint_review_history(progress, "Review history ready")
                     return ReviewDataLoad(
@@ -425,7 +475,9 @@ def load_review_data_for_checkpoint(
                         collection_revision,
                     ),
                 )
-        if allow_persisted_tail_context and collection_revision is not None:
+        # The old persisted context describes V1 learning-sequence trimming and
+        # omits V5 provenance/catalog identity. Full V5 loads remain authoritative.
+        if allow_persisted_tail_context and collection_revision is not None and not history_kwargs:
             persisted = _load_review_data_from_persisted_tail_context(
                 col,
                 store,
@@ -444,6 +496,7 @@ def load_review_data_for_checkpoint(
         store,
         exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
         filtered_review_normalization_policy=normalization_policy,
+        **history_kwargs,
     )
     update_checkpoint_review_history(progress, "Review history ready")
     stable_revision = _stable_collection_revision(col, collection_revision)
@@ -463,6 +516,7 @@ def load_review_data_from_collection(
     *,
     exclude_deleted_card_revlogs: bool = True,
     filtered_review_normalization_policy: FilteredReviewNormalizationPolicy | None = None,
+    model_generation: str | None = None,
 ) -> ReviewData:
     normalization_policy = filtered_review_normalization_policy or _policy_for_store_or_disabled(
         store
@@ -472,6 +526,7 @@ def load_review_data_from_collection(
             col,
             exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
             filtered_review_normalization_policy=normalization_policy,
+            **_generation_history_kwargs(model_generation),
         )
     except MemoryError:
         raise
@@ -481,7 +536,12 @@ def load_review_data_from_collection(
             store,
             exclude_deleted_card_revlogs=exclude_deleted_card_revlogs,
             filtered_review_normalization_policy=normalization_policy,
+            **_generation_history_kwargs(model_generation),
         )
+
+
+def _generation_history_kwargs(generation: object) -> dict[str, str]:
+    return {"model_generation": "v5o"} if model_generation_uses_v5o(generation) else {}
 
 
 def _stable_collection_revision(
@@ -585,7 +645,12 @@ def _load_review_data_from_persisted_tail_context(
         )
         if read_collection_revision(col) != collection_revision:
             return None
-        if not bool(accept_tail(rows, persisted.checkpoint_history_fingerprint)):
+        if not bool(
+            accept_tail(
+                rows,
+                persisted.checkpoint_history_fingerprint,
+            )
+        ):
             return None
     except MemoryError:
         raise
@@ -691,11 +756,14 @@ def _store_current_origin_on_first_row(
     rows[0] = {**rows[0], "raw_day_offset": int(day_offset_origin)}
 
 
-def _remember_review_data_from_load(manager, review_load: ReviewDataLoad) -> None:
+def _prime_review_data_from_load(manager, review_load: ReviewDataLoad) -> None:
     manager.remember_review_data(
         review_load.review_data,
         latest_collection_review_id=review_load.latest_review_id,
     )
+
+
+def _remember_review_data_context_from_load(manager, review_load: ReviewDataLoad) -> None:
     revision = review_load.collection_revision
     if revision is None:
         return
@@ -731,6 +799,7 @@ def ensure_checkpoint_ready_from_load(
     lease = None
     try:
         if needs_runtime:
+            _prime_review_data_from_load(manager, review_load)
             lease, result = manager.open_scoped_runtime(
                 review_load.review_data.rows,
                 (),
@@ -738,7 +807,7 @@ def ensure_checkpoint_ready_from_load(
                 force_save=force_save,
                 check_consistency=not review_load.incremental,
             )
-            _remember_review_data_from_load(manager, review_load)
+            _remember_review_data_context_from_load(manager, review_load)
         if wait_for_save and manager.save_in_progress:
             progress.update(0, 1, "Waiting for checkpoint/cache write")
             manager.wait_for_pending_save()
@@ -772,16 +841,22 @@ def open_checkpoint_runtime_from_load(
     scope_cards,
     force_save: bool = False,
     wait_for_save: bool = False,
+    gpu_prediction_math: str | None = None,
 ) -> tuple[CheckpointReadiness, object]:
+    _prime_review_data_from_load(manager, review_load)
+    math_kwargs = (
+        {} if gpu_prediction_math is None else {"gpu_prediction_math": gpu_prediction_math}
+    )
     lease, result = manager.open_scoped_runtime(
         review_load.review_data.rows,
         scope_cards,
         progress,
         force_save=force_save,
         check_consistency=not review_load.incremental,
+        **math_kwargs,
     )
     try:
-        _remember_review_data_from_load(manager, review_load)
+        _remember_review_data_context_from_load(manager, review_load)
         if wait_for_save and manager.save_in_progress:
             progress.update(0, 1, "Waiting for checkpoint/cache write")
             manager.wait_for_pending_save()
@@ -806,6 +881,7 @@ def initialize_or_update_checkpoint_from_load(
     rebuild: bool,
     force_save: bool = False,
 ) -> CheckpointReadiness:
+    _prime_review_data_from_load(manager, review_load)
     if rebuild:
         progress.update(0, 1, "Preparing checkpoint rebuild")
         result = manager.initialize_or_rebuild(review_load.review_data.rows, progress)
@@ -822,7 +898,7 @@ def initialize_or_update_checkpoint_from_load(
         finally:
             if lease is not None:
                 lease.close()
-    _remember_review_data_from_load(manager, review_load)
+    _remember_review_data_context_from_load(manager, review_load)
     if rebuild:
         manager.release_runtime(preserve_review_data=True)
     return CheckpointReadiness(
@@ -866,30 +942,6 @@ def latest_collection_review_timestamp_seconds(col) -> float | None:
     return None if review_id is None else review_id / 1000.0
 
 
-def extend_last_review_map(
-    last_by_card: dict[int, LastReviewInfo],
-    rows: Sequence[Mapping[str, Any]],
-) -> dict[int, LastReviewInfo]:
-    last = dict(last_by_card)
-    lapses = {card_id: info.lapse_count for card_id, info in last.items()}
-    latest_by_card: dict[int, tuple[int, int, int]] = {}
-    for review_id, card_id, day_offset, elapsed_days, rating, interval in last_review_scalar_values(
-        rows
-    ):
-        if rating == 1 and elapsed_days != 0:
-            lapses[card_id] = lapses.get(card_id, 0) + 1
-        latest_by_card[card_id] = (review_id, day_offset, interval)
-    for card_id, (review_id, day_offset, interval) in latest_by_card.items():
-        last[card_id] = LastReviewInfo(
-            review_id=review_id,
-            day_offset=day_offset,
-            timestamp_seconds=review_id / 1000.0,
-            interval=interval,
-            lapse_count=lapses.get(card_id, 0),
-        )
-    return last
-
-
 def _cards_from_db(col) -> dict[int, CardInfo]:
     rows = col.db.all(
         """
@@ -905,6 +957,7 @@ def _cards_from_db(col) -> dict[int, CardInfo]:
             note_id=int(note_id) if int(note_id) else None,
             deck_id=int(deck_id) if int(deck_id) else None,
             preset_id=None,
+            card_creation_ms=int(card_id),
         )
         for card_id, note_id, deck_id in rows
     }
@@ -935,6 +988,7 @@ def load_card_info_for_card_directly(
         note_id=int(note_id) if int(note_id) else None,
         deck_id=normalized_deck_id,
         preset_id=deck.preset_id if deck else None,
+        card_creation_ms=int(resolved_card_id),
     )
 
 
@@ -952,6 +1006,7 @@ def _cards_with_preset_ids(
                 if card.deck_id is not None and card.deck_id in decks
                 else None
             ),
+            card_creation_ms=card.card_creation_ms,
         )
         for card_id, card in cards.items()
     }

@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from .model_generation import model_generation_supports_curves, model_generation_uses_v5o
 from .review_rows import (
     SECONDS_PER_DAY,
     CardInfo,
@@ -13,6 +14,8 @@ from .review_rows import (
     prediction_row_for_card,
     rwkv_processable_revlog_where_sql,
 )
+from .timestamp_context import rollover_phase_ms_from_next_day_at
+from .v5o_review_rows import V5oInputContext
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,11 @@ def rwkv_card_info_retrievability(
     """
 
     prediction_runtime = manager if runtime is None else runtime
+    generation = getattr(
+        prediction_runtime, "model_generation", getattr(manager, "model_generation", "v1")
+    )
+    if not model_generation_supports_curves(generation):
+        include_forgetting_curve = include_intervals = include_forgetting_curve_graph = False
     if runtime is None and not bool(getattr(manager, "runtime_loaded", False)):
         return None
     next_day_at = int(col.sched.day_cutoff)
@@ -82,6 +90,7 @@ def rwkv_card_info_retrievability(
         int(card_id),
         target_timestamp_seconds=target_timestamp_seconds,
         day_offset_origin=day_offset_origin,
+        model_generation=generation,
     )
     if row is None:
         return None
@@ -150,6 +159,7 @@ def prediction_row_for_card_from_collection(
     *,
     target_timestamp_seconds: float,
     day_offset_origin: int | None = None,
+    model_generation: str = "v1",
 ) -> dict[str, Any] | None:
     card = _card_info_from_collection(col, int(card_id))
     if card is None:
@@ -157,14 +167,28 @@ def prediction_row_for_card_from_collection(
     next_day_at = int(col.sched.day_cutoff)
     if day_offset_origin is None:
         day_offset_origin = _day_offset_origin_from_collection(col, next_day_at)
-    return prediction_row_for_card(
-        card,
-        _last_review_info_from_collection(
-            col,
-            int(card_id),
+    last_review = _last_review_info_from_collection(
+        col,
+        int(card_id),
+        next_day_at=next_day_at,
+        day_offset_origin=day_offset_origin,
+    )
+    if model_generation_uses_v5o(model_generation):
+        if last_review is None:
+            return None
+        return V5oInputContext(
+            rollover_phase_ms=rollover_phase_ms_from_next_day_at(next_day_at),
+            cards={card.card_id: card},
+        ).prediction_row_for_card(
+            card,
+            last_review,
+            target_timestamp_ms=int(target_timestamp_seconds * 1_000),
             next_day_at=next_day_at,
             day_offset_origin=day_offset_origin,
-        ),
+        )
+    return prediction_row_for_card(
+        card,
+        last_review,
         target_timestamp_seconds=target_timestamp_seconds,
         next_day_at=next_day_at,
         day_offset_origin=day_offset_origin,
@@ -250,6 +274,7 @@ def _card_info_from_collection(col, card_id: int) -> CardInfo | None:
         note_id=int(row[1]) if row[1] is not None else None,
         deck_id=deck_id,
         preset_id=_preset_id_for_deck(col, deck_id),
+        card_creation_ms=int(row[0]),
     )
 
 

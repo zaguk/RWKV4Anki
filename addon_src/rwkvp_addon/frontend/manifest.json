@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "source_sha256": "0260abdcbcfc4ee2367d1d74668c30f6db2af47135bc5cd2fb6103067af5b7fa",
+  "bundle_sha256": "63aac55bca36c3356435d878fc4ca4649446a9b35838750a61f3a42737a562f5",
+  "svelte": "5.57.2",
+  "libraries": [
+    {
+      "name": "clsx",
+      "version": "2.1.1"
+    },
+    {
+      "name": "esm-env",
+      "version": "1.2.2"
+    },
+    {
+      "name": "svelte",
+      "version": "5.57.2"
+    }
+  ]
+}

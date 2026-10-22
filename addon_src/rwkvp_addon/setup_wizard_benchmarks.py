@@ -11,6 +11,7 @@ from .live_prediction_benchmark import (
     validate_live_prediction_refresh_count,
 )
 from .progress import CancelledError
+from .rwkv_performance_modes import PREDICT_MANY_FULL_FP16_MODE, prediction_mode_label
 
 SETUP_PROCESS_REVIEW_LIMIT = 10_000
 SETUP_PREDICTION_CARD_LIMIT = 1_000
@@ -212,7 +213,7 @@ def run_prediction_mode_benchmark(
     repetitions: int = SETUP_MODE_REPETITIONS,
     clock: Callable[[], float] = time.perf_counter,
 ) -> SetupPredictionModeBenchmarkResult:
-    """Compare warmed native Live Session cycles on at most 1,000 cards."""
+    """Compare Fast and Full FP16 warmed Live cycles on at most 1,000 cards."""
 
     eligible = max(0, int(eligible_card_count))
     card_count = min(SETUP_PREDICTION_CARD_LIMIT, eligible)
@@ -229,7 +230,7 @@ def run_prediction_mode_benchmark(
         expected=SETUP_MODE_REPETITIONS,
     )
     batch = list(rows[:card_count])
-    modes = (_FAST_MODE, _GPU_MODE) if gpu_available else (_FAST_MODE,)
+    modes = (_FAST_MODE, PREDICT_MANY_FULL_FP16_MODE) if gpu_available else (_FAST_MODE,)
     total = len(modes) * (repetitions + 1)
     completed = 0
     measurements: list[SetupModeMeasurement] = []
@@ -324,6 +325,8 @@ def search_prediction_refresh_count(
     maximum_binary_probes: int = 12,
     clock: Callable[[], float] = time.perf_counter,
     seeded_durations: Mapping[int, float] | None = None,
+    repetitions: int = 1,
+    require_under_target: bool = False,
 ) -> PredictionRefreshSearchResult:
     """Find the warmed native refresh count whose latency is closest to target.
 
@@ -331,6 +334,10 @@ def search_prediction_refresh_count(
     with fewer than 100 eligible cards use their exact cap. The search first
     doubles or halves to bracket the target, then probes rounded midpoints. A
     failed probe is retained and treated as an unusable upper bound.
+
+    Settings Auto repeats each probe and requires every timed cycle to fit the
+    budget. In that mode select the largest passing count, not the closest
+    over-budget timing. Single-run seeds cannot qualify repeated probes.
     """
 
     eligible = max(0, int(eligible_card_count))
@@ -353,6 +360,9 @@ def search_prediction_refresh_count(
         raise ValueError("The prediction latency target must be finite and positive.")
     step = max(SETUP_PREDICTION_COUNT_STEP, int(step))
     binary_limit = max(0, int(maximum_binary_probes))
+    repetitions = int(repetitions)
+    if repetitions < 1:
+        raise ValueError("Prediction search requires at least one timed run.")
 
     if configured_cap < step:
         search_cap = configured_cap
@@ -368,7 +378,7 @@ def search_prediction_refresh_count(
         1 + math.ceil(math.log2(max(1, search_cap // step))) + binary_limit
     )
 
-    for count, duration in (seeded_durations or {}).items():
+    for count, duration in (seeded_durations or {}).items() if repetitions == 1 else ():
         normalized_count = int(count)
         normalized_duration = float(duration)
         if (
@@ -405,20 +415,28 @@ def search_prediction_refresh_count(
                 str(mode),
                 warmup=True,
             )
-            progress.check_cancelled()
-            started = float(clock())
-            refreshed_count = session.run_cycle()
-            elapsed = float(clock()) - started
-            _validate_duration(elapsed)
-            validate_live_prediction_refresh_count(
-                refreshed_count,
-                normalized_count,
-                str(mode),
-                warmup=False,
-            )
+            durations = []
+            for repetition in range(1, repetitions + 1):
+                progress.check_cancelled()
+                progress.update(
+                    len(probe_order), max_expected_probes,
+                    f"{label} (run {repetition}/{repetitions})",
+                )
+                started = float(clock())
+                refreshed_count = session.run_cycle()
+                elapsed = float(clock()) - started
+                _validate_duration(elapsed)
+                validate_live_prediction_refresh_count(
+                    refreshed_count,
+                    normalized_count,
+                    str(mode),
+                    warmup=False,
+                )
+                durations.append(elapsed)
+                progress.check_cancelled()
             measurement = PredictionCountMeasurement(
                 card_count=normalized_count,
-                duration_seconds=elapsed,
+                duration_seconds=max(durations),
             )
         except CancelledError:
             raise
@@ -490,7 +508,17 @@ def search_prediction_refresh_count(
             "Prediction timing failed.",
         )
         raise RuntimeError(details)
-    selected = min(successful, key=lambda item: _prediction_count_rank(item, target))
+    progress.check_cancelled()
+    if require_under_target:
+        within_budget = [item for item in successful if _is_at_or_below_target(item, target)]
+        if not within_budget:
+            raise RuntimeError(
+                f"No tested card count completed every run within {target * 1000:g} ms. "
+                "The Cards Checked Between Reviews value has not been changed."
+            )
+        selected = max(within_budget, key=lambda item: item.card_count)
+    else:
+        selected = min(successful, key=lambda item: _prediction_count_rank(item, target))
     return PredictionRefreshSearchResult(
         mode=str(mode),
         eligible_card_count=eligible,
@@ -624,4 +652,4 @@ def _error_text(exc: Exception) -> str:
 
 
 def _mode_label(mode: str) -> str:
-    return "GPU" if str(mode) == _GPU_MODE else str(mode).title()
+    return prediction_mode_label(mode)

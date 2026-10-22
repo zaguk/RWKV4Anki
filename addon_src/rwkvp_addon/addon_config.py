@@ -6,13 +6,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from .constants import (
-    ADDON_ROOT,
-    CHECKPOINT_SAVE_INTERVAL,
-    DEFAULT_MODEL_ID,
-    PREDICT_BATCH_SIZE,
-    VENDOR_ROOT,
-)
+from .constants import ADDON_ROOT, CHECKPOINT_SAVE_INTERVAL, DEFAULT_MODEL_ID, PREDICT_BATCH_SIZE
 from .live_review_engine import (
     DEFAULT_HOT_PREDICT_LIMIT,
     DEFAULT_PREDICTION_REFRESH_LIMIT,
@@ -20,6 +14,17 @@ from .live_review_engine import (
     DEFAULT_SAME_DAY_REENTRY_DELAY_REVIEWS,
 )
 from .metrics import RWKVPredictionMode
+from .model_generation import (
+    model_generation_capabilities,
+    model_generation_supports_curves,
+    normalize_model_generation,
+)
+from .model_storage import (
+    DEFAULT_BUNDLED_MODEL_GENERATION,
+    available_model_ids,
+    default_model_id_for_generation,
+    legacy_model_generation,
+)
 from .prediction_cache import (
     PER_REVIEW_CACHE_SPEC,
     PREDICT_AHEAD_CACHE_SPEC,
@@ -27,16 +32,23 @@ from .prediction_cache import (
 )
 from .review_load_policy import DEFAULT_MINIMUM_RETENTION_STEP
 from .rwkv_performance_modes import (
-    DEFAULT_PREDICT_MANY_MODE,
+    DEFAULT_PREDICTION_MODE,
     DEFAULT_PROCESS_MANY_MODE,
     PREDICT_MANY_FAST_MODE,
+    PREDICT_MANY_FULL_FP16_MODE,
     PREDICT_MANY_GPU_MODE,
     PREDICT_MANY_ORACLE_MODE,
-    normalize_predict_many_mode,
+    native_prediction_mode,
+    normalize_prediction_mode,
     normalize_process_many_mode,
+    prediction_mode_math,
 )
 
 MODEL_CONFIG_KEY = "model"
+MODEL_GENERATION_CONFIG_KEY = "model_generation"
+USE_FP16_STATE_CONFIG_KEY = "use_fp16_state"
+USE_FP16_GPU_PREDICTIONS_CONFIG_KEY = "use_fp16_gpu_predictions"
+DEFAULT_CONFIG_MODEL_GENERATION = DEFAULT_BUNDLED_MODEL_GENERATION
 PREDICT_MANY_MODE_CONFIG_KEY = "predict_many_mode"
 # Kept only to migrate configurations written before per-mode automatic
 # batching was introduced.
@@ -46,15 +58,12 @@ PROCESS_MANY_MODE_CONFIG_KEY = "process_many_mode"
 ENABLE_RWKV_IMMEDIATE_CONFIG_KEY = "enable_rwkv_immediate"
 CALCULATE_FORGETTING_CURVES_CONFIG_KEY = "calculate_forgetting_curves"
 SAVE_CHECKPOINT_EVERY_REVIEWS_CONFIG_KEY = "save_checkpoint_every_reviews"
-SHOW_CHECKPOINT_REBUILD_CONFIRMATION_CONFIG_KEY = (
-    "show_checkpoint_rebuild_confirmation"
-)
+RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY = "retain_multiple_model_generations"
+SHOW_CHECKPOINT_REBUILD_CONFIRMATION_CONFIG_KEY = "show_checkpoint_rebuild_confirmation"
 WINDOWS_DISPLAY_BUG_PATCH_CONFIG_KEY = "windows_display_bug_patch"
 EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY = "exclude_deleted_card_revlogs"
 CARD_INFO_RETRIEVABILITY_CONFIG_KEY = "enable_card_info_retrievability"
-CARD_INFO_RETRIEVABILITY_AUTO_REFRESH_CONFIG_KEY = (
-    "auto_refresh_card_info_retrievability"
-)
+CARD_INFO_RETRIEVABILITY_AUTO_REFRESH_CONFIG_KEY = "auto_refresh_card_info_retrievability"
 CARD_INFO_INTERVALS_CONFIG_KEY = "enable_card_info_rwkv_intervals"
 CARD_INFO_FORGETTING_CURVE_GRAPH_CONFIG_KEY = "enable_card_info_rwkv_forgetting_curve_graph"
 CARD_INFO_FORGETTING_CURVE_GRAPH_LOWER_BOUND_CONFIG_KEY = (
@@ -64,9 +73,7 @@ _LEGACY_LIVE_REVIEW_READY_QUEUE_SIZE_CONFIG_KEY = "live_review_ready_queue_size"
 LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY = "live_review_prediction_refresh_limit"
 LIVE_REVIEW_SAMEDAY_PREDICTION_LIMIT_CONFIG_KEY = "live_review_sameday_prediction_limit"
 LIVE_REVIEW_QUIET_REFRESH_ATTEMPTS_CONFIG_KEY = "live_review_quiet_refresh_attempts"
-LIVE_REVIEW_SAMEDAY_REENTRY_DELAY_REVIEWS_CONFIG_KEY = (
-    "live_review_sameday_reentry_delay_reviews"
-)
+LIVE_REVIEW_SAMEDAY_REENTRY_DELAY_REVIEWS_CONFIG_KEY = "live_review_sameday_reentry_delay_reviews"
 MINIMUM_REVIEW_WIDENING_EXTRA_PERCENT_CONFIG_KEY = "minimum_review_widening_extra_percent"
 CURVE_RESCHEDULING_CONFIG_KEY = "experimental_enable_curve_rescheduling"
 EXPERIMENTAL_SHORT_TERM_RESCHEDULING_CONFIG_KEY = "experimental_enable_short_term_rescheduling"
@@ -86,13 +93,16 @@ def default_addon_config() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         loaded = {
             MODEL_CONFIG_KEY: DEFAULT_MODEL_ID,
+            MODEL_GENERATION_CONFIG_KEY: DEFAULT_CONFIG_MODEL_GENERATION,
+            USE_FP16_STATE_CONFIG_KEY: True,
             SAVE_CHECKPOINT_EVERY_REVIEWS_CONFIG_KEY: CHECKPOINT_SAVE_INTERVAL,
+            RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY: False,
             SHOW_CHECKPOINT_REBUILD_CONFIRMATION_CONFIG_KEY: True,
-            PREDICT_MANY_MODE_CONFIG_KEY: DEFAULT_PREDICT_MANY_MODE,
+            PREDICT_MANY_MODE_CONFIG_KEY: DEFAULT_PREDICTION_MODE,
             PREDICT_MANY_BATCH_SIZES_CONFIG_KEY: _default_predict_many_batch_sizes(),
             PROCESS_MANY_MODE_CONFIG_KEY: DEFAULT_PROCESS_MANY_MODE,
             ENABLE_RWKV_IMMEDIATE_CONFIG_KEY: True,
-            CALCULATE_FORGETTING_CURVES_CONFIG_KEY: True,
+            CALCULATE_FORGETTING_CURVES_CONFIG_KEY: False,
             EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY: True,
             CARD_INFO_RETRIEVABILITY_CONFIG_KEY: True,
             CARD_INFO_RETRIEVABILITY_AUTO_REFRESH_CONFIG_KEY: False,
@@ -125,8 +135,52 @@ def normalized_addon_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     source_config = dict(config or {})
     normalized = default_addon_config()
     _deep_update(normalized, source_config)
+    if source_config and USE_FP16_STATE_CONFIG_KEY not in source_config:
+        # Older saved configs used FP32. Only fresh/default configs should opt
+        # into FP16; never invalidate an existing checkpoint implicitly.
+        normalized[USE_FP16_STATE_CONFIG_KEY] = False
+    if source_config and MODEL_GENERATION_CONFIG_KEY not in source_config:
+        # Configs saved by releases before generation selection are V1 configs.
+        # A fresh install receives config.json, which carries the explicit V1
+        # default, while a legacy mapping must not silently switch model/state.
+        normalized[MODEL_GENERATION_CONFIG_KEY] = _legacy_model_generation(source_config)
+        # V1 releases calculated curves by default. A sparse legacy mapping
+        # must inherit that generation's old default instead of the fresh-install
+        # config.json value.
+        if CALCULATE_FORGETTING_CURVES_CONFIG_KEY not in source_config:
+            normalized[CALCULATE_FORGETTING_CURVES_CONFIG_KEY] = True
+        if CARD_INFO_INTERVALS_CONFIG_KEY not in source_config:
+            normalized[CARD_INFO_INTERVALS_CONFIG_KEY] = True
+    else:
+        normalized[MODEL_GENERATION_CONFIG_KEY] = configured_model_generation(normalized)
     normalized[MODEL_CONFIG_KEY] = configured_model_id(normalized)
-    normalized[PREDICT_MANY_MODE_CONFIG_KEY] = predict_many_mode(normalized)
+    normalized[USE_FP16_STATE_CONFIG_KEY] = use_fp16_state(normalized)
+    # Retire the independent toggle. Preserve its effective GPU choice once,
+    # then keep the selector as the sole source of truth.
+    if (source_config.get(USE_FP16_GPU_PREDICTIONS_CONFIG_KEY) is True
+            and source_config.get(PREDICT_MANY_MODE_CONFIG_KEY) == PREDICT_MANY_GPU_MODE):
+        normalized[PREDICT_MANY_MODE_CONFIG_KEY] = PREDICT_MANY_FULL_FP16_MODE
+    normalized.pop(USE_FP16_GPU_PREDICTIONS_CONFIG_KEY, None)
+    if not model_generation_supports_curves(normalized[MODEL_GENERATION_CONFIG_KEY]):
+        # Immediate-only generations cannot enable the V1 curve APIs. Persist the master
+        # switch and every dependent boolean as off, rather than merely making
+        # their helpers return false. This prevents unavailable V1-only
+        # features from silently reappearing after a later generation change.
+        for key in (
+            CALCULATE_FORGETTING_CURVES_CONFIG_KEY,
+            CARD_INFO_INTERVALS_CONFIG_KEY,
+            CARD_INFO_FORGETTING_CURVE_GRAPH_CONFIG_KEY,
+            ADAPTIVE_DESIRED_RETENTION_CONFIG_KEY,
+            CURVE_RESCHEDULING_CONFIG_KEY,
+            EXPERIMENTAL_SHORT_TERM_RESCHEDULING_CONFIG_KEY,
+            EXPERIMENTAL_BEHAVIOR_LAB_CONFIG_KEY,
+        ):
+            normalized[key] = False
+    if not model_generation_capabilities(
+        normalized[MODEL_GENERATION_CONFIG_KEY]
+    ).deleted_card_history:
+        normalized[EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY] = True
+    normalized[PREDICT_MANY_MODE_CONFIG_KEY] = configured_prediction_mode(normalized)
     batch_config_source = (
         source_config
         if PREDICT_MANY_BATCH_SIZES_CONFIG_KEY in source_config
@@ -137,12 +191,13 @@ def normalized_addon_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     normalized.pop(PREDICT_MANY_BATCH_SIZE_CONFIG_KEY, None)
     normalized[PROCESS_MANY_MODE_CONFIG_KEY] = process_many_mode(normalized)
     normalized[SAVE_CHECKPOINT_EVERY_REVIEWS_CONFIG_KEY] = checkpoint_save_interval(normalized)
+    normalized[RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY] = retain_multiple_model_generations(
+        normalized
+    )
     normalized[SHOW_CHECKPOINT_REBUILD_CONFIRMATION_CONFIG_KEY] = (
         show_checkpoint_rebuild_confirmation(normalized)
     )
-    normalized[WINDOWS_DISPLAY_BUG_PATCH_CONFIG_KEY] = (
-        windows_display_bug_patch_enabled(normalized)
-    )
+    normalized[WINDOWS_DISPLAY_BUG_PATCH_CONFIG_KEY] = windows_display_bug_patch_enabled(normalized)
     normalized[CARD_INFO_FORGETTING_CURVE_GRAPH_LOWER_BOUND_CONFIG_KEY] = (
         card_info_forgetting_curve_graph_lower_bound_percent(normalized)
     )
@@ -158,8 +213,8 @@ def normalized_addon_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     normalized[LIVE_REVIEW_SAMEDAY_PREDICTION_LIMIT_CONFIG_KEY] = (
         live_review_sameday_prediction_limit(normalized)
     )
-    normalized[LIVE_REVIEW_QUIET_REFRESH_ATTEMPTS_CONFIG_KEY] = (
-        live_review_quiet_refresh_attempts(normalized)
+    normalized[LIVE_REVIEW_QUIET_REFRESH_ATTEMPTS_CONFIG_KEY] = live_review_quiet_refresh_attempts(
+        normalized
     )
     normalized[LIVE_REVIEW_SAMEDAY_REENTRY_DELAY_REVIEWS_CONFIG_KEY] = (
         live_review_sameday_reentry_delay_reviews(normalized)
@@ -170,30 +225,67 @@ def normalized_addon_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     # Drop the retired daily/review-batch prediction experiment from existing
     # user configurations instead of preserving it as an unknown nested key.
     normalized.pop("rwkv_prediction_caches", None)
+    normalized.pop("experimental_enable_additional_feature_prediction_correction", None)
     return normalized
 
 
-def available_model_ids() -> tuple[str, ...]:
-    pretrained_dir = VENDOR_ROOT / "rwkv_srs" / "pretrained"
-    try:
-        model_ids = tuple(sorted(path.stem for path in pretrained_dir.glob("*.safetensors")))
-    except OSError:
-        model_ids = ()
-    if model_ids:
-        return model_ids
-    return (DEFAULT_MODEL_ID,)
-
-
 def configured_model_id(config: Mapping[str, Any] | None) -> str:
+    generation = configured_model_generation(config)
+    default_model = default_model_id_for_generation(generation)
     if not config:
-        return DEFAULT_MODEL_ID
-    value = str(config.get(MODEL_CONFIG_KEY) or DEFAULT_MODEL_ID)
-    models = available_model_ids()
+        return default_model
+    value = str(config.get(MODEL_CONFIG_KEY) or default_model)
+    models = available_model_ids(generation)
     if value in models:
         return value
-    if DEFAULT_MODEL_ID in models:
-        return DEFAULT_MODEL_ID
+    if default_model in models:
+        return default_model
     return models[0]
+
+
+def retain_multiple_model_generations(config: Mapping[str, Any] | None) -> bool:
+    return (config or {}).get(RETAIN_MULTIPLE_MODEL_GENERATIONS_CONFIG_KEY) is True
+
+
+def use_fp16_state(config: Mapping[str, Any] | None) -> bool:
+    return (config or {}).get(USE_FP16_STATE_CONFIG_KEY) is True
+
+
+def state_precision(config: Mapping[str, Any] | None) -> str:
+    return "fp16" if use_fp16_state(config) else "fp32"
+
+
+def gpu_prediction_math(config: Mapping[str, Any] | None) -> str:
+    """Explicit V1/V5 arithmetic choice; independent of canonical storage."""
+    return prediction_mode_math(configured_prediction_mode(config))
+
+
+def configured_prediction_mode(config: Mapping[str, Any] | None) -> str:
+    return normalize_prediction_mode((config or {}).get(PREDICT_MANY_MODE_CONFIG_KEY))
+
+
+def configured_model_generation(config: Mapping[str, Any] | None) -> str:
+    # Raw/absent mappings retain the low-level V1 compatibility default. New
+    # user configurations pass through ``default_addon_config()`` first and
+    # therefore explicitly carry the V1 default from config.json.
+    value = None if not config else config.get(MODEL_GENERATION_CONFIG_KEY)
+    return normalize_model_generation(value)
+
+
+def configured_runtime_model_id(config: Mapping[str, Any] | None) -> str:
+    """Return the logical model selected within the configured generation."""
+
+    return configured_model_id(config)
+
+
+def evaluation_settings_signature(config: Mapping[str, Any] | None) -> tuple:
+    """Settings bound to the model choices/results of a modeless analysis window."""
+    return (
+        configured_model_generation(config),
+        configured_model_id(config),
+        state_precision(config),
+        exclude_deleted_card_revlogs(config),
+    )
 
 
 def addon_config_for_mw(mw) -> dict[str, Any]:
@@ -201,7 +293,31 @@ def addon_config_for_mw(mw) -> dict[str, Any]:
     if addon_manager is None:
         return {}
     addon = addon_manager.addonFromModule(__name__)
-    return normalized_addon_config(addon_manager.getConfig(addon) or {})
+    config = dict(addon_manager.getConfig(addon) or {})
+    # Anki merges new config.json defaults over a user's stored mapping before
+    # getConfig() returns it. Consult the public add-on metadata accessor so a
+    # pre-generation config remains V1 instead of inheriting the fresh-install key.
+    addon_meta = getattr(addon_manager, "addonMeta", None)
+    if callable(addon_meta):
+        try:
+            user_config = addon_meta(addon).get("config", {})
+        except (AttributeError, TypeError):
+            user_config = {}
+        if (
+            isinstance(user_config, Mapping)
+            and user_config
+            and MODEL_GENERATION_CONFIG_KEY not in user_config
+        ):
+            config[MODEL_GENERATION_CONFIG_KEY] = _legacy_model_generation(user_config)
+            if CALCULATE_FORGETTING_CURVES_CONFIG_KEY not in user_config:
+                config[CALCULATE_FORGETTING_CURVES_CONFIG_KEY] = True
+            if CARD_INFO_INTERVALS_CONFIG_KEY not in user_config:
+                config[CARD_INFO_INTERVALS_CONFIG_KEY] = True
+    return normalized_addon_config(config)
+
+
+def _legacy_model_generation(config: Mapping[str, Any]) -> str:
+    return legacy_model_generation(config.get(MODEL_CONFIG_KEY))
 
 
 def write_addon_config_for_mw(mw, config: Mapping[str, Any]) -> None:
@@ -210,6 +326,7 @@ def write_addon_config_for_mw(mw, config: Mapping[str, Any]) -> None:
         return
     addon = addon_manager.addonFromModule(__name__)
     normalized = normalized_addon_config(config)
+
     write_config = getattr(addon_manager, "writeConfig", None)
     if callable(write_config):
         write_config(addon, normalized)
@@ -221,6 +338,8 @@ def write_addon_config_for_mw(mw, config: Mapping[str, Any]) -> None:
         meta = addon_meta(addon)
         meta["config"] = normalized
         write_addon_meta(addon, meta)
+
+
 
 
 def enabled_prediction_cache_specs(
@@ -260,6 +379,8 @@ def enabled_forgetting_curve_rwkv_prediction_modes(
 
 
 def calculate_forgetting_curves(config: Mapping[str, Any] | None) -> bool:
+    if not model_generation_supports_curves(configured_model_generation(config)):
+        return False
     if not config:
         return True
     return bool(config.get(CALCULATE_FORGETTING_CURVES_CONFIG_KEY, True))
@@ -299,14 +420,14 @@ def predict_many_batch_size(
     config: Mapping[str, Any] | None,
     mode: object | None = None,
 ) -> int | None:
-    selected_mode = predict_many_mode(config) if mode is None else normalize_predict_many_mode(mode)
+    selected_mode = predict_many_mode(config) if mode is None else native_prediction_mode(mode)
     value = predict_many_batch_sizes(config)[selected_mode]
     return value if value > 0 else None
 
 
 def predict_many_mode(config: Mapping[str, Any] | None) -> str:
-    value = None if not config else config.get(PREDICT_MANY_MODE_CONFIG_KEY)
-    return normalize_predict_many_mode(value)
+    """Native execution route; arithmetic remains a runtime constructor choice."""
+    return native_prediction_mode(configured_prediction_mode(config))
 
 
 def process_many_mode(config: Mapping[str, Any] | None) -> str:
@@ -320,7 +441,7 @@ def checkpoint_save_interval(config: Mapping[str, Any] | None) -> int:
     value = config.get(SAVE_CHECKPOINT_EVERY_REVIEWS_CONFIG_KEY, CHECKPOINT_SAVE_INTERVAL)
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return CHECKPOINT_SAVE_INTERVAL
     return parsed if parsed > 0 else CHECKPOINT_SAVE_INTERVAL
 
@@ -357,14 +478,12 @@ def webview_popup_control_mode(
 ) -> str:
     """Translate the user-facing workaround toggle into the shared UI mode."""
 
-    return (
-        "in-page"
-        if windows_display_bug_patch_enabled(config, platform=platform)
-        else "native"
-    )
+    return "in-page" if windows_display_bug_patch_enabled(config, platform=platform) else "native"
 
 
 def exclude_deleted_card_revlogs(config: Mapping[str, Any] | None) -> bool:
+    if not model_generation_capabilities(configured_model_generation(config)).deleted_card_history:
+        return True
     if not config:
         return True
     return bool(config.get(EXCLUDE_DELETED_CARD_REVLOGS_CONFIG_KEY, True))
@@ -510,6 +629,8 @@ def adaptive_desired_retention_enabled(config: Mapping[str, Any] | None) -> bool
 
 
 def behavior_lab_enabled(config: Mapping[str, Any] | None) -> bool:
+    if not model_generation_supports_curves(configured_model_generation(config)):
+        return False
     if not config:
         return False
     return bool(config.get(EXPERIMENTAL_BEHAVIOR_LAB_CONFIG_KEY, False))
@@ -528,7 +649,7 @@ def _batch_size_override_value(value: object) -> int:
         return 0
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return parsed if parsed > 0 else 0
 
@@ -546,7 +667,7 @@ def _integer_config(
     value = config.get(key, default)
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return int(default)
     if parsed < int(minimum):
         return int(default)

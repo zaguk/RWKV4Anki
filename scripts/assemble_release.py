@@ -411,11 +411,16 @@ def _validate_vendor_release(
         url = record.get("url")
         if not isinstance(path, str) or not isinstance(digest, str) or not isinstance(url, str):
             raise ReleaseAssemblyError(f"{target} vendor manifest has an invalid model record")
-        name = PurePosixPath(path).name
-        if name in actual_models:
+        if path in actual_models:
             raise ReleaseAssemblyError(f"{target} vendor manifest has duplicate models")
-        actual_models[name] = (digest, url)
-    expected_models = {model.name: (model.sha256, model.url) for model in model_lock.models}
+        actual_models[path] = (digest, url)
+    expected_models = {
+        f"rwkv_srs/pretrained/{model.generation}/{model.name}": (
+            model.sha256,
+            model.url,
+        )
+        for model in model_lock.models
+    }
     if actual_models != expected_models:
         raise ReleaseAssemblyError(f"{target} vendor models do not match the model lock")
 

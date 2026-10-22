@@ -359,15 +359,20 @@ class WebDialogHost(QDialog):
             return
         self._cleaned_up = True
         self._close_reason = reason
-        self._progress_owner.shutdown()
-        self._message_owner.shutdown()
-        self._bridge.invalidate()
-        self._remove_profile_hook()
         try:
-            with suppress(RuntimeError, ValueError):
-                self.web.cleanup()
+            self._progress_owner.shutdown()
         finally:
-            self.controller.on_dialog_closed(reason)
+            # A workflow's cancellation callback is external code. Its failure
+            # must not strand a WebView, profile hook, or controller after the
+            # host has already committed its exact-once closed state.
+            self._message_owner.shutdown()
+            self._bridge.invalidate()
+            self._remove_profile_hook()
+            try:
+                with suppress(RuntimeError, ValueError):
+                    self.web.cleanup()
+            finally:
+                self.controller.on_dialog_closed(reason)
 
     def _remove_profile_hook(self) -> None:
         if not self._profile_hook_registered:

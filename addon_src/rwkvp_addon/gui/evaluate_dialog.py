@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from aqt import mw
 
-from ..addon_config import addon_config_for_mw, calculate_forgetting_curves
+from ..addon_config import (
+    addon_config_for_mw,
+    calculate_forgetting_curves,
+    configured_model_generation,
+    evaluation_settings_signature,
+    exclude_deleted_card_revlogs,
+    retain_multiple_model_generations,
+)
 from ..anki_api import (
     FsrsEvaluationMode,
     build_evaluation_scope_descriptors,
@@ -21,6 +28,11 @@ from ..evaluate_controller import (
     EvaluationRunRequest,
     EvaluationScopeSelection,
 )
+from ..evaluation_comparison import (
+    ComparisonCheckpointRequired,
+    ComparisonEvaluationError,
+    GenerationEvaluation,
+)
 from ..evaluation_date_range import (
     filter_target_review_ids_by_date_range,
     review_date_bounds_for_ids,
@@ -31,7 +43,7 @@ from ..runtime import manager_for_mw, store_for_mw
 from .checkpoint_failure import handle_checkpoint_failure
 from .common import ProgressStage, run_with_progress_stages
 from .web_dialog import WebDialogHost, widget_uses_dark_palette
-from .web_message import show_web_warning
+from .web_message import ask_web_confirmation, show_web_warning
 
 
 class EvaluateDialog(WebDialogHost):
@@ -45,6 +57,8 @@ class EvaluateDialog(WebDialogHost):
     ) -> None:
         self.rwkv_mode = rwkv_mode
         self.rwkv_label = rwkv_label
+        config = addon_config_for_mw(mw)
+        self._evaluation_settings = evaluation_settings_signature(config)
         first_review_id, last_review_id = collection_review_id_bounds(mw.col)
         full_start, full_end = review_date_bounds_for_ids(
             first_review_id,
@@ -60,6 +74,8 @@ class EvaluateDialog(WebDialogHost):
             on_run_requested=self._start_evaluation,
             on_warning=self._show_warning,
             is_dark=widget_uses_dark_palette(parent),
+            active_generation=configured_model_generation(config),
+            include_deleted_reviews=not exclude_deleted_card_revlogs(config),
         )
         super().__init__(
             parent,
@@ -84,7 +100,18 @@ class EvaluateDialog(WebDialogHost):
     def run_rwkv_only(self) -> bool:
         return self._evaluate_controller.request_evaluation(include_fsrs=False)
 
-    def _start_evaluation(self, request: EvaluationRunRequest) -> bool:
+    def _start_evaluation(
+        self,
+        request: EvaluationRunRequest,
+        *,
+        allow_comparison_build: bool = False,
+    ) -> bool:
+        config = addon_config_for_mw(mw)
+        if self._evaluation_settings != evaluation_settings_signature(config):
+            self._show_warning(
+                "RWKV model or history settings changed. Reopen Evaluation to use them."
+            )
+            return False
         if (
             request.prediction_mode == RWKVPredictionMode.PREDICT_AHEAD
             and not calculate_forgetting_curves(addon_config_for_mw(mw))
@@ -98,9 +125,23 @@ class EvaluateDialog(WebDialogHost):
 
         store = store_for_mw(mw)
         manager = manager_for_mw(mw)
-        if not self._evaluate_controller.begin_evaluation(
-            include_fsrs=request.include_fsrs
-        ):
+        comparison = None
+        comparison_review_load = None
+        retain = retain_multiple_model_generations(config)
+        if request.comparison_generation is not None:
+            try:
+                comparison = GenerationEvaluation(
+                    manager,
+                    request.comparison_generation,
+                    prediction_mode=request.prediction_mode,
+                )
+                if comparison.needs_build and not allow_comparison_build:
+                    self._confirm_comparison_build(request, comparison, retain=retain)
+                    return True
+            except (OSError, ValueError) as exc:
+                self._show_warning(str(exc))
+                return False
+        if not self._evaluate_controller.begin_evaluation(include_fsrs=request.include_comparison):
             return False
 
         scope_descriptors = list(request.scopes)
@@ -127,6 +168,7 @@ class EvaluateDialog(WebDialogHost):
             return plans, fsrs_results
 
         def export_op(col, progress, previous):
+            nonlocal comparison_review_load
             plans, fsrs_results = previous
             review_load = load_review_data_for_checkpoint(
                 col,
@@ -135,10 +177,22 @@ class EvaluateDialog(WebDialogHost):
                 progress,
                 allow_incremental=True,
             )
+            if comparison is not None:
+                comparison_review_load = comparison.load_review_data(col, progress)
+                if (
+                    review_load.collection_revision is not None
+                    and review_load.collection_revision
+                    != comparison_review_load.collection_revision
+                ):
+                    raise RuntimeError(
+                        "Review history changed while loading. Run the comparison again."
+                    )
             return plans, fsrs_results, review_load
 
         def prepare_op(_col, progress, previous):
             plans, fsrs_results, review_load = previous
+            if comparison is not None:
+                comparison.validate_active_checkpoint()
             readiness = ensure_checkpoint_ready_from_load(
                 manager,
                 review_load,
@@ -196,11 +250,30 @@ class EvaluateDialog(WebDialogHost):
                 progress,
                 prediction_mode=request.prediction_mode,
             )
+            if comparison is not None:
+                result = comparison.compare(
+                    comparison_review_load,
+                    review_data,
+                    prediction_snapshot,
+                    plans,
+                    rwkv_target_review_ids,
+                    progress,
+                    allow_build=allow_comparison_build,
+                    retain=retain,
+                )
+                return (
+                    result.comparison.metrics,
+                    result.comparison.counts,
+                    result.active.metrics,
+                    result.active.counts,
+                    prediction_snapshot.history_revision,
+                )
             scoped_results = calculate_aligned_scoped_metrics(
                 review_data.rows,
                 prediction_snapshot.predictions,
                 scopes,
                 target_review_ids_by_scope=rwkv_target_review_ids,
+                progress=progress,
             )
             return (
                 fsrs_results,
@@ -221,13 +294,20 @@ class EvaluateDialog(WebDialogHost):
                 rwkv_results=rwkv_results,
                 rwkv_counts=rwkv_counts,
                 history_revision=revision,
+                comparison_model_id=comparison.model_id if comparison is not None else None,
             )
 
         def failure(exc: Exception) -> None:
             if self.cleaned_up:
                 return
             self._evaluate_controller.finish_evaluation()
-            retry = self.run_comparison if request.include_fsrs else self.run_rwkv_only
+            if isinstance(exc, ComparisonCheckpointRequired) and comparison is not None:
+                self._confirm_comparison_build(request, comparison, retain=retain)
+                return
+            if isinstance(exc, ComparisonEvaluationError):
+                self._show_warning(str(exc))
+                return
+            retry = self.run_comparison if request.include_comparison else self.run_rwkv_only
             handle_checkpoint_failure(exc, retry, parent=self)
 
         def cancelled() -> None:
@@ -249,8 +329,8 @@ class EvaluateDialog(WebDialogHost):
             ]
         )
         operation_title = (
-            f"Compare FSRS-6 and {self.rwkv_label}"
-            if request.include_fsrs
+            self._evaluate_controller.comparison_button_label
+            if request.include_comparison
             else f"{self.rwkv_label} Evaluation"
         )
         run_with_progress_stages(
@@ -263,6 +343,20 @@ class EvaluateDialog(WebDialogHost):
             on_cancel=cancelled,
         )
         return True
+
+    def _confirm_comparison_build(self, request, comparison, *, retain: bool) -> None:
+        def confirmed(accepted: bool) -> None:
+            if accepted and not self.cleaned_up:
+                self._start_evaluation(request, allow_comparison_build=True)
+
+        ask_web_confirmation(
+            parent=self,
+            title="Build comparison model",
+            message=comparison.build_warning(retain=retain),
+            confirm_label="Okay",
+            cancel_label="Cancel",
+            on_result=confirmed,
+        )
 
     def _build_scope_descriptors(
         self,
@@ -287,6 +381,5 @@ def _target_counts(
     target_review_ids_by_scope: dict[str, set[int]],
 ) -> dict[str, int]:
     return {
-        scope_key: len(review_ids)
-        for scope_key, review_ids in target_review_ids_by_scope.items()
+        scope_key: len(review_ids) for scope_key, review_ids in target_review_ids_by_scope.items()
     }

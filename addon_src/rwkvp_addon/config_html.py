@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-# The inline CSS/JavaScript is intentionally kept readable as browser source.
+# Presentation data stays in Python; Svelte owns the Settings DOM and events.
 # ruff: noqa: E501
-import html
-import json
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime
@@ -11,35 +9,20 @@ from typing import Any
 
 from .addon_config import (
     CALCULATE_FORGETTING_CURVES_CONFIG_KEY,
-    CARD_INFO_FORGETTING_CURVE_GRAPH_CONFIG_KEY,
-    CURVE_RESCHEDULING_CONFIG_KEY,
+    LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY,
+    MODEL_CONFIG_KEY,
+    MODEL_GENERATION_CONFIG_KEY,
+    PREDICT_MANY_MODE_CONFIG_KEY,
+    configured_model_generation,
     webview_popup_control_mode,
 )
 from .config_options import CONFIG_OPTIONS, CONFIG_SECTIONS, ConfigOption
-from .glossary import GlossaryRenderer
-from .modal_html import (
-    ModalButton,
-    ModalField,
-    ModalTab,
-    ProgressState,
-    popup_control_mode_script,
-    render_button,
-    render_footer,
-    render_message_overlay_template,
-    render_number_input,
-    render_progress_overlay,
-    render_tab_list,
-    shared_modal_script_tag,
-)
-from .modal_style import shared_style_tag
+from .model_generation import MODEL_GENERATIONS, V5O_MODEL_GENERATION, model_generation_label
 from .review_type_normalization import parse_cutoff_datetime
-from .setup_faq_html import render_setup_faq_help_button
-from .setup_wizard_html import (
-    SETUP_WIZARD_CSS,
-    SETUP_WIZARD_SCRIPT,
-    render_setup_launcher,
-    render_setup_overlay,
-)
+from .rwkv_performance_modes import prediction_mode_label
+from .settings_view import settings_pages
+from .setup_faq_html import setup_faq_items
+from .svelte_ui import render_svelte_document
 
 BRIDGE_PREFIX = "rwkvConfig:"
 
@@ -118,68 +101,16 @@ _SPEED_BUTTON_LABELS = {
     "predictions": "Compare Modes",
     "curves": "Compare On vs. Off",
     "live-predictions": "Test This Size",
+    "auto-live-predictions": "Auto",
 }
 
 _COMPARISON_BUTTON_LABELS = {
+    "generations": "Compare Generations",
     "models": "Compare Models",
     "deleted-reviews": "Compare On vs. Off",
+    "state-precision": "Compare FP16 vs FP32",
+    "gpu-math": "Compare Predictions",
 }
-
-
-def render_initial_setup_html(
-    *,
-    generation: int = 1,
-    popup_control_mode: str = "native",
-) -> str:
-    """Render first-run Guided Setup without mounting the Settings interface."""
-
-    bootstrap = _script_json(
-        {
-            "bridgePrefix": BRIDGE_PREFIX,
-            "bridgeMode": "flat",
-            "bridgeExpectsReply": False,
-            "generation": int(generation),
-            "rootSelector": "#rwkv-guided-setup-root",
-            "backgroundSelectors": ("#rwkv-setup-overlay",),
-        }
-    )
-    return f"""
-{shared_style_tag()}
-<style>
-    html, body {{ height: 100%; overflow: hidden; }}
-    body {{ background: var(--rwkv-canvas); }}
-    .rwkv-guided-setup-host {{
-        height: 100%; min-height: 0; overflow: hidden;
-    }}
-    .rwkv-guided-setup-host .setup-overlay {{
-        background: var(--rwkv-canvas); backdrop-filter: none;
-    }}
-    .rwkv-guided-setup-host .setup-dialog {{
-        height: calc(100vh - 44px);
-    }}
-    {SETUP_WIZARD_CSS}
-</style>
-<div class="rwkv-modal-shell rwkv-guided-setup-host" id="rwkv-guided-setup-root"
-     role="document" aria-label="RWKV Guided Setup"
-     data-rwkv-generation="{int(generation)}">
-  {render_message_overlay_template()}
-  {render_setup_overlay(initially_open=True, show_close_button=False)}
-  <div class="rwkv-sr-only" id="rwkv-dialog-announcer"
-       aria-live="polite" aria-atomic="true"></div>
-</div>
-{popup_control_mode_script(popup_control_mode)}
-<script>window.RWKV_MODAL_BOOTSTRAP = {bootstrap};</script>
-{shared_modal_script_tag()}
-<script>
-(() => {{
-    function values() {{ return {{}}; }}
-    function send(action, extra={{}}) {{
-        window.RWKVModal.send(action, extra).catch(() => {{}});
-    }}
-    {SETUP_WIZARD_SCRIPT}
-}})();
-</script>
-""".strip()
 
 
 def visible_config_options(*, predict_gpu_available: bool) -> tuple[ConfigOption, ...]:
@@ -194,6 +125,78 @@ def option_path_name(path: tuple[str, ...]) -> str:
     return "/".join(path)
 
 
+def _model_choices_by_generation(
+    choices: Mapping[tuple[str, ...], Sequence[str]],
+    configured: Mapping[str, Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    fallback = tuple(str(value) for value in choices.get((MODEL_CONFIG_KEY,), ()))
+    return {
+        generation: tuple(
+            str(value)
+            for value in (
+                configured.get(generation, fallback) if configured is not None else fallback
+            )
+        )
+        for generation in MODEL_GENERATIONS
+    }
+
+
+def build_settings_payload(
+    config: Mapping[str, Any],
+    *,
+    choices: Mapping[tuple[str, ...], Sequence[str]],
+    predict_gpu_available: bool,
+    process_gpu_available: bool,
+    checkpoint_usable: bool,
+    initial_setup: bool = False,
+    apply_enabled: bool = False,
+    model_choices_by_generation: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
+    generation_model_choices = _model_choices_by_generation(choices, model_choices_by_generation)
+    rendered_choices = dict(choices)
+    rendered_choices[(MODEL_CONFIG_KEY,)] = generation_model_choices[
+        configured_model_generation(config)
+    ]
+    pages = (
+        []
+        if initial_setup
+        else settings_pages(
+            config,
+            options=visible_config_options(predict_gpu_available=predict_gpu_available),
+            sections=CONFIG_SECTIONS,
+            choices=rendered_choices,
+            page_intros=_PAGE_INTROS,
+            group_intros=_GROUP_INTROS,
+            subsection_intros=_SUBSECTION_INTROS,
+            capability_note=_capability_note(
+                predict_gpu_available=predict_gpu_available,
+                process_gpu_available=process_gpu_available,
+            ),
+            choice_label=_choice_label,
+            datetime_parts=_datetime_control_parts,
+            model_key=MODEL_CONFIG_KEY,
+        )
+    )
+    return {
+        "pages": pages,
+        "initialSetup": bool(initial_setup),
+        "applyEnabled": bool(apply_enabled),
+        "checkpointUsable": bool(checkpoint_usable),
+        "modelChoices": generation_model_choices,
+        "speedLabels": _SPEED_BUTTON_LABELS,
+        "comparisonLabels": _COMPARISON_BUTTON_LABELS,
+        "keys": {
+            "curves": CALCULATE_FORGETTING_CURVES_CONFIG_KEY,
+            "model": MODEL_CONFIG_KEY,
+            "generation": MODEL_GENERATION_CONFIG_KEY,
+            "predictionMode": PREDICT_MANY_MODE_CONFIG_KEY,
+            "predictionRefreshLimit": LIVE_REVIEW_PREDICTION_REFRESH_LIMIT_CONFIG_KEY,
+            "v5": V5O_MODEL_GENERATION,
+        },
+        "faq": setup_faq_items(),
+    }
+
+
 def render_config_html(
     config: Mapping[str, Any],
     *,
@@ -204,338 +207,46 @@ def render_config_html(
     initial_setup: bool = False,
     apply_enabled: bool = False,
     generation: int = 1,
+    model_choices_by_generation: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
-    popup_control_mode = webview_popup_control_mode(config)
-    if initial_setup:
-        return render_initial_setup_html(
-            generation=generation,
-            popup_control_mode=popup_control_mode,
-        )
-
-    options = visible_config_options(predict_gpu_available=predict_gpu_available)
-    capability_note = _capability_note(
+    data = build_settings_payload(
+        config,
+        choices=choices,
         predict_gpu_available=predict_gpu_available,
         process_gpu_available=process_gpu_available,
+        checkpoint_usable=checkpoint_usable,
+        initial_setup=initial_setup,
+        apply_enabled=apply_enabled,
+        model_choices_by_generation=model_choices_by_generation,
     )
-    pages = "\n".join(
-        _render_page(
-            section,
-            config=config,
-            options=options,
-            choices=choices,
-            checkpoint_usable=checkpoint_usable,
-            capability_note=capability_note if section == "General" else "",
-        )
-        for section in CONFIG_SECTIONS
-    )
-    tabs = render_tab_list(
-        tuple(
-            ModalTab(
-                key=f"settings-{section.casefold()}",
-                label=section,
-                panel_id=f"settings-page-{section}",
-                selected=section == "General",
-            )
-            for section in CONFIG_SECTIONS
-        ),
-        label="RWKV Settings sections",
-        extra_classes=("rwkv-settings-tabs",),
-    )
-    bootstrap = _script_json(
-        {
+    return render_svelte_document(
+        "settings",
+        {"data": data},
+        title="RWKV Guided Setup" if initial_setup else "RWKV Settings",
+        generation=generation,
+        layout="custom",
+        title_id=None,
+        root_attributes={"data-rwkv-enter-from-inputs": "true"} if not initial_setup else None,
+        root_extra_classes="rwkv-guided-setup-host" if initial_setup else "rwkv-settings-host",
+        escape_action="cancel",
+        enter_action=None if initial_setup else "ok",
+        bootstrap={
             "bridgePrefix": BRIDGE_PREFIX,
             "bridgeMode": "flat",
             "bridgeExpectsReply": False,
-            "generation": int(generation),
-            "rootSelector": "#rwkv-settings-root",
+            "popupControlMode": webview_popup_control_mode(config),
             "backgroundSelectors": (
-                ".settings-shell > .rwkv-settings-tabs",
-                ".settings-shell > .settings-pages",
-                ".settings-shell > .rwkv-dialog-footer",
-                "#rwkv-setup-overlay",
+                ("#rwkv-setup-overlay",)
+                if initial_setup
+                else (
+                    ".settings-shell > .rwkv-settings-tabs",
+                    ".settings-shell > .settings-pages",
+                    ".settings-shell > .rwkv-dialog-footer",
+                    "#rwkv-setup-overlay",
+                )
             ),
-        }
+        },
     )
-    curve_path = _script_json(option_path_name((CALCULATE_FORGETTING_CURVES_CONFIG_KEY,)))
-    graph_path = _script_json(option_path_name((CARD_INFO_FORGETTING_CURVE_GRAPH_CONFIG_KEY,)))
-    reschedule_path = _script_json(option_path_name((CURVE_RESCHEDULING_CONFIG_KEY,)))
-    settings_footer = _render_settings_footer(apply_enabled=apply_enabled)
-    apply_enabled_script = "true" if apply_enabled else "false"
-    progress_overlay = render_progress_overlay(
-        ProgressState(
-            title="Working",
-            label="Preparing operation",
-            cancellable=True,
-            visible=False,
-        ),
-        cancel_action="progress-cancel",
-    )
-    message_overlay = render_message_overlay_template()
-    return f"""
-{shared_style_tag()}
-<style>
-    .rwkv-settings-tabs {{ position: sticky; top: 0; z-index: 5; flex: 0 0 auto; gap: 4px; padding: 12px 18px 0; background: var(--rwkv-canvas); }}
-    .rwkv-settings-tabs .rwkv-tab {{ padding: 9px 16px 10px; }}
-    .page {{ display: block; max-width: 980px; margin: 0 auto; padding: 22px 24px 40px; }}
-    .page[hidden] {{ display: none; }}
-    .settings-page-heading {{ align-items: center; display: flex; gap: 14px; justify-content: space-between; }}
-    .settings-page-heading .page-title {{ margin: 0; }}
-    .settings-page-heading > button.setup-faq-help-button {{
-        align-self: flex-start; border: 1px solid var(--rwkv-border); border-radius: 50%;
-        box-shadow: none;
-        flex: 0 0 32px; font-size: 15px; font-weight: 750; height: 32px; min-height: 32px;
-        margin: 0; padding: 0; width: 32px;
-    }}
-    .settings-page-heading > button.setup-faq-help-button:hover:not(:disabled) {{
-        border-color: var(--rwkv-accent-border); border-radius: 50%; box-shadow: none;
-        color: var(--rwkv-accent);
-    }}
-    .capability-note {{ margin-top: 12px; border-left: 3px solid var(--rwkv-accent); padding: 7px 10px; background: rgba(75,123,236,.08); border-radius: 3px; }}
-    .major-group {{ margin-top: 28px; }}
-    .major-group > h2 {{ font-size: 18px; margin: 0 0 4px; }}
-    .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-top: 13px; align-items: start; }}
-    .settings-grid--stacked {{ grid-template-columns: minmax(0, 1fr); }}
-    .settings-card h3 {{ font-size: 15px; margin: 0 0 3px; }}
-    .subsection-intro {{ margin-bottom: 10px; font-size: 12px; }}
-    .curve-disabled-note {{ display: none; margin: 10px 0 4px; border-radius: 6px; padding: 8px 10px; color: var(--fg-subtle, #626872); background: rgba(127,127,127,.12); }}
-    .settings-card.curves-disabled .curve-disabled-note {{ display: block; }}
-    .setting {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(170px, auto); gap: 10px 18px; align-items: center; padding: 13px 0; border-top: 1px solid var(--rwkv-border); }}
-    .setting:first-of-type {{ border-top: 0; }}
-    .setting.conditional-hidden {{ display: none; }}
-    .setting.disabled {{ opacity: .52; }}
-    .setting-title {{ font-weight: 650; }}
-    .setting-description {{ color: var(--rwkv-subtle); font-size: 12px; margin-top: 3px; }}
-    .restart-badge, .rebuild-badge {{ display: inline-block; color: #8a5a00; background: rgba(230,165,0,.16); border-radius: 99px; font-size: 10px; font-weight: 700; margin-left: 6px; padding: 2px 7px; vertical-align: 1px; }}
-    .control {{ display: flex; justify-content: flex-end; align-items: center; gap: 7px; min-width: 170px; }}
-    select, input[type=date], .datetime-time {{ width: 180px; max-width: 100%; color: inherit; background: var(--rwkv-control); border: 1px solid var(--rwkv-border); border-radius: 6px; padding: 7px 9px; }}
-    .rwkv-settings-number-field {{ flex: 0 1 180px; width: 180px; }}
-    .rwkv-settings-number-field > input[type=number] {{ appearance: textfield; }}
-    .rwkv-settings-number-field > input[type=number]::-webkit-inner-spin-button,
-    .rwkv-settings-number-field > input[type=number]::-webkit-outer-spin-button {{
-        appearance: none;
-        margin: 0;
-    }}
-    .setting-datetime {{ grid-template-columns: minmax(0, 1fr); }}
-    .setting-datetime .control {{ justify-content: flex-start; }}
-    .datetime-editor {{ display: flex; align-items: flex-start; flex-wrap: wrap; gap: 7px; width: 100%; }}
-    .datetime-part {{ align-content: start; display: grid; gap: 3px; grid-template-rows: 12px 34px; }}
-    .datetime-part-label {{ color: var(--fg-subtle, #626872); font-size: 10px; font-weight: 650; letter-spacing: .02em; line-height: 12px; }}
-    .datetime-date, .datetime-time, .datetime-period,
-    .datetime-part > .rwkv-popup-select, .datetime-part > .rwkv-popup-temporal {{ height: 34px; min-height: 34px; }}
-    .datetime-date {{ width: 155px; }}
-    .datetime-time {{ width: 96px; font-variant-numeric: tabular-nums; }}
-    .datetime-period {{ width: 72px; }}
-    .datetime-date[aria-invalid="true"], .datetime-time[aria-invalid="true"] {{ border-color: #c64747; box-shadow: 0 0 0 1px rgba(198,71,71,.18); }}
-    .datetime-error {{ flex-basis: 100%; color: #b23b3b; font-size: 11px; }}
-    .unit {{ color: var(--fg-subtle, #626872); font-size: 12px; }}
-    @media (max-width: 620px) {{
-        .settings-grid {{ grid-template-columns: 1fr; }}
-        .setting {{ grid-template-columns: 1fr; }} .control {{ justify-content: flex-start; flex-wrap: wrap; }}
-    }}
-    .nightMode .settings-shell, .night_mode .settings-shell {{ color: #e7e9ec; }}
-    .nightMode .restart-badge, .night_mode .restart-badge, .nightMode .rebuild-badge, .night_mode .rebuild-badge {{ color: #ffd77b; }}
-    html, body {{ height: 100%; overflow: hidden; }}
-    .rwkv-settings-host {{
-        height: 100%; min-height: 0; overflow: hidden;
-    }}
-    .settings-shell {{
-        display: flex; flex-direction: column; height: 100%; min-height: 0;
-        overflow: hidden;
-    }}
-    .settings-pages {{
-        flex: 1 1 0; min-height: 0; overflow-y: auto;
-        overscroll-behavior: contain;
-    }}
-    #rwkv-settings-footer {{ flex: 0 0 auto; z-index: 6; }}
-    {SETUP_WIZARD_CSS}
-</style>
-<div class="rwkv-modal-shell rwkv-settings-host" id="rwkv-settings-root"
-     role="document" aria-label="RWKV Settings" data-rwkv-generation="{int(generation)}"
-     data-rwkv-escape-action="cancel" data-rwkv-enter-action="ok"
-     data-rwkv-enter-from-inputs="true">
-  <div class="settings-shell">
-    {tabs}
-    <div class="settings-pages">{pages}</div>
-    {settings_footer}
-    {progress_overlay}
-  </div>
-  <!-- Keep runtime messages outside the inert Settings shell so Guided Setup can
-       display and dismiss errors without exposing the underlying settings page. -->
-  {message_overlay}
-  {render_setup_overlay()}
-  <div class="rwkv-sr-only" id="rwkv-dialog-announcer"
-       aria-live="polite" aria-atomic="true"></div>
-</div>
-{popup_control_mode_script(popup_control_mode)}
-<script>window.RWKV_MODAL_BOOTSTRAP = {bootstrap};</script>
-{shared_modal_script_tag()}
-<script>
-(() => {{
-    const curvePath = {curve_path};
-    const graphPath = {graph_path};
-    const reschedulePath = {reschedule_path};
-    const settingsFooter = document.getElementById('rwkv-settings-footer');
-    let settingsApplyEnabled = {apply_enabled_script};
-    const controls = () => Array.from(document.querySelectorAll('[data-config-path]'));
-    function valueFor(path) {{
-        const el = document.querySelector(`[data-config-path="${{CSS.escape(path)}}"]`);
-        if (!el) return null;
-        if (el.type === 'checkbox') return el.checked;
-        if (el.type === 'number') return el.value === '' ? null : Number(el.value);
-        return el.value;
-    }}
-    function values() {{
-        const result = {{}};
-        controls().forEach((el) => {{ result[el.dataset.configPath] = valueFor(el.dataset.configPath); }});
-        return result;
-    }}
-    function send(action, extra={{}}) {{
-        window.RWKVModal.send(action, extra).catch(() => {{}});
-    }}
-    const actionsWithSettingsValues = new Set([
-        'change', 'speed-test', 'comparison', 'setup',
-        'restore-defaults', 'apply', 'ok', 'cancel',
-    ]);
-    window.RWKV_MODAL_PAYLOAD_PROVIDER = (action, payload={{}}) => {{
-        if (!actionsWithSettingsValues.has(action) || Object.hasOwn(payload, 'values')) {{
-            return payload;
-        }}
-        return Object.assign({{}}, payload, {{values: values()}});
-    }};
-    function parseTypedTime(value) {{
-        const match = /^\\s*(\\d{{1,2}})(?::([0-5]?\\d))?(?::([0-5]?\\d))?\\s*$/.exec(value);
-        if (!match) return null;
-        const hour = Number(match[1]);
-        if (hour < 1 || hour > 12) return null;
-        return {{hour: hour, minute: Number(match[2] || 0), second: Number(match[3] || 0)}};
-    }}
-    function twoDigits(value) {{
-        return String(value).padStart(2, '0');
-    }}
-    function updateDateTimeEditor(editor, {{commit=false, normalize=false}}={{}}) {{
-        const stored = editor.querySelector('[data-datetime-value]');
-        const date = editor.querySelector('[data-datetime-date]');
-        const time = editor.querySelector('[data-datetime-time]');
-        const period = editor.querySelector('[data-datetime-period]');
-        const error = editor.querySelector('[data-datetime-error]');
-        const parsed = parseTypedTime(time.value);
-        const dateIsValid = Boolean(date.value) && date.validity.valid;
-        const valid = dateIsValid && parsed !== null;
-        date.setAttribute('aria-invalid', String(!dateIsValid));
-        time.setAttribute('aria-invalid', String(parsed === null));
-        error.hidden = valid;
-        if (!commit) return;
-        if (valid) {{
-            if (normalize) {{
-                time.value = `${{parsed.hour}}:${{twoDigits(parsed.minute)}}:${{twoDigits(parsed.second)}}`;
-            }}
-            const hour = (parsed.hour % 12) + (period.value === 'PM' ? 12 : 0);
-            stored.value = `${{date.value}}T${{twoDigits(hour)}}:${{twoDigits(parsed.minute)}}:${{twoDigits(parsed.second)}}`;
-        }} else {{
-            // Send an invalid value once the edit is committed so Python's
-            // existing validation prevents an accidental save of the old date.
-            stored.value = `${{date.value}}T${{time.value.trim()}} ${{period.value}}`;
-        }}
-        stored.dispatchEvent(new Event('input', {{bubbles: true}}));
-    }}
-    function initializeDateTimeEditors() {{
-        document.querySelectorAll('[data-datetime-editor]').forEach((editor) => {{
-            const date = editor.querySelector('[data-datetime-date]');
-            const time = editor.querySelector('[data-datetime-time]');
-            const period = editor.querySelector('[data-datetime-period]');
-            date.addEventListener('input', () => updateDateTimeEditor(editor));
-            time.addEventListener('input', () => updateDateTimeEditor(editor));
-            date.addEventListener('change', () => updateDateTimeEditor(editor, {{commit: true}}));
-            time.addEventListener('change', () => updateDateTimeEditor(editor, {{commit: true, normalize: true}}));
-            period.addEventListener('change', () => updateDateTimeEditor(editor, {{commit: true}}));
-            time.addEventListener('keydown', (event) => {{
-                if (event.key === 'Enter') {{
-                    event.preventDefault();
-                    time.blur();
-                }}
-            }});
-            updateDateTimeEditor(editor);
-        }});
-    }}
-    function refreshDependencies() {{
-        const curves = Boolean(valueFor(curvePath));
-        const graph = Boolean(valueFor(graphPath));
-        const rescheduling = Boolean(valueFor(reschedulePath));
-        function setDependencyDisabled(row, dependencyDisabled) {{
-            row.querySelectorAll('input, select, button').forEach((el) => {{
-                const unavailable = Boolean(el.closest('.rwkv-disabled-control-help'));
-                el.disabled = Boolean(dependencyDisabled) || unavailable;
-            }});
-        }}
-        document.querySelectorAll('.requires-curves').forEach((row) => {{
-            row.classList.toggle('disabled', !curves);
-            setDependencyDisabled(row, !curves);
-        }});
-        document.querySelectorAll('.curve-feature-card').forEach((card) => {{
-            card.classList.toggle('curves-disabled', !curves);
-        }});
-        document.querySelectorAll('[data-parent-path]').forEach((row) => {{
-            const needsCurves = row.classList.contains('requires-curves');
-            const parent = document.querySelector(
-                `[data-config-path="${{CSS.escape(row.dataset.parentPath)}}"]`,
-            );
-            const enabled = Boolean(valueFor(row.dataset.parentPath))
-                && !Boolean(parent && parent.disabled)
-                && (!needsCurves || curves);
-            row.classList.toggle('disabled', !enabled);
-            setDependencyDisabled(row, !enabled);
-        }});
-        document.querySelectorAll('[data-visible-path]').forEach((row) => {{
-            const visible = curves && Boolean(valueFor(row.dataset.visiblePath));
-            row.classList.toggle('conditional-hidden', !visible);
-        }});
-    }}
-    controls().forEach((control) => control.addEventListener('input', () => {{
-        refreshDependencies();
-        send('change', {{values: values()}});
-    }}));
-    initializeDateTimeEditors();
-    function setSettingsButtonDisabled(button, disabled) {{
-        if (!button) return;
-        button.disabled = Boolean(disabled);
-        button.setAttribute('aria-disabled', String(Boolean(disabled)));
-    }}
-    function setSettingsApplyEnabled(enabled) {{
-        settingsApplyEnabled = Boolean(enabled);
-        const button = document.getElementById('rwkv-settings-apply');
-        if (button && !settingsFooter.hidden) {{
-            setSettingsButtonDisabled(button, !settingsApplyEnabled);
-        }}
-    }}
-    function setSettingsFooterActive(active) {{
-        if (!settingsFooter) return;
-        const enabled = Boolean(active);
-        settingsFooter.hidden = !enabled;
-        settingsFooter.setAttribute('aria-hidden', String(!enabled));
-        settingsFooter.querySelectorAll('button').forEach((button) => {{
-            setSettingsButtonDisabled(
-                button,
-                !enabled || (
-                    button.id === 'rwkv-settings-apply' && !settingsApplyEnabled
-                ),
-            );
-        }});
-    }}
-    window.rwkvSetSettingsApplyEnabled = setSettingsApplyEnabled;
-    window.rwkvSetSettingsFooterActive = setSettingsFooterActive;
-    window.rwkvSetSpeedTestEnabled = (name, enabled) => {{
-        const button = document.getElementById(`speed-${{name}}`);
-        if (button) button.disabled = !enabled;
-    }};
-    window.rwkvSetComparisonEnabled = (name, enabled) => {{
-        const button = document.getElementById(`comparison-${{name}}`);
-        if (button) button.disabled = !enabled;
-    }};
-    {SETUP_WIZARD_SCRIPT}
-    refreshDependencies();
-}})();
-</script>
-""".strip()
 
 
 def config_from_web_values(
@@ -547,6 +258,8 @@ def config_from_web_values(
 ) -> dict[str, Any]:
     updated = deepcopy(dict(base))
     for option in options:
+        if option.value_type == "action":
+            continue
         name = option_path_name(option.key_path)
         if name not in values or values[name] is None:
             continue
@@ -565,6 +278,8 @@ def merge_config_option_values(
 ) -> dict[str, Any]:
     merged = deepcopy(dict(base))
     for option in options:
+        if option.value_type == "action":
+            continue
         value = _get_path(source, option.key_path)
         if value is not None:
             _set_path(merged, option.key_path, deepcopy(value))
@@ -586,355 +301,6 @@ def sanitize_choice_values(
         if current not in allowed:
             _set_path(sanitized, option.key_path, allowed[0])
     return sanitized
-
-
-def _render_settings_footer(*, apply_enabled: bool) -> str:
-    return render_footer(
-        (
-            ModalButton(
-                "Cancel",
-                "cancel",
-                variant="quiet",
-                button_id="rwkv-settings-cancel",
-            ),
-            ModalButton(
-                "Apply",
-                "apply",
-                variant="secondary",
-                disabled=not apply_enabled,
-                button_id="rwkv-settings-apply",
-            ),
-            ModalButton(
-                "OK",
-                "ok",
-                variant="primary",
-                button_id="rwkv-settings-ok",
-            ),
-        ),
-        leading_buttons=(
-            ModalButton(
-                "Restore Defaults",
-                "restore-defaults",
-                variant="quiet",
-                button_id="rwkv-settings-restore-defaults",
-            ),
-        ),
-        label="RWKV Settings actions",
-        footer_id="rwkv-settings-footer",
-    )
-
-
-def _render_page(
-    section: str,
-    *,
-    config: Mapping[str, Any],
-    options: Sequence[ConfigOption],
-    choices: Mapping[tuple[str, ...], Sequence[str]],
-    checkpoint_usable: bool,
-    capability_note: str,
-) -> str:
-    glossary = GlossaryRenderer(section)
-    page_intro = glossary.render(_PAGE_INTROS[section])
-    capability_html = glossary.render(capability_note) if capability_note else ""
-    page_options = tuple(option for option in options if option.section == section)
-    groups = tuple(dict.fromkeys(option.group for option in page_options))
-    rendered_groups = "\n".join(
-        _render_group(
-            section,
-            group,
-            config=config,
-            options=page_options,
-            choices=choices,
-            checkpoint_usable=checkpoint_usable,
-            glossary=glossary,
-        )
-        for group in groups
-    )
-    hidden = "" if section == "General" else " hidden"
-    help_button = render_setup_faq_help_button() if section == "General" else ""
-    return f"""
-<main class="page rwkv-tab-panel" role="tabpanel"
-      id="settings-page-{html.escape(section, quote=True)}"
-      aria-labelledby="rwkv-tab-settings-{html.escape(section.casefold(), quote=True)}"{hidden}>
-    <div class="settings-page-heading">
-      <h1 class="page-title">{html.escape(section)}</h1>
-      {help_button}
-    </div>
-    <p class="page-intro">{page_intro}</p>
-    {f'<div class="capability-note">{capability_html}</div>' if capability_html else ""}
-    {render_setup_launcher() if section == "General" else ""}
-    {rendered_groups}
-</main>
-""".strip()
-
-
-def _render_group(
-    section: str,
-    group: str,
-    *,
-    config: Mapping[str, Any],
-    options: Sequence[ConfigOption],
-    choices: Mapping[tuple[str, ...], Sequence[str]],
-    checkpoint_usable: bool,
-    glossary: GlossaryRenderer,
-) -> str:
-    group_options = tuple(option for option in options if option.group == group)
-    subsections = tuple(dict.fromkeys(option.subsection for option in group_options))
-    heading = glossary.render(group)
-    intro = _GROUP_INTROS.get((section, group), "")
-    intro_html = glossary.render(intro)
-    cards = "\n".join(
-        _render_card(
-            section,
-            group,
-            subsection,
-            config=config,
-            options=tuple(option for option in group_options if option.subsection == subsection),
-            choices=choices,
-            checkpoint_usable=checkpoint_usable,
-            glossary=glossary,
-        )
-        for subsection in subsections
-    )
-    grid_class = "settings-grid settings-grid--stacked" if section == "General" else "settings-grid"
-    return f"""
-<section class="major-group">
-    <h2>{heading}</h2>
-    <p class="group-intro">{intro_html}</p>
-    <div class="{grid_class}">{cards}</div>
-</section>
-""".strip()
-
-
-def _render_card(
-    section: str,
-    group: str,
-    subsection: str,
-    *,
-    config: Mapping[str, Any],
-    options: Sequence[ConfigOption],
-    choices: Mapping[tuple[str, ...], Sequence[str]],
-    checkpoint_usable: bool,
-    glossary: GlossaryRenderer,
-) -> str:
-    title = subsection or group
-    intro = _SUBSECTION_INTROS.get((section, group, subsection), "")
-    curve_card = subsection == "RWKV Forgetting Curve"
-    heading = f"<h3>{glossary.render(title)}</h3>" if subsection else ""
-    intro_html = f'<p class="subsection-intro">{glossary.render(intro)}</p>' if intro else ""
-    curve_note = (
-        '<div class="curve-disabled-note">'
-        + glossary.render(
-            "Enable Calculate Forgetting Curves under Performance to use these features."
-        )
-        + "</div>"
-        if curve_card
-        else ""
-    )
-    rows = "\n".join(
-        _render_option(
-            option,
-            config=config,
-            choices=choices.get(option.key_path, ()),
-            checkpoint_usable=checkpoint_usable,
-            glossary=glossary,
-        )
-        for option in options
-    )
-    card_class = "settings-card curve-feature-card" if curve_card else "settings-card"
-    return f'<section class="{card_class}">{heading}{intro_html}{curve_note}{rows}</section>'
-
-
-def _render_option(
-    option: ConfigOption,
-    *,
-    config: Mapping[str, Any],
-    choices: Sequence[str],
-    checkpoint_usable: bool,
-    glossary: GlossaryRenderer,
-) -> str:
-    path_name = option_path_name(option.key_path)
-    value = _get_path(config, option.key_path)
-    display_value = not bool(value) if option.inverted else value
-    classes = ["setting"]
-    if option.value_type == "datetime":
-        classes.append("setting-datetime")
-    attributes = [f'data-option-row="{html.escape(path_name, quote=True)}"']
-    if option.requires_curves:
-        classes.append("requires-curves")
-    if option.parent_key_path:
-        attributes.append(
-            f'data-parent-path="{html.escape(option_path_name(option.parent_key_path), quote=True)}"'
-        )
-    if option.visible_when_key_path:
-        attributes.append(
-            f'data-visible-path="{html.escape(option_path_name(option.visible_when_key_path), quote=True)}"'
-        )
-    restart = (
-        '<span class="restart-badge" tabindex="0" '
-        f'data-rwkv-tooltip="{html.escape(option.restart_tooltip, quote=True)}">'
-        f"{html.escape(option.restart_badge)}</span>"
-        if option.restart_required
-        else ""
-    )
-    rebuild = (
-        '<span class="rebuild-badge" tabindex="0" '
-        'data-rwkv-tooltip="Changing this setting may require rebuilding '
-        'the RWKV checkpoint">Rebuild</span>'
-        if option.checkpoint_rebuild_required
-        else ""
-    )
-    rendered_label = glossary.render(option.label)
-    rendered_description = glossary.render(option.tooltip)
-    control_id = html.escape(_config_control_id(path_name), quote=True)
-    title = (
-        f'<div class="setting-title">{rendered_label}{restart}{rebuild}</div>'
-        if option.value_type == "datetime"
-        else (
-            f'<label class="setting-title" for="{control_id}">'
-            f"{rendered_label}{restart}{rebuild}</label>"
-        )
-    )
-    control = _render_control(
-        option,
-        path_name=path_name,
-        value=display_value,
-        choices=choices,
-    )
-    if option.speed_test:
-        reason = (
-            "Run this benchmark using the current checkpoint."
-            if checkpoint_usable
-            else "Unavailable: speed tests require an idle, usable checkpoint. Use "
-            "RWKV > Manage Checkpoint to initialize or rebuild it, or finish the RWKV "
-            "operation currently using it."
-        )
-        speed_button = render_button(
-            ModalButton(
-                _SPEED_BUTTON_LABELS[option.speed_test],
-                "speed-test",
-                variant="secondary",
-                payload={"test": option.speed_test},
-                disabled=not checkpoint_usable,
-                button_id=f"speed-{option.speed_test}",
-                tooltip=reason if checkpoint_usable else None,
-            )
-        )
-        if not checkpoint_usable:
-            escaped_reason = html.escape(reason, quote=True)
-            escaped_label = html.escape(_SPEED_BUTTON_LABELS[option.speed_test], quote=True)
-            speed_button = (
-                '<span class="rwkv-disabled-control-help rwkv-help-surface" tabindex="0" '
-                f'aria-label="{escaped_label}. {escaped_reason}" '
-                f'data-rwkv-tooltip="{escaped_reason}">{speed_button}</span>'
-            )
-        control += speed_button
-    if option.comparison:
-        control += render_button(
-            ModalButton(
-                _COMPARISON_BUTTON_LABELS[option.comparison],
-                "comparison",
-                variant="secondary",
-                payload={"comparison": option.comparison},
-                button_id=f"comparison-{option.comparison}",
-                tooltip="Build disposable states and compare RWKV Immediate accuracy.",
-            )
-        )
-    return f"""
-<div class="{" ".join(classes)}" {" ".join(attributes)}>
-    <div>
-        {title}
-        <div class="setting-description">{rendered_description}</div>
-    </div>
-    <div class="control">{control}</div>
-</div>
-""".strip()
-
-
-def _render_control(
-    option: ConfigOption,
-    *,
-    path_name: str,
-    value: Any,
-    choices: Sequence[str],
-) -> str:
-    escaped_path = html.escape(path_name, quote=True)
-    control_id = html.escape(_config_control_id(path_name), quote=True)
-    if option.value_type == "bool":
-        checked = " checked" if bool(value) else ""
-        return (
-            f'<label class="rwkv-switch" for="{control_id}">'
-            f'<input id="{control_id}" type="checkbox" data-config-path="{escaped_path}" '
-            f'aria-label="{html.escape(option.label, quote=True)}"{checked}>'
-            '<span class="rwkv-switch__track" aria-hidden="true"></span>'
-            "</label>"
-        )
-    if option.value_type == "choice":
-        selected_value = str(value or "")
-        rendered = "".join(
-            f'<option value="{html.escape(str(item), quote=True)}"'
-            f"{' selected' if str(item) == selected_value else ''}>"
-            f"{html.escape(_choice_label(str(item)))}</option>"
-            for item in choices
-        )
-        return f'<select id="{control_id}" data-config-path="{escaped_path}">{rendered}</select>'
-    if option.value_type == "int":
-        suffix = (
-            '<span class="unit">cards</span>' if option.speed_test == "live-predictions" else ""
-        )
-        number_input = render_number_input(
-            ModalField(
-                name=path_name,
-                label=option.label,
-                kind="number",
-                value=int(value or 0),
-                minimum=None if option.minimum is None else int(option.minimum),
-                maximum=None if option.maximum is None else int(option.maximum),
-                step=1,
-                required=True,
-            ),
-            control_id=_config_control_id(path_name),
-            data_attributes={"data-config-path": path_name},
-        )
-        return f'<div class="rwkv-field rwkv-settings-number-field">{number_input}</div>{suffix}'
-    if option.value_type == "datetime":
-        date_value, time_value, period = _datetime_control_parts(value)
-        error_id = control_id + "-error"
-        return (
-            '<div class="datetime-editor" data-datetime-editor>'
-            f'<input id="{control_id}" type="hidden" data-config-path="{escaped_path}" '
-            f'data-datetime-value value="{html.escape(str(value or ""), quote=True)}">'
-            '<label class="datetime-part">'
-            '<span class="datetime-part-label">Date</span>'
-            f'<input class="datetime-date" type="date" data-datetime-date '
-            f'aria-describedby="{error_id}" value="{html.escape(date_value, quote=True)}">'
-            "</label>"
-            '<label class="datetime-part">'
-            '<span class="datetime-part-label" tabindex="0" '
-            'data-rwkv-tooltip="Type an hour, or a time such as 9:30 or 9:30:15">Time</span>'
-            f'<input class="datetime-time" type="text" data-datetime-time '
-            f'aria-describedby="{error_id}" autocomplete="off" spellcheck="false" '
-            f'placeholder="h:mm:ss" '
-            f'value="{html.escape(time_value, quote=True)}">'
-            "</label>"
-            '<label class="datetime-part">'
-            '<span class="datetime-part-label">AM / PM</span>'
-            '<select class="datetime-period" data-datetime-period>'
-            f'<option value="AM"{" selected" if period == "AM" else ""}>AM</option>'
-            f'<option value="PM"{" selected" if period == "PM" else ""}>PM</option>'
-            "</select></label>"
-            f'<span id="{error_id}" class="datetime-error" data-datetime-error role="alert" hidden>'
-            "Enter a date and a time from 1:00:00 to 12:59:59.</span>"
-            "</div>"
-        )
-    return (
-        f'<input id="{control_id}" type="text" data-config-path="{escaped_path}" '
-        f'value="{html.escape(str(value or ""), quote=True)}">'
-    )
-
-
-def _config_control_id(path_name: str) -> str:
-    return "config-" + path_name.replace("/", "-")
 
 
 def _coerce_value(
@@ -1006,7 +372,9 @@ def _set_path(config: dict[str, Any], path: tuple[str, ...], value: Any) -> None
 
 
 def _choice_label(value: str) -> str:
-    return "GPU" if value.lower() == "gpu" else value.replace("_", " ").title()
+    if value.casefold() in MODEL_GENERATIONS:
+        return model_generation_label(value)
+    return prediction_mode_label(value)
 
 
 def _capability_note(*, predict_gpu_available: bool, process_gpu_available: bool) -> str:
@@ -1017,12 +385,3 @@ def _capability_note(*, predict_gpu_available: bool, process_gpu_available: bool
     if process_gpu_available:
         return "GPU acceleration is available for State Building, but not Predictions."
     return "No compatible GPU acceleration was detected. RWKV will use CPU Fast."
-
-
-def _script_json(value: Any) -> str:
-    return (
-        json.dumps(value, ensure_ascii=False)
-        .replace("&", "\\u0026")
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-    )

@@ -51,7 +51,8 @@ separate parameter set for each user, the benchmark trained one shared model on
 5,000 users and evaluated it on different users, repeating the split for full
 coverage.
 
-One trained recurrent model and state provide two useful kinds of prediction:
+The V1 model and state provide two useful kinds of prediction; V5o-a supports
+Immediate predictions only:
 
 - **RWKV Immediate (RWKV-P)** estimates recall immediately before a review.
   Because it incorporates the latest answers from across the collection, it is
@@ -75,7 +76,7 @@ the same margin for every individual collection.
 - **Immediate and Forgetting Curve tools:** inspect Card Info, calculate average
   retrievability, and generate filtered decks from RWKV predictions.
 - **Evaluation and calibration:** compare predictions with actual review
-  outcomes using Log Loss, RMSE(bins), calibration graphs, and Live Session
+  outcomes using Log Loss, RMSE(bins), AUC, calibration graphs, and Live Session
   history.
 - **CPU and GPU support:** choose optimized CPU modes or compatible GPU modes
   for prediction and large state builds. The setup wizard can benchmark the
@@ -87,6 +88,39 @@ the same margin for every individual collection.
   loaded while studying.
 - **Local checkpoints:** preserve RWKV’s recurrent collection state so it does
   not need to be rebuilt whenever Anki starts.
+
+Supported model generations are V1 (Immediate and curves) and V5 (Immediate,
+using V5o-a). Both support optionally including deleted-card review history in
+state building; deleted cards are never offered for study. New profiles
+default to V1. Select V5 in **Settings → Advanced → RWKV State Settings → RWKV
+Generation**. Forgetting-curve features and Behavior Lab are available with V1.
+
+**V5o-a is experimental and intended to be superseded by a future model
+generation.** It is an optional model choice, not the new-profile default.
+
+### Model choices and precision
+
+- **Bundled models:** two V1 models and V5o-a for the V5 generation.
+- **FP16 card/note storage is on for new configurations.** It halves those tensor
+  payloads, not total RAM or checkpoint size. Rounding can slightly change
+  predictions. Existing FP16 or FP32 choices are preserved. Switching storage
+  precision requires a full history rebuild.
+- **GPU (Full FP16) is the default prediction mode on supported hardware.**
+  Half-precision GPU math can improve throughput, with small prediction and
+  near-threshold ordering differences. It is independent of storage precision;
+  changing prediction math does not require rebuilding state. CPU Fast remains
+  available when GPU support is unavailable. Guided Setup compares Fast with
+  Full FP16 and selects the fastest successful measurement.
+- **Compare before changing.** Setup's optional accuracy tuning offers
+  **Compare Storage Sizes (FP16 vs FP32)**. Advanced Settings also compares
+  storage precision and GPU prediction differences; General **Compare Modes**
+  measures prediction throughput. Storage comparisons are disposable and never
+  automatically change precision or retain a checkpoint.
+
+Changing model generation, underlying weights, deleted-card history policy, or
+storage precision requires a compatible checkpoint or a history rebuild. Simply
+installing an update does not convert an existing checkpoint's precision. Keep
+normal Anki backups and allow the add-on to rebuild incompatible state.
 
 RWKV4Anki requires Anki Desktop 26.05 or newer on Windows, macOS, or Linux. The
 add-on manifest records 26.05 as the currently tested Anki release without
@@ -143,9 +177,11 @@ python scripts/package_addon.py --version dev
 
 The packager downloads only the exact RWKV-SRS wheel selected by
 `rwkv-srs.lock.json` and verifies the release’s hashes and provenance. It also
-downloads the two stable models declared by `rwkv-models.lock.json`, verifies
-their SHA-256 values, and includes them in the resulting add-on. Anki does not
-download the runtime or models after installation.
+downloads the three stable models declared by `rwkv-models.lock.json` (two V1
+models and V5o-a), verifies
+their SHA-256 values, and includes them in their generation-specific
+`rwkv_srs/pretrained/v1/` or `rwkv_srs/pretrained/v5/` directories. Anki does
+not download the runtime or models after installation.
 
 Official GitHub Releases build each architecture on a matching native runner.
 They also include `SHA256SUMS` and `RELEASE_PROVENANCE.json`, which bind every

@@ -25,14 +25,73 @@ __all__ = (
     "ranked_metric_style",
     "relative_metric_percent",
     "relative_metric_style",
+    "render_improvement_cell",
+    "render_metric_header",
+    "render_metric_pair_cell",
     "render_report_document",
     "render_report_footnotes",
     "render_report_metric_cell",
+    "render_sortable_header",
     "report_palette",
     "semantic_metric_style",
 )
 
 _ATTRIBUTE_NAME = re.compile(r"(?:aria|data)-[a-z0-9_.:-]+\Z")
+
+
+def render_metric_header(metric: str, *, sources: Sequence[tuple[str, str, str]]) -> str:
+    """Paired metric heading; each source supplies its label, sort key and accessible label."""
+    separator = (
+        '<span class="rwkv-evaluation-metric-header__separator" aria-hidden="true"> | </span>'
+    )
+    buttons = separator.join(
+        _render_sort_button(label, key=key, sort_label=sort_label, kind="number")
+        for label, key, sort_label in sources
+    )
+    return (
+        '<th scope="col" class="rwkv-number rwkv-evaluation-metric-header">'
+        f'<span class="rwkv-evaluation-metric-header__name">{html.escape(metric)}</span>'
+        '<span class="rwkv-evaluation-metric-header__sources">'
+        f"{buttons}</span></th>"
+    )
+
+
+def render_sortable_header(
+    visible_label: str, *, key: str, sort_label: str, kind: str, classes: str
+) -> str:
+    return (
+        f'<th scope="col" class="{html.escape(classes, quote=True)}">'
+        + _render_sort_button(visible_label, key=key, sort_label=sort_label, kind=kind)
+        + "</th>"
+    )
+
+
+def _render_sort_button(visible_label: str, *, key: str, sort_label: str, kind: str) -> str:
+    if kind not in {"number", "text"}:
+        raise ValueError(f"unsupported table sort kind: {kind!r}")
+    escaped_sort_label = html.escape(sort_label, quote=True)
+    return (
+        '<button type="button" class="rwkv-table-sort-button" '
+        f'data-rwkv-sort-key="{html.escape(key, quote=True)}" '
+        f'data-rwkv-sort-kind="{kind}" '
+        f'data-rwkv-sort-label="{escaped_sort_label}" '
+        f'aria-label="Sort by {escaped_sort_label}, ascending" aria-pressed="false">'
+        f"<span>{html.escape(visible_label)}</span>"
+        '<span class="rwkv-table-sort-indicator" aria-hidden="true"></span>'
+        "</button>"
+    )
+
+
+def render_metric_pair_cell(baseline_value: str, value: str) -> str:
+    pair = f"{baseline_value or '—'} | {value or '—'}" if baseline_value or value else ""
+    return f'<td class="rwkv-number rwkv-evaluation-metric-pair">{html.escape(pair)}</td>'
+
+
+def render_improvement_cell(value: str, state: str) -> str:
+    classes = ["rwkv-number", "rwkv-evaluation-improvement-cell"]
+    if state in {"better", "worse"}:
+        classes.append(f"rwkv-evaluation-cell--{state}")
+    return f'<td class="{html.escape(" ".join(classes), quote=True)}">{html.escape(value)}</td>'
 
 
 class MetricDirection(str, Enum):
@@ -121,6 +180,7 @@ def report_palette(
             MetricTone.NEUTRAL: "#222222" if neutral == "gray" else "#665713",
             MetricTone.LOSS: "#762024",
         }
+
     def foreground_for(tone: MetricTone) -> str:
         if foreground == "tone":
             return tone_foregrounds[tone]

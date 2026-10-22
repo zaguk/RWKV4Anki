@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ from .review_load_policy import (
     DEFAULT_MINIMUM_RETENTION_STEP,
     is_same_day_elapsed,
     select_with_minimum_retention,
+    validate_random_card_percent,
 )
 from .review_rows import ReviewData, prediction_rows_for_card_ids
 from .rwkv_modes import (
@@ -41,6 +43,10 @@ class FilteredDeckSettings:
     minimum: int = 0
     minimum_retention_extra_quantum: float = DEFAULT_MINIMUM_RETENTION_STEP
     adaptive_retention: AdaptiveRetentionSettings | None = None
+    random_card_percent: float = 0.0
+
+    def __post_init__(self) -> None:
+        validate_random_card_percent(self.random_card_percent)
 
 
 @dataclass(frozen=True)
@@ -174,6 +180,9 @@ def filtered_deck_candidate_search(
     search = base_search.strip()
     if settings.same_day_only:
         search = f"{search} rated:1" if search else "rated:1"
+    elif settings.random_card_percent > 0:
+        # Match Anki's gathering exclusions before drawing from the universe.
+        search = f"{search} -is:buried -deck:filtered".strip()
     return required_search_with_filter(search, extra_search)
 
 
@@ -259,7 +268,7 @@ def select_candidates_with_minimum(
         if order == FilteredDeckOrder.RANDOM
         else {}
     )
-    return select_with_minimum_retention(
+    eligible, selected, extra = select_with_minimum_retention(
         candidate_list,
         limit=settings.limit,
         minimum=settings.minimum,
@@ -273,6 +282,36 @@ def select_candidates_with_minimum(
         desired_retention=lambda candidate: candidate.active_desired_retention,
         allow_widening=lambda candidate: not _candidate_is_intraday(candidate),
     )
+    if settings.random_card_percent > 0 and not settings.same_day_only:
+        ordered = selected
+        pool = {
+            candidate.card_id: candidate
+            for candidate in candidate_list
+            if candidate.elapsed_days >= 1 and math.isfinite(candidate.predicted_retrievability)
+        }
+        pool_ids = list(pool)
+        positions = {card_id: index for index, card_id in enumerate(pool_ids)}
+        chosen: set[int] = set()
+        normal = iter(ordered)
+        selected = []
+        for _ in range(min(settings.limit, len(candidate_list))):
+            if random.random() < settings.random_card_percent / 100.0 and pool_ids:
+                candidate = pool[random.choice(pool_ids)]
+            else:
+                candidate = next((value for value in normal if value.card_id not in chosen), None)
+                if candidate is None:
+                    break
+            selected.append(candidate)
+            chosen.add(candidate.card_id)
+            # O(1) removal from the uniform pool, without materializing card IDs
+            # repeatedly for large filtered decks.
+            index = positions.pop(candidate.card_id, None)
+            if index is not None:
+                last = pool_ids.pop()
+                if index < len(pool_ids):
+                    pool_ids[index] = last
+                    positions[last] = index
+    return eligible, selected, extra
 
 
 def _candidate_is_intraday(candidate: FilteredDeckCandidate) -> bool:

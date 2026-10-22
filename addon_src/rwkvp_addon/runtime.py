@@ -3,12 +3,15 @@ from __future__ import annotations
 from .addon_config import (
     addon_config_for_mw,
     checkpoint_save_interval,
+    configured_model_generation,
     configured_model_id,
     enabled_prediction_cache_specs,
     exclude_deleted_card_revlogs,
+    gpu_prediction_math,
     predict_many_batch_size,
     predict_many_mode,
     process_many_mode,
+    state_precision,
 )
 from .anki_api import profile_name
 from .checkpoint_manager import CheckpointBusyError, RWKVCheckpointManager
@@ -22,12 +25,14 @@ from .rwkv_performance_modes import (
 _manager: RWKVCheckpointManager | None = None
 _manager_profile: str | None = None
 _manager_model_id: str | None = None
+_manager_model_generation: str | None = None
 
 
 def manager_for_mw(mw) -> RWKVCheckpointManager:
-    global _manager, _manager_model_id, _manager_profile
+    global _manager, _manager_model_generation, _manager_model_id, _manager_profile
     name = profile_name(mw)
     config = addon_config_for_mw(mw)
+    model_generation = configured_model_generation(config)
     model_id = configured_model_id(config)
     prediction_cache_specs = enabled_prediction_cache_specs(config)
     configured_predict_many_mode = predict_many_mode(config)
@@ -40,6 +45,16 @@ def manager_for_mw(mw) -> RWKVCheckpointManager:
         ),
     )
     configured_process_many_mode = process_many_mode(config)
+    configured_precision = state_precision(config)
+    configured_math = gpu_prediction_math(config)
+    math_changed = bool(
+        _manager is not None
+        and getattr(_manager, "gpu_prediction_math", "fp32") != configured_math
+    )
+    precision_changed = bool(
+        _manager is not None
+        and getattr(_manager, "state_precision", "fp32") != configured_precision
+    )
     configured_save_interval = checkpoint_save_interval(config)
     configured_exclude_deleted = exclude_deleted_card_revlogs(config)
     store = (
@@ -57,17 +72,31 @@ def manager_for_mw(mw) -> RWKVCheckpointManager:
         _manager is None
         or _manager_profile != name
         or _manager_model_id != model_id
+        or _manager_model_generation != model_generation
         or policy_changed
+        or precision_changed
+        or math_changed
     ):
         if _manager is not None:
             if (
                 _manager_profile == name
-                and (_manager_model_id != model_id or policy_changed)
+                and (
+                    _manager_model_id != model_id
+                    or _manager_model_generation != model_generation
+                    or policy_changed
+                    or precision_changed
+                    or math_changed
+                )
                 and bool(getattr(_manager, "runtime_scope_active", False))
             ):
                 setting = (
                     "the RWKV model"
-                    if _manager_model_id != model_id
+                    if (
+                        _manager_model_id != model_id
+                        or _manager_model_generation != model_generation
+                        or precision_changed
+                        or math_changed
+                    )
                     else "Filtered-review interpretation"
                 )
                 raise CheckpointBusyError(
@@ -77,6 +106,9 @@ def manager_for_mw(mw) -> RWKVCheckpointManager:
         _manager = RWKVCheckpointManager(
             store,
             model_id=model_id,
+            model_generation=model_generation,
+            state_precision=configured_precision,
+            gpu_prediction_math=configured_math,
             prediction_cache_specs=prediction_cache_specs,
             predict_many_mode=configured_predict_many_mode,
             predict_many_batch_size=configured_batch_size,
@@ -89,6 +121,7 @@ def manager_for_mw(mw) -> RWKVCheckpointManager:
             _manager.filtered_review_normalization_policy = normalization_policy
         _manager_profile = name
         _manager_model_id = model_id
+        _manager_model_generation = model_generation
     else:
         # Prediction mode and review-history GPU selection are per-call. Every
         # add-on-owned processing runtime uses the Fast CPU profile, so Fast and
@@ -115,9 +148,10 @@ def store_for_mw(mw) -> ProfileStore:
 
 
 def reset_runtime() -> None:
-    global _manager, _manager_model_id, _manager_profile
+    global _manager, _manager_model_generation, _manager_model_id, _manager_profile
     if _manager is not None:
         _manager.unload()
     _manager = None
     _manager_profile = None
     _manager_model_id = None
+    _manager_model_generation = None

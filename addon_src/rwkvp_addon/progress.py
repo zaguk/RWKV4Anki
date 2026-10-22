@@ -1,7 +1,63 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
+
+ProgressCallback = Callable[[int, int, str, float | None], None]
+
+
+class CoalescedProgressCallback:
+    """Keep at most one queued UI delivery, replacing it with the latest report.
+
+    Posting is thread-safe; delivery runs only through the supplied scheduler.
+    Closing discards pending and later reports without blocking the worker.
+    """
+
+    def __init__(
+        self,
+        callback: ProgressCallback,
+        *,
+        schedule: Callable[[Callable[[], None]], None],
+    ) -> None:
+        self._callback = callback
+        self._schedule = schedule
+        self._lock = Lock()
+        self._pending: tuple[int, int, str, float | None] | None = None
+        self._scheduled = False
+        self._closed = False
+
+    def __call__(self, current: int, total: int, label: str, eta: float | None) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._pending = (current, total, label, eta)
+            if self._scheduled:
+                return
+            self._scheduled = True
+        try:
+            # Scheduling outside the lock also supports immediate schedulers.
+            self._schedule(self._flush)
+        except Exception:
+            with self._lock:
+                self._scheduled = False
+                self._pending = None
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._pending = None
+
+    def _flush(self) -> None:
+        with self._lock:
+            pending = self._pending
+            self._pending = None
+            self._scheduled = False
+            if self._closed or pending is None:
+                return
+        self._callback(*pending)
 
 
 class CancelledError(RuntimeError):

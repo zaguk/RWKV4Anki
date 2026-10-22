@@ -6,19 +6,22 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .live_retention_table_html import render_live_retention_table
+from .live_retention_payload import live_retention_table_data
 from .live_review_history import (
+    LIVE_REVIEW_SCHEDULING_LABELS,
     LiveReviewHistoryOverview,
     LiveReviewHistorySession,
     LiveReviewPeriod,
+    LiveReviewScheduling,
     records_in_live_review_period,
 )
-from .live_review_history_html import render_live_review_history_html
+from .live_review_history_html import live_history_session_key, render_live_review_history_html
 from .live_review_stats import (
     LiveRetentionRecord,
     LiveRetentionSummary,
     summarize_live_retention_records,
 )
+from .progress import ProgressReporter
 from .web_dialog_bridge import BridgePayloadError, WebDialogCommand
 from .web_dialog_controller import BaseWebDialogController
 
@@ -30,6 +33,8 @@ SELECT_DECK_ACTION = "select-deck"
 APPLY_SEARCH_ACTION = "apply-search"
 SET_RECENT_PAGE_ACTION = "set-recent-page"
 SET_ALL_REVIEWS_PERIOD_ACTION = "set-all-reviews-period"
+SET_SCHEDULING_ACTION = "set-scheduling"
+SET_COMPARISON_ACTION = "set-comparison"
 
 
 class LiveReviewHistorySearchUnavailable(RuntimeError):
@@ -41,6 +46,7 @@ class _DerivedHistoryKey:
     source_revision: int
     deck_filter: str
     search_revision: int
+    scheduling: LiveReviewScheduling
     include_fsrs: bool
     recent_session_page_size: int
 
@@ -52,14 +58,29 @@ class _DerivedHistoryData:
     summary: LiveRetentionSummary
     matching_session_count: int
     recent_page_count: int
-    retention_table_html: str
+    retention_table_data: dict
 
 
 @dataclass(frozen=True, slots=True)
 class _AllReviewsDisplayData:
     summary: LiveRetentionSummary
     matching_session_count: int
-    retention_table_html: str
+    retention_table_data: dict
+
+
+@dataclass(frozen=True, slots=True)
+class LiveHistoryMetricsRequest:
+    key: tuple[_DerivedHistoryKey, LiveReviewPeriod]
+    summary: LiveRetentionSummary | None
+    session_index: int | None = None
+    session_summary: LiveRetentionSummary | None = None
+
+    def same_selection(self, other: LiveHistoryMetricsRequest | None) -> bool:
+        # Compare identities only: equality on summaries would traverse records.
+        return (
+            other is not None and self.key == other.key
+            and self.session_index == other.session_index
+        )
 
 
 class LiveReviewHistoryController(BaseWebDialogController):
@@ -71,6 +92,8 @@ class LiveReviewHistoryController(BaseWebDialogController):
             APPLY_SEARCH_ACTION,
             SET_RECENT_PAGE_ACTION,
             SET_ALL_REVIEWS_PERIOD_ACTION,
+            SET_SCHEDULING_ACTION,
+            SET_COMPARISON_ACTION,
         }
     )
 
@@ -98,6 +121,14 @@ class LiveReviewHistoryController(BaseWebDialogController):
         self._overview = overview
         self._search_card_ids_callback = search_card_ids
         self._include_fsrs = bool(include_fsrs)
+        self._metrics_cache: dict[
+            tuple[_DerivedHistoryKey, LiveReviewPeriod], _AllReviewsDisplayData,
+        ] = {}
+        # Indices refer to the current filtered snapshot; filters invalidate it.
+        # Retain only the small rendered table, not another copy of the records.
+        self._session_metrics_cache: dict[int, dict] = {}
+        self._metrics_message = "RMSE(bins) and AUC have not been calculated for this selection."
+        self.log_loss = False
         self.is_dark = bool(is_dark)
         self.recent_session_page_size = max(1, int(recent_session_page_size))
         self._deck_options = deck_filter_options(overview.sessions)
@@ -116,12 +147,17 @@ class LiveReviewHistoryController(BaseWebDialogController):
         ] = {}
         self._next_day_at_seconds = next_day_at_seconds
         self._selected_review_period = LiveReviewPeriod.ALL
+        self._selected_scheduling = LiveReviewScheduling.ALL
+        self._scheduling_focus = False
         self._review_period_focus = False
         self._recent_session_page = 0
         self._recent_sessions_expanded = False
         self._recent_page_focus: str | None = None
         self._restore_scroll_y: float | None = None
         self._rerender: Callable[[], Any] | None = None
+        self._request_metrics: Callable[[], Any] | None = None
+        self._active_session_key: str | None = None
+        self._comparison_focus: str | None = None
 
     @property
     def overview(self) -> LiveReviewHistoryOverview:
@@ -168,6 +204,10 @@ class LiveReviewHistoryController(BaseWebDialogController):
         return self._selected_review_period
 
     @property
+    def selected_scheduling(self) -> LiveReviewScheduling:
+        return self._selected_scheduling
+
+    @property
     def recent_session_page(self) -> int:
         return self._recent_session_page
 
@@ -179,6 +219,81 @@ class LiveReviewHistoryController(BaseWebDialogController):
         if not callable(rerender):
             raise TypeError("Live Review History rerender callback must be callable")
         self._rerender = rerender
+
+    def prepare_display(self, progress: ProgressReporter | None = None) -> None:
+        """Warm the initial pure-Python report off-thread before host attachment."""
+        self._all_reviews_display_data(self._derived_history_data(progress=progress))
+
+    def attach_metrics_loader(self, loader: Callable[[], Any]) -> None:
+        self._request_metrics = loader
+
+    def metrics_request(self) -> LiveHistoryMetricsRequest | None:
+        """Capture immutable inputs; expensive metrics belong to the worker."""
+        if not self.log_loss:
+            return None
+        derived = self._derived_history_data()
+        key = (derived.key, self._selected_review_period)
+        summary = (
+            None if key in self._metrics_cache else self._all_reviews_display_data(derived).summary
+        )
+        session_index = self._session_index(self._active_session_key, derived)
+        session_summary = None
+        if session_index is not None and session_index not in self._session_metrics_cache:
+            session_summary = derived.sessions[session_index].summary
+        else:
+            session_index = None
+        if summary is None and session_summary is None:
+            return None
+        return LiveHistoryMetricsRequest(key, summary, session_index, session_summary)
+
+    def finish_metrics(
+        self, request: LiveHistoryMetricsRequest, summary: LiveRetentionSummary | None,
+        *, session_summary: LiveRetentionSummary | None = None, message: str = "",
+    ) -> bool:
+        if not request.same_selection(self.metrics_request()):
+            return False
+        if (request.summary is None) != (summary is None) or (
+            (request.session_summary is None) != (session_summary is None)
+        ):
+            raise ValueError("Live metrics results do not match the requested scopes.")
+        if summary is not None:
+            display = self._all_reviews_display_data(self._derived_history_data())
+            self._metrics_cache[request.key] = _AllReviewsDisplayData(
+                summary=summary, matching_session_count=display.matching_session_count,
+                retention_table_data=live_retention_table_data(
+                    summary, include_fsrs=self.include_fsrs, include_rmse_bins=True,
+                    include_auc=True, rmse_message=message,
+                ),
+            )
+        if session_summary is not None:
+            assert request.session_index is not None
+            self._session_metrics_cache[request.session_index] = live_retention_table_data(
+                session_summary, include_fsrs=self.include_fsrs, include_rmse_bins=True,
+                include_auc=True, rmse_message=message,
+            )
+        self._request_rerender()
+        return True
+
+    def cancel_metrics(self, request: LiveHistoryMetricsRequest, message: str) -> bool:
+        if not request.same_selection(self.metrics_request()):
+            return False
+        self._metrics_message = message
+        # Keep the request uncached so switching back to Metrics can retry.
+        if self._rerender is not None:
+            self._rerender()
+        return True
+
+    def _session_index(
+        self, session_key: str | None, derived: _DerivedHistoryData,
+    ) -> int | None:
+        if session_key is None:
+            return None
+        start = self._recent_session_page * self.recent_session_page_size
+        stop = min(start + self.recent_session_page_size, len(derived.sessions))
+        for index in range(start, stop):
+            if session_key == live_history_session_key(index):
+                return index
+        raise BridgePayloadError("Selected Live Session is not available on this page.")
 
     def replace_overview(self, overview: LiveReviewHistoryOverview) -> None:
         """Replace the immutable source snapshot and invalidate derived history.
@@ -213,9 +328,19 @@ class LiveReviewHistoryController(BaseWebDialogController):
             recent_sessions_expanded=self._recent_sessions_expanded,
             recent_page_focus=self._recent_page_focus,
             restore_scroll_y=restore_scroll_y,
-            retention_table_html=display.retention_table_html,
+            retention_table_data=(
+                live_retention_table_data(
+                    display.summary, include_fsrs=self.include_fsrs, include_rmse_bins=True,
+                    include_auc=True, rmse_message=self._metrics_message,
+                ) if self.log_loss and (derived.key, self._selected_review_period)
+                not in self._metrics_cache else display.retention_table_data
+            ),
+            session_metric_tables=self._session_metrics_cache,
+            session_metrics_message=self._metrics_message,
             selected_review_period=self._selected_review_period,
             review_period_focus=self._review_period_focus,
+            selected_scheduling=self._selected_scheduling,
+            scheduling_focus=self._scheduling_focus,
             filter_description=self.filter_description(),
             deck_options=self._deck_options,
             selected_deck_filter=self._selected_deck_filter,
@@ -223,13 +348,56 @@ class LiveReviewHistoryController(BaseWebDialogController):
             include_fsrs=self.include_fsrs,
             is_dark=self.is_dark,
             generation=generation,
+            log_loss=self.log_loss,
+            active_session_key=self._active_session_key,
+            comparison_focus=self._comparison_focus,
         )
         self._recent_page_focus = None
         self._review_period_focus = False
+        self._scheduling_focus = False
         self._restore_scroll_y = None
+        self._comparison_focus = None
         return rendered
 
     def handle_command(self, command: WebDialogCommand) -> dict[str, bool]:
+        if command.action == SET_COMPARISON_ACTION:
+            values = command.payload
+            if (
+                set(values) != {"log_loss", "scroll_y", "recent_expanded", "session_key", "focus"}
+                or not isinstance(values["log_loss"], bool)
+                or not isinstance(values["recent_expanded"], bool)
+                or not isinstance(values["focus"], str)
+                or values["focus"] not in {
+                    "history_comparison", "recent_comparison", "detail_comparison",
+                }
+                or (
+                    values["session_key"] is not None
+                    and not isinstance(values["session_key"], str)
+                )
+            ):
+                raise BridgePayloadError("Invalid Live comparison selection.")
+            scroll_y = _scroll_y_value(values["scroll_y"], label="Live comparison")
+            self._session_index(values["session_key"], self._derived_history_data())
+            self.log_loss = values["log_loss"]
+            self._restore_scroll_y = scroll_y
+            self._recent_sessions_expanded = values["recent_expanded"]
+            self._active_session_key = values["session_key"]
+            self._comparison_focus = values["focus"]
+            # The browser switches immediately without destroying open details.
+            if self.log_loss and self._request_metrics is not None:
+                self._request_metrics()
+            return {"updated": True}
+        self._active_session_key = None
+        self._comparison_focus = None
+        if command.action in self.actions and "log_loss" in command.payload:
+            log_loss = command.payload["log_loss"]
+            if not isinstance(log_loss, bool):
+                raise BridgePayloadError("Live comparison mode must be a boolean.")
+            self.log_loss = log_loss
+            command = replace(
+                command,
+                payload={key: value for key, value in command.payload.items() if key != "log_loss"},
+            )
         if command.action == SELECT_DECK_ACTION:
             deck_filter, search_input = _filter_form_values(command.payload)
             self._select_deck(deck_filter)
@@ -269,6 +437,20 @@ class LiveReviewHistoryController(BaseWebDialogController):
             self._request_rerender()
             return {"updated": True}
 
+        if command.action == SET_SCHEDULING_ACTION:
+            scheduling, scroll_y, search_input = _scheduling_values(command.payload)
+            if scheduling is not self._selected_scheduling:
+                self._selected_scheduling = scheduling
+                self._invalidate_derived_cache()
+                self._recent_session_page = 0
+            self._search_input = search_input
+            self._recent_page_focus = None
+            self._review_period_focus = False
+            self._scheduling_focus = True
+            self._restore_scroll_y = scroll_y
+            self._request_rerender()
+            return {"updated": True}
+
         raise BridgePayloadError(f"Unhandled Live Review History action: {command.action}")
 
     def filtered_sessions(self) -> tuple[LiveReviewHistorySession, ...]:
@@ -285,16 +467,20 @@ class LiveReviewHistoryController(BaseWebDialogController):
             filtered_session = session_matching_card_ids(
                 session,
                 self._matching_card_ids,
+                scheduling=self._selected_scheduling,
             )
             if filtered_session is not None:
                 sessions.append(filtered_session)
         return tuple(sessions)
 
-    def _derived_history_data(self) -> _DerivedHistoryData:
+    def _derived_history_data(
+        self, *, progress: ProgressReporter | None = None,
+    ) -> _DerivedHistoryData:
         key = _DerivedHistoryKey(
             source_revision=self._source_revision,
             deck_filter=self._selected_deck_filter,
             search_revision=self._search_revision,
+            scheduling=self._selected_scheduling,
             include_fsrs=self._include_fsrs,
             recent_session_page_size=self.recent_session_page_size,
         )
@@ -306,6 +492,7 @@ class LiveReviewHistoryController(BaseWebDialogController):
         summary = summarize_live_retention_records(
             records_for_sessions(sessions),
             skipped_count=sum(session.skipped_count for session in sessions),
+            progress=progress,
         )
         derived = _DerivedHistoryData(
             key=key,
@@ -316,9 +503,11 @@ class LiveReviewHistoryController(BaseWebDialogController):
                 len(sessions),
                 self.recent_session_page_size,
             ),
-            retention_table_html=render_live_retention_table(
+            retention_table_data=live_retention_table_data(
                 summary,
                 include_fsrs=self._include_fsrs,
+                include_rmse_bins=True,
+                include_auc=True,
             ),
         )
         self._derived_cache = derived
@@ -329,14 +518,16 @@ class LiveReviewHistoryController(BaseWebDialogController):
         derived: _DerivedHistoryData,
     ) -> _AllReviewsDisplayData:
         period = self._selected_review_period
+        key = (derived.key, period)
+        if key in self._metrics_cache:
+            return self._metrics_cache[key]
         if period is LiveReviewPeriod.ALL:
             return _AllReviewsDisplayData(
                 summary=derived.summary,
                 matching_session_count=derived.matching_session_count,
-                retention_table_html=derived.retention_table_html,
+                retention_table_data=derived.retention_table_data,
             )
 
-        key = (derived.key, period)
         cached = self._all_reviews_display_cache.get(key)
         if cached is not None:
             return cached
@@ -357,9 +548,11 @@ class LiveReviewHistoryController(BaseWebDialogController):
         display = _AllReviewsDisplayData(
             summary=summary,
             matching_session_count=matching_session_count,
-            retention_table_html=render_live_retention_table(
+            retention_table_data=live_retention_table_data(
                 summary,
                 include_fsrs=self._include_fsrs,
+                include_rmse_bins=True,
+                include_auc=True,
             ),
         )
         self._all_reviews_display_cache[key] = display
@@ -374,7 +567,10 @@ class LiveReviewHistoryController(BaseWebDialogController):
         search_description = search_filter_label(self._applied_search_query)
         if self._search_error:
             search_description = f"{search_description} ({self._search_error})"
-        return f"Live Session Selected Deck: {deck_label} · Anki Search: {search_description}"
+        return (
+            f"Live Session Selected Deck: {deck_label} · Anki Search: {search_description}"
+            f" · Scheduling: {LIVE_REVIEW_SCHEDULING_LABELS[self._selected_scheduling]}"
+        )
 
     def _select_deck(self, deck_filter: str) -> None:
         valid_filters = {ALL_DECK_FILTER, *self._deck_labels}
@@ -407,27 +603,41 @@ class LiveReviewHistoryController(BaseWebDialogController):
     def _invalidate_derived_cache(self) -> None:
         self._derived_cache = None
         self._all_reviews_display_cache.clear()
+        self._metrics_cache.clear()
+        self._session_metrics_cache.clear()
+        self._metrics_message = "RMSE(bins) and AUC have not been calculated for this selection."
 
     def _reset_recent_sessions_view(self) -> None:
         self._recent_session_page = 0
         self._recent_sessions_expanded = False
         self._recent_page_focus = None
         self._review_period_focus = False
+        self._scheduling_focus = False
         self._restore_scroll_y = None
+        self._active_session_key = None
+        self._comparison_focus = None
 
     def _request_rerender(self) -> None:
         if self._rerender is None:
             raise RuntimeError("Live Review History controller is not attached to its dialog")
-        self._rerender()
+        if self.metrics_request() is not None and self._request_metrics is not None:
+            self._request_metrics()
+        else:
+            self._rerender()
 
 
 def session_matching_card_ids(
     session: LiveReviewHistorySession,
     card_ids: frozenset[int] | None,
+    *,
+    scheduling: LiveReviewScheduling = LiveReviewScheduling.ALL,
 ) -> LiveReviewHistorySession | None:
-    if card_ids is None:
+    if card_ids is None and scheduling is LiveReviewScheduling.ALL:
         return session
-    records = tuple(record for record in session.summary.records if int(record.card_id) in card_ids)
+    records = tuple(
+        record for record in session.summary.records
+        if (card_ids is None or int(record.card_id) in card_ids) and scheduling.includes(record)
+    )
     if not records:
         return None
     return replace(
@@ -547,3 +757,22 @@ def _scroll_y_value(value: Any, *, label: str) -> float:
     ):
         raise BridgePayloadError(f"{label} window position must be non-negative.")
     return float(scroll_y)
+
+
+def _scheduling_values(payload: Mapping[str, Any]) -> tuple[LiveReviewScheduling, float, str]:
+    if set(payload) != {"scheduling", "scroll_y", "search_query"}:
+        raise BridgePayloadError(
+            "Scheduling selection requires scheduling, window position and search text."
+        )
+    value = payload["scheduling"]
+    if not isinstance(value, str) or not isinstance(payload["search_query"], str):
+        raise BridgePayloadError("Scheduling selection and search must be text.")
+    try:
+        scheduling = LiveReviewScheduling(value)
+    except ValueError as exc:
+        raise BridgePayloadError("Scheduling selection is not available.") from exc
+    return (
+        scheduling,
+        _scroll_y_value(payload["scroll_y"], label="Scheduling"),
+        payload["search_query"],
+    )

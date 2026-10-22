@@ -3,12 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from ..modal_html import (
-    ProgressState,
-    render_modal_document,
-    render_progress_region,
-    render_status_state,
-)
+from ..svelte_ui import render_svelte_document
 from ..web_dialog_controller import BaseWebDialogController
 
 StatusState = Literal["empty", "loading", "disabled", "error", "success"]
@@ -27,25 +22,16 @@ class StandaloneOverlayController(BaseWebDialogController):
     inline_progress: bool = False
 
     def render_html(self, generation: int) -> str:
-        body_html = (
-            render_progress_region(
-                ProgressState(
-                    title=self.title,
-                    label=self.status_message,
-                    cancellable=True,
-                )
-            )
-            if self.inline_progress
-            else render_status_state(
-                title=self.status_title,
-                message=self.status_message,
-                state=self.status_state,
-            )
-        )
-        return render_modal_document(
+        return render_svelte_document(
+            "standalone",
+            {
+                "status_title": self.status_title,
+                "status_message": self.status_message,
+                "status_state": self.status_state,
+                "inline_progress": self.inline_progress,
+            },
             title=self.title,
             intro=self.intro,
-            body_html=body_html,
             generation=generation,
             is_dark=self.is_dark,
             width="compact",

@@ -322,7 +322,6 @@ def start_web_progress(
         status_message=label,
         status_state="loading",
         size=(620, 330),
-        intro="This operation can be cancelled without blocking Anki.",
         inline_progress=True,
     )
     return dialog.start_web_progress(

@@ -34,6 +34,7 @@ class CachedProcessManySpeed:
     reviews_per_minute: float
     measured_at: float = 0.0
     source: str = "speed_test"
+    state_precision: str = "fp32"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ def cache_process_many_speed_test(
     result: ProcessManySpeedTestResult,
     *,
     measured_at: float | None = None,
+    state_precision: str = "fp32",
 ) -> None:
     """Remember the largest completed process_many() measurement per mode."""
 
@@ -80,6 +82,7 @@ def cache_process_many_speed_test(
                 reviews_per_minute=rate,
                 measured_at=measurement_time,
                 source="speed_test",
+                state_precision=state_precision,
             )
         )
 
@@ -91,6 +94,7 @@ def cache_process_many_curve_speed_test(
     result: ProcessManyCurveSpeedTestResult,
     *,
     measured_at: float | None = None,
+    state_precision: str = "fp32",
 ) -> None:
     """Remember both exact rates from the curve on/off comparison."""
 
@@ -113,6 +117,7 @@ def cache_process_many_curve_speed_test(
                 reviews_per_minute=rate,
                 measured_at=measurement_time,
                 source="curve_speed_test",
+                state_precision=state_precision,
             )
         )
 
@@ -126,6 +131,7 @@ def cache_setup_process_mode_benchmark(
     model_id: str,
     return_curves: bool,
     measured_at: float | None = None,
+    state_precision: str = "fp32",
 ) -> None:
     """Remember completed Guided Setup state-building measurements.
 
@@ -161,6 +167,7 @@ def cache_setup_process_mode_benchmark(
                 reviews_per_minute=rate,
                 measured_at=measurement_time,
                 source="setup_wizard",
+                state_precision=state_precision,
             )
         )
 
@@ -176,6 +183,7 @@ def cache_completed_checkpoint_build(
     review_count: int,
     duration_seconds: float,
     measured_at: float | None = None,
+    state_precision: str = "fp32",
 ) -> CachedProcessManySpeed | None:
     """Remember the observed rate of a successfully completed full build."""
 
@@ -198,12 +206,15 @@ def cache_completed_checkpoint_build(
         reviews_per_minute=count * 60.0 / duration,
         measured_at=_measurement_time(measured_at),
         source="checkpoint_build",
+        state_precision=state_precision,
     )
     _cache_entries(path, [entry])
     return entry
 
 
 def _cache_entries(path: Path, new_entries: list[CachedProcessManySpeed]) -> None:
+    if any(entry.state_precision not in {"fp16", "fp32"} for entry in new_entries):
+        raise ValueError("State precision must be fp16 or fp32.")
     entries = {_entry_key(entry): entry for entry in _read_entries(path)}
     for entry in new_entries:
         existing = entries.get(_entry_key(entry))
@@ -220,6 +231,7 @@ def _cache_entries(path: Path, new_entries: list[CachedProcessManySpeed]) -> Non
                     entries.values(),
                     key=lambda item: (
                         item.model_id,
+                        item.state_precision,
                         item.return_curves,
                         item.mode,
                     ),
@@ -235,12 +247,14 @@ def cached_process_many_speed(
     model_id: str,
     return_curves: bool,
     mode: str,
+    state_precision: str = "fp32",
 ) -> CachedProcessManySpeed | None:
     return _matching_cached_speed(
         _read_entries(path),
         model_id=model_id,
         return_curves=return_curves,
         mode=mode,
+        state_precision=state_precision,
     )
 
 
@@ -250,6 +264,7 @@ def checkpoint_build_speed_estimate(
     model_id: str,
     return_curves: bool,
     mode: str,
+    state_precision: str = "fp32",
 ) -> CheckpointBuildSpeedEstimate:
     """Choose the best defensible checkpoint-build throughput estimate.
 
@@ -261,7 +276,10 @@ def checkpoint_build_speed_estimate(
     reviews/minute fallback.
     """
 
-    entries = _read_entries(Path(path))
+    entries = tuple(
+        entry for entry in _read_entries(Path(path))
+        if entry.state_precision == state_precision
+    )
     wanted_model = str(model_id)
     wanted_curves = bool(return_curves)
     wanted_mode = str(mode)
@@ -271,6 +289,7 @@ def checkpoint_build_speed_estimate(
         model_id=wanted_model,
         return_curves=wanted_curves,
         mode=wanted_mode,
+        state_precision=state_precision,
     )
     if matching is not None:
         return CheckpointBuildSpeedEstimate(
@@ -285,6 +304,7 @@ def checkpoint_build_speed_estimate(
             model_id=wanted_model,
             return_curves=False,
             mode=wanted_mode,
+            state_precision=state_precision,
         )
         if selected_without_curves is not None:
             return CheckpointBuildSpeedEstimate(
@@ -302,6 +322,7 @@ def checkpoint_build_speed_estimate(
             model_id=wanted_model,
             return_curves=wanted_curves,
             mode=PROCESS_MANY_FAST_MODE,
+            state_precision=state_precision,
         )
         if cpu_matching is not None:
             return CheckpointBuildSpeedEstimate(
@@ -316,6 +337,7 @@ def checkpoint_build_speed_estimate(
                 model_id=wanted_model,
                 return_curves=False,
                 mode=PROCESS_MANY_FAST_MODE,
+                state_precision=state_precision,
             )
             if cpu_without_curves is not None:
                 return CheckpointBuildSpeedEstimate(
@@ -339,8 +361,9 @@ def _matching_cached_speed(
     model_id: object,
     return_curves: object,
     mode: object,
+    state_precision: str = "fp32",
 ) -> CachedProcessManySpeed | None:
-    wanted = (str(model_id), bool(return_curves), str(mode))
+    wanted = (str(model_id), bool(return_curves), str(mode), state_precision)
     return next((entry for entry in entries if _entry_key(entry) == wanted), None)
 
 
@@ -349,7 +372,10 @@ def _read_entries(path: Path) -> tuple[CachedProcessManySpeed, ...]:
         payload = read_json(Path(path))
     except (OSError, ValueError, TypeError):
         return ()
-    if payload.get("schema_version") != PROCESS_MANY_SPEED_CACHE_SCHEMA_VERSION:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != PROCESS_MANY_SPEED_CACHE_SCHEMA_VERSION
+    ):
         return ()
     raw_measurements = payload.get("measurements")
     if not isinstance(raw_measurements, list):
@@ -374,10 +400,12 @@ def _parse_entry(raw: Any) -> CachedProcessManySpeed | None:
         reviews_per_minute = float(raw["reviews_per_minute"])
         measured_at = float(raw.get("measured_at", 0.0))
         source = str(raw.get("source", "speed_test"))
-    except (KeyError, TypeError, ValueError):
+        precision = raw.get("state_precision", "fp32")
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
     if (
         not model_id
+        or precision not in ("fp16", "fp32")
         or not isinstance(return_curves, bool)
         or mode not in PROCESS_MANY_MODES
         or review_count <= 0
@@ -396,6 +424,7 @@ def _parse_entry(raw: Any) -> CachedProcessManySpeed | None:
         reviews_per_minute=reviews_per_minute,
         measured_at=measured_at,
         source=source,
+        state_precision=precision,
     )
 
 
@@ -410,13 +439,14 @@ def _largest_measurement_by_mode(
     return tuple(by_mode.values())
 
 
-def _entry_key(entry: CachedProcessManySpeed) -> tuple[str, bool, str]:
-    return (entry.model_id, entry.return_curves, entry.mode)
+def _entry_key(entry: CachedProcessManySpeed) -> tuple[str, bool, str, str]:
+    return (entry.model_id, entry.return_curves, entry.mode, entry.state_precision)
 
 
 def _entry_payload(entry: CachedProcessManySpeed) -> dict[str, Any]:
     return {
         "model_id": entry.model_id,
+        "state_precision": entry.state_precision,
         "return_curves": entry.return_curves,
         "mode": entry.mode,
         "review_count": entry.review_count,

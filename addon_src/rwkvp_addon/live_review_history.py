@@ -16,8 +16,9 @@ from .live_review_stats import (
     LiveRetentionSummary,
     summarize_live_retention_records,
 )
+from .progress import CancelledError, ProgressReporter
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SECONDS_PER_DAY = 86_400
 
 
@@ -27,6 +28,24 @@ class LiveReviewPeriod(str, Enum):
     THREE_MONTHS = "three_months"
     YEAR = "year"
     ALL = "all"
+
+
+class LiveReviewScheduling(str, Enum):
+    ALL = "all"
+    RWKV = "rwkv"
+    RANDOM = "random"
+
+    def includes(self, record: LiveRetentionRecord) -> bool:
+        if self is LiveReviewScheduling.ALL:
+            return True
+        return bool(record.randomly_selected) is (self is LiveReviewScheduling.RANDOM)
+
+
+LIVE_REVIEW_SCHEDULING_LABELS = {
+    LiveReviewScheduling.ALL: "All",
+    LiveReviewScheduling.RWKV: "RWKV-Scheduled",
+    LiveReviewScheduling.RANDOM: "Randomly Scheduled",
+}
 
 
 LIVE_REVIEW_PERIOD_DAYS: dict[LiveReviewPeriod, int | None] = {
@@ -184,8 +203,9 @@ def append_live_review_history_session(
                 rwkv_stability_days,
                 fsrs_difficulty,
                 answered_at_ms,
+                randomly_selected,
                 ordinal
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _review_values(resolved_session_id, record, ordinal)
@@ -199,36 +219,78 @@ def load_live_review_history(
     path: Path,
     *,
     session_limit: int | None = 200,
+    progress: ProgressReporter | None = None,
 ) -> LiveReviewHistoryOverview:
+    progress = progress or ProgressReporter()
+    progress.check_cancelled()
     if not path.exists():
         return LiveReviewHistoryOverview(
             summary=summarize_live_retention_records(()),
             sessions=(),
         )
-    with closing(sqlite3.connect(path)) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.row_factory = sqlite3.Row
-        _ensure_schema(db)
-        # Future improvement: compute the all-time overview with SQL aggregates so
-        # opening the history dialog does not hydrate every saved review row.
-        all_records = _records_from_rows(
-            db.execute(
+        cancelled: CancelledError | None = None
+
+        def check_sqlite_cancelled() -> int:
+            nonlocal cancelled
+            try:
+                progress.check_cancelled()
+            except CancelledError as exc:
+                cancelled = exc
+                return 1
+            return 0
+
+        # SQLite may spend time sorting before it yields its first row.
+        db.set_progress_handler(check_sqlite_cancelled, 10_000)
+        try:
+            _ensure_schema(db)
+            session_rows = _load_session_rows(db, session_limit=session_limit)
+            selected_sessions = {str(row["session_id"]) for row in session_rows}
+            total = int(db.execute("SELECT count(*) FROM live_review_reviews").fetchone()[0])
+            all_records: list[LiveRetentionRecord] = []
+            grouped: dict[str, list[tuple[int, int, LiveRetentionRecord]]] = defaultdict(list)
+            progress.update(0, total, "Reading saved Live reviews…")
+            for index, row in enumerate(db.execute(
                 """
                 SELECT *
                 FROM live_review_reviews
                 ORDER BY answered_at_ms, ordinal, review_id
                 """
-            ).fetchall()
-        )
-        session_rows = _load_session_rows(db, session_limit=session_limit)
-        records_by_session = _records_by_session(db, [row["session_id"] for row in session_rows])
+            )):
+                if index % 512 == 0:
+                    progress.update(index, total, "Reading saved Live reviews…")
+                record = _record_from_row(row)
+                if record is None:
+                    continue
+                all_records.append(record)
+                session_id = str(row["session_id"])
+                if session_id in selected_sessions:
+                    grouped[session_id].append((int(row["ordinal"]), record.review_id, record))
+            progress.update(total, total, "Read saved Live reviews")
+        except sqlite3.OperationalError:
+            if cancelled is not None:
+                raise cancelled from None
+            raise
+        finally:
+            db.set_progress_handler(None, 0)
 
-    sessions = tuple(
-        _history_session_from_row(row, records_by_session.get(row["session_id"], ()))
-        for row in session_rows
-    )
+    sessions = []
+    for index, row in enumerate(session_rows):
+        progress.update(index, len(session_rows), "Summarizing saved Live sessions…")
+        # Preserve the independent session ordinal order, even when answer
+        # timestamps are not monotonic. Hydrate each immutable record only once.
+        session_records = grouped.get(str(row["session_id"]), [])
+        session_records.sort(key=lambda item: (item[0], item[1]))
+        sessions.append(_history_session_from_row(
+            row, tuple(item[2] for item in session_records), progress=progress,
+        ))
+    progress.update(len(sessions), len(sessions), "Summarizing all saved Live reviews…")
+    summary = summarize_live_retention_records(all_records, progress=progress)
+    progress.check_cancelled()
     return LiveReviewHistoryOverview(
-        summary=summarize_live_retention_records(all_records),
-        sessions=sessions,
+        summary=summary,
+        sessions=tuple(sessions),
     )
 
 
@@ -280,6 +342,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             rwkv_stability_days REAL,
             fsrs_difficulty REAL,
             answered_at_ms INTEGER,
+            randomly_selected INTEGER NOT NULL DEFAULT 0,
             ordinal INTEGER NOT NULL,
             PRIMARY KEY (session_id, review_id),
             FOREIGN KEY (session_id)
@@ -288,6 +351,14 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         )
         """
     )
+    # Existing users' saved history predates random sampling. Missing flags
+    # belong to RWKV-Scheduled; only explicit random draws form the random cohort.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(live_review_reviews)")}
+    if "randomly_selected" not in columns:
+        db.execute(
+            "ALTER TABLE live_review_reviews "
+            "ADD COLUMN randomly_selected INTEGER NOT NULL DEFAULT 0"
+        )
     db.execute(
         """
         CREATE INDEX IF NOT EXISTS live_review_reviews_session_idx
@@ -321,46 +392,11 @@ def _load_session_rows(
     return list(db.execute(query + " LIMIT ?", (max(0, int(session_limit)),)).fetchall())
 
 
-def _records_by_session(
-    db: sqlite3.Connection,
-    session_ids: list[str],
-) -> dict[str, tuple[LiveRetentionRecord, ...]]:
-    if not session_ids:
-        return {}
-    grouped: dict[str, list[LiveRetentionRecord]] = defaultdict(list)
-    for batch in _session_id_batches(session_ids):
-        placeholders = ",".join("?" for _session_id in batch)
-        rows = db.execute(
-            f"""
-            SELECT *
-            FROM live_review_reviews
-            WHERE session_id IN ({placeholders})
-            ORDER BY session_id, ordinal, review_id
-            """,
-            tuple(batch),
-        ).fetchall()
-        for row in rows:
-            record = _record_from_row(row)
-            if record is not None:
-                grouped[str(row["session_id"])].append(record)
-    return {session_id: tuple(records) for session_id, records in grouped.items()}
-
-
-def _session_id_batches(
-    session_ids: list[str],
-    *,
-    batch_size: int = 500,
-) -> tuple[tuple[str, ...], ...]:
-    size = max(1, int(batch_size))
-    return tuple(
-        tuple(session_ids[index : index + size])
-        for index in range(0, len(session_ids), size)
-    )
-
-
 def _history_session_from_row(
     row: sqlite3.Row,
     records: tuple[LiveRetentionRecord, ...],
+    *,
+    progress: ProgressReporter | None = None,
 ) -> LiveReviewHistorySession:
     return LiveReviewHistorySession(
         session_id=str(row["session_id"]),
@@ -379,6 +415,7 @@ def _history_session_from_row(
         summary=summarize_live_retention_records(
             records,
             skipped_count=int(row["skipped_count"]),
+            progress=progress,
         ),
     )
 
@@ -404,17 +441,9 @@ def _review_values(
         _sqlite_float(record.rwkv_stability_days),
         _sqlite_float(record.fsrs_difficulty),
         _optional_int(record.answered_at_ms) or int(record.review_id),
+        _bool_int(record.randomly_selected),
         int(ordinal),
     )
-
-
-def _records_from_rows(rows: list[sqlite3.Row]) -> tuple[LiveRetentionRecord, ...]:
-    records = []
-    for row in rows:
-        record = _record_from_row(row)
-        if record is not None:
-            records.append(record)
-    return tuple(records)
 
 
 def _record_from_row(row: sqlite3.Row) -> LiveRetentionRecord | None:
@@ -444,6 +473,7 @@ def _record_from_row(row: sqlite3.Row) -> LiveRetentionRecord | None:
         rwkv_stability_days=_sqlite_optional_float(row["rwkv_stability_days"]),
         fsrs_difficulty=_sqlite_optional_float(row["fsrs_difficulty"]),
         answered_at_ms=_optional_int(row["answered_at_ms"]),
+        randomly_selected=row["randomly_selected"] == 1,
     )
 
 

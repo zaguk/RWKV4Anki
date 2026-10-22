@@ -4,9 +4,11 @@ import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from itertools import islice
+from typing import Any, TypeVar
 
 from .constants import DEFAULT_MODEL_ID
+from .model_generation import DEFAULT_MODEL_GENERATION
 from .prediction_cache import (
     PER_REVIEW_CACHE_SPEC,
     PREDICT_AHEAD_CACHE_SPEC,
@@ -18,7 +20,9 @@ from .prediction_cache import (
     load_prediction_value_cache,
 )
 from .profile_store import ProfileStore
-from .progress import ProgressReporter
+from .progress import CancelledError, ProgressReporter
+from .rmse_bins import RmseBinsAccumulator
+from .runtime_inputs import RuntimeInputContext
 from .rwkv_processing import new_rwkvp_runtime, process_review_rows
 from .rwkv_runtime_resources import release_runtime_resources
 
@@ -33,6 +37,7 @@ class EvaluationScope:
     deck_id: int | None = None
     preset_id: int | None = None
     preset_config_id: int | None = None
+    label_tooltip: str | None = None
 
     def with_card_ids(self, card_ids: Iterable[int]) -> EvaluationScope:
         return replace(self, card_ids=frozenset(int(card_id) for card_id in card_ids))
@@ -48,6 +53,7 @@ class MetricResult:
     rmse_bins: float | None
     log_loss: float | None
     error: str | None = None
+    auc: float | None = None
 
 
 @dataclass(frozen=True)
@@ -62,8 +68,18 @@ def calculate_rwkv_metrics(
     progress: ProgressReporter,
     *,
     model_id: str = DEFAULT_MODEL_ID,
+    model_generation: str = DEFAULT_MODEL_GENERATION,
+    input_context: RuntimeInputContext | None = None,
+    state_precision: str = "fp32",
 ) -> dict[str, MetricResult]:
-    predictions = rwkv_review_predictions(rows, progress, model_id=model_id)
+    prediction_kwargs: dict[str, Any] = {
+        "model_id": model_id,
+        "model_generation": model_generation,
+        "state_precision": state_precision,
+    }
+    if input_context is not None:
+        prediction_kwargs["input_context"] = input_context
+    predictions = rwkv_review_predictions(rows, progress, **prediction_kwargs)
     return calculate_scoped_metrics(predictions, scopes)
 
 
@@ -183,14 +199,22 @@ def rwkv_review_predictions(
     progress: ProgressReporter,
     *,
     model_id: str = DEFAULT_MODEL_ID,
+    model_generation: str = DEFAULT_MODEL_GENERATION,
+    input_context: RuntimeInputContext | None = None,
+    state_precision: str = "fp32",
 ) -> list[dict[str, Any]]:
-    runtime = new_rwkvp_runtime(model_id=model_id)
+    runtime = new_rwkvp_runtime(
+        model_id=model_id,
+        model_generation=model_generation,
+        state_precision=state_precision,
+    )
     try:
         return process_review_rows(
             runtime,
             rows,
             progress,
             label="Evaluating RWKV review predictions",
+            input_context=input_context,
         )
     finally:
         release_runtime_resources(runtime)
@@ -216,7 +240,7 @@ def calculate_scoped_metrics(
         )
         try:
             predictions = [float(row["prediction"]) for row in scoped]
-            rmse_bins, log_loss = _calculate_precomputed_metrics(
+            rmse_bins, log_loss, auc = _calculate_precomputed_metrics(
                 scoped,
                 predictions,
                 range(len(scoped)),
@@ -224,6 +248,7 @@ def calculate_scoped_metrics(
             results[scope.key] = MetricResult(
                 rmse_bins=rmse_bins,
                 log_loss=log_loss,
+                auc=auc,
             )
         except Exception as exc:
             results[scope.key] = MetricResult(None, None, str(exc))
@@ -256,6 +281,7 @@ def calculate_aligned_scoped_metrics(
     scopes: Sequence[EvaluationScope],
     *,
     target_review_ids_by_scope: dict[str, set[int]] | None = None,
+    progress: ProgressReporter | None = None,
 ) -> ScopedMetricResults:
     """Score aligned predictions without materializing per-review dictionaries.
 
@@ -275,7 +301,7 @@ def calculate_aligned_scoped_metrics(
     counts: dict[str, int] = {}
     all_indices = range(len(predictions))
 
-    for scope in scopes:
+    for scope in _cancellable_items(scopes, progress):
         target_ids = (
             None
             if target_review_ids_by_scope is None
@@ -286,30 +312,35 @@ def calculate_aligned_scoped_metrics(
         else:
             if index_by_review_id is None:
                 index_by_review_id = {
-                    int(row["review_id"]): index for index, row in enumerate(processed_rows)
+                    int(row["review_id"]): index
+                    for index, row in _cancellable_items(enumerate(processed_rows), progress)
                 }
             candidate_indices = sorted(
                 index_by_review_id[review_id]
-                for review_id in target_ids
+                for review_id in _cancellable_items(target_ids, progress)
                 if review_id in index_by_review_id
             )
         selected_indices = [
             index
-            for index in candidate_indices
+            for index in _cancellable_items(candidate_indices, progress)
             if row_matches_scope(processed_rows[index], scope)
             and _has_finite_prediction_value(predictions[index])
         ]
         counts[scope.key] = len(selected_indices)
         try:
-            rmse_bins, log_loss = _calculate_precomputed_metrics(
+            rmse_bins, log_loss, auc = _calculate_precomputed_metrics(
                 processed_rows,
                 predictions,
                 selected_indices,
+                progress=progress,
             )
             metrics[scope.key] = MetricResult(
                 rmse_bins=rmse_bins,
                 log_loss=log_loss,
+                auc=auc,
             )
+        except CancelledError:
+            raise
         except Exception as exc:
             metrics[scope.key] = MetricResult(None, None, str(exc))
 
@@ -352,6 +383,27 @@ def _has_finite_prediction(row: dict[str, Any]) -> bool:
 
 
 _FLOAT_EPS = 2.220446049250313e-16
+_MetricItem = TypeVar("_MetricItem")
+
+
+def _cancellable_items(
+    items: Iterable[_MetricItem], progress: ProgressReporter | None,
+) -> Iterable[_MetricItem]:
+    """Poll at bounded intervals without allocating chunks or polling every row."""
+
+    if progress is None:
+        yield from items
+        return
+    iterator = iter(items)
+    while True:
+        progress.check_cancelled()
+        chunk = islice(iterator, 10_000)
+        try:
+            first = next(chunk)
+        except StopIteration:
+            return
+        yield first
+        yield from chunk
 
 
 def _has_finite_prediction_value(prediction: float | None) -> bool:
@@ -367,12 +419,15 @@ def _calculate_precomputed_metrics(
     rows: Sequence[dict[str, Any]],
     predictions: Sequence[float | None],
     indices: Sequence[int],
-) -> tuple[float, float]:
-    grouped: dict[tuple[float, float, float], list[float]] = {}
+    *,
+    progress: ProgressReporter | None = None,
+) -> tuple[float, float, float | None]:
+    binned_rmse = RmseBinsAccumulator()
+    outcomes_by_prediction: dict[float, list[int]] = {}
     log_loss_sum = 0.0
     evaluated_count = 0
 
-    for index in indices:
+    for index in _cancellable_items(indices, progress):
         prediction = float(predictions[index])  # selected indices are finite/non-null
         if prediction < 0.0 or prediction > 1.0:
             raise ValueError(f"prediction must be between 0 and 1, got {prediction}")
@@ -397,58 +452,74 @@ def _calculate_precomputed_metrics(
         review_count = 1 if review_count_value is None else int(float(review_count_value))
         prior_lapses = 0 if prior_lapses_value is None else int(float(prior_lapses_value))
         actual = 0 if rating == 1 else 1
+        outcomes_by_prediction.setdefault(prediction, [0, 0])[actual] += 1
 
         clipped = min(max(prediction, _FLOAT_EPS), 1.0 - _FLOAT_EPS)
         log_loss_sum -= actual * math.log(clipped) + (1 - actual) * math.log(1.0 - clipped)
 
-        key = (
-            _elapsed_days_bin(elapsed_days),
-            _review_count_bin(review_count),
-            _lapse_count_bin(prior_lapses),
+        binned_rmse.add(
+            prediction, actual, elapsed_days=elapsed_days,
+            review_count=review_count, prior_lapses=prior_lapses,
         )
-        stats = grouped.setdefault(key, [0.0, 0.0, 0.0])
-        stats[0] += actual
-        stats[1] += prediction
-        stats[2] += 1.0
         evaluated_count += 1
 
     if evaluated_count <= 0:
         raise ValueError("No evaluable reviews after preprocessing.")
 
-    weighted_square_error = 0.0
-    total_weight = 0.0
-    # Evaluation-cache records do not store custom weights, so the reference
-    # calculator's group weight is exactly the number of rows in each bin.
-    for actual_sum, prediction_sum, count in grouped.values():
-        actual_mean = actual_sum / count
-        prediction_mean = prediction_sum / count
-        weighted_square_error += count * (actual_mean - prediction_mean) ** 2
-        total_weight += count
-
-    if total_weight <= 0.0:
+    rmse_bins = binned_rmse.value()
+    if rmse_bins is None:
         raise ValueError("RMSE(bins) requires a positive total weight.")
     return (
-        math.sqrt(weighted_square_error / total_weight),
+        rmse_bins,
         log_loss_sum / evaluated_count,
+        roc_auc_from_counts(outcomes_by_prediction, progress=progress),
     )
 
 
-def _elapsed_days_bin(elapsed_days: float) -> float:
-    value = max(elapsed_days, 1e-6)
-    return round(2.48 * 3.62 ** math.floor(math.log(value) / math.log(3.62)), 2)
+def roc_auc_from_counts(
+    outcomes_by_prediction: dict[float, list[int]],
+    *,
+    progress: ProgressReporter | None = None,
+) -> float | None:
+    """Match srs-benchmark's round(roc_auc_score(y, p), 6) without sklearn.
 
+    See srs-benchmark/utils.py::evaluate and rwkv/get_result.py::get_stats.
+    Count correctly ranked success/lapse pairs, giving tied scores half credit.
+    Use the original probabilities, not the clipping used only for LogLoss.
+    AUC is undefined when either outcome is absent; other metrics remain valid.
+    """
 
-def _review_count_bin(review_count: int) -> float:
-    return round(
-        1.99 * 1.89 ** math.floor(math.log(review_count) / math.log(1.89)),
-        0,
+    negatives = 0
+    positives = 0
+    for counts in _cancellable_items(outcomes_by_prediction.values(), progress):
+        negatives += counts[0]
+        positives += counts[1]
+    if not negatives or not positives:
+        return None
+
+    return roc_auc_from_sorted_counts(
+        (outcomes_by_prediction[p] for p in sorted(outcomes_by_prediction)),
+        negatives=negatives, positives=positives, progress=progress,
     )
 
 
-def _lapse_count_bin(prior_lapses: int) -> float:
-    if prior_lapses == 0:
-        return 0.0
-    return round(
-        1.65 * 1.73 ** math.floor(math.log(prior_lapses) / math.log(1.73)),
-        0,
-    )
+def roc_auc_from_sorted_counts(
+    ordered_counts: Iterable[Sequence[int]], *, negatives: int, positives: int,
+    progress: ProgressReporter | None = None,
+) -> float | None:
+    """Rank ascending, distinct-score (lapse, success) counts, with half-credit ties.
+
+    Shared by Evaluation and Live's overlapping cohorts. Zero-count entries
+    are harmless, so Live can reuse one ordering per model without sorting
+    each cohort again. Totals must describe this cohort, not the shared order.
+    """
+    if progress is not None:
+        progress.check_cancelled()
+    if not negatives or not positives:
+        return None
+    negatives_below = 0
+    twice_correct_pairs = 0
+    for tied_negatives, tied_positives in _cancellable_items(ordered_counts, progress):
+        twice_correct_pairs += tied_positives * (2 * negatives_below + tied_negatives)
+        negatives_below += tied_negatives
+    return round(twice_correct_pairs / (2 * negatives * positives), 6)

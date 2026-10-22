@@ -186,14 +186,30 @@ def build_evaluation_scope_descriptors(
 
     if include_presets:
         current_configs = col.decks.get_deck_configs_for_update(config_lookup_deck_id(col))
-        for preset in presets_from_configs(current_configs):
-            search = preset.param_search or f'preset:"{escape_search(preset.name)}" -is:suspended'
+        for wrapped in getattr(current_configs, "all_config", []):
+            use_count = getattr(wrapped, "use_count", None)
+            if use_count is not None and int(use_count) <= 0:
+                continue
+            preset = preset_from_config(wrapped.config)
+            uses_custom_search = bool(preset.param_search.strip())
+            search = (
+                preset.param_search
+                if uses_custom_search
+                else f'preset:"{escape_search(preset.name)}" -is:suspended'
+            )
             scopes.append(
                 EvaluationScope(
                     key=f"preset:{preset.config_id}",
-                    label=f"Preset: {preset.name}",
+                    label=f"Preset: {preset.name}{'*' if uses_custom_search else ''}",
                     kind="preset",
                     search=search,
+                    label_tooltip=(
+                        "This preset uses a custom FSRS search. Its evaluation includes "
+                        "cards matched by that search, which may differ from the decks "
+                        "assigned to the preset."
+                        if uses_custom_search
+                        else None
+                    ),
                     preset_config_id=preset.config_id,
                 )
             )
@@ -701,6 +717,7 @@ def create_filtered_deck_from_card_ids_with_changes(
     name: str,
     card_ids: list[int],
     order_index: int = 1,
+    preserve_card_order: bool = False,
 ):
     if not card_ids:
         raise ValueError("No cards were selected for the filtered deck.")
@@ -716,7 +733,26 @@ def create_filtered_deck_from_card_ids_with_changes(
     )
     deck.config.search_terms.extend([term])
     deck.config.reschedule = True
-    return col.sched.add_or_update_filtered_deck(deck)
+    result = col.sched.add_or_update_filtered_deck(deck)
+    if preserve_card_order:
+        # The search term can gather exactly these IDs, but Anki does not have
+        # a search order for an arbitrary mixed sequence. Reposition only cards
+        # actually moved into this newly created deck, preserving original due
+        # and all scheduling fields. Keep creation and order in one undo step.
+        undo_step = int(col.undo_status().last_step)
+        members = set(col.find_cards(f"did:{int(result.id)}"))
+        cards = []
+        for index, card_id in enumerate(dict.fromkeys(card_ids)):
+            if int(card_id) not in members:
+                continue
+            card = col.get_card(int(card_id))
+            if int(card.did) == int(result.id) and int(card.odid) != 0:
+                card.due = -len(card_ids) + index
+                cards.append(card)
+        if cards:
+            col.update_cards(cards)
+            result.changes.CopyFrom(col.merge_undo_entries(undo_step))
+    return result
 
 
 def ensure_no_deck_name_collision(

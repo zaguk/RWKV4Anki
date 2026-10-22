@@ -20,6 +20,7 @@ __all__ = (
     "render_chart_tooltip",
     "render_count_y_ticks",
     "render_empty_chart_state",
+    "render_model_comparison_legend",
     "render_percent_x_ticks",
     "render_percent_y_ticks",
     "render_plot_background",
@@ -294,9 +295,35 @@ def render_empty_chart_state(
 
 
 def render_chart_tooltip() -> str:
+    return '<div class="rwkv-chart-tooltip" data-rwkv-chart-tooltip hidden></div>'
+
+
+def render_model_comparison_legend(
+    *,
+    rwkv_detail: str = "",
+    fsrs_detail: str = "",
+    include_perfect: bool = False,
+    active_label: str = "RWKV",
+    comparison_label: str = "FSRS",
+) -> str:
+    """Shared model colors and semantic legend for Calibration and UM+."""
+    items = []
+    for model, label, detail in (
+        ("rwkv", active_label, rwkv_detail),
+        ("fsrs", comparison_label, fsrs_detail),
+    ):
+        text = label + (f" · {detail}" if detail else "")
+        items.append(
+            f'<li><span class="rwkvp-legend-line rwkvp-legend-{model}" '
+            f'aria-hidden="true"></span>{html.escape(text)}</li>'
+        )
+    if include_perfect:
+        items.append(
+            '<li><span class="rwkvp-legend-line rwkvp-legend-perfect" '
+            'aria-hidden="true"></span>Perfect calibration</li>'
+        )
     return (
-        '<div class="rwkv-chart-tooltip" '
-        'data-rwkv-chart-tooltip hidden></div>'
+        '<ul class="rwkvp-calibration-legend" aria-label="Chart legend">' + "".join(items) + "</ul>"
     )
 
 
@@ -355,6 +382,41 @@ def _svg_number(value: float) -> str:
 
 
 _BASE_CHART_CSS = """
+.rwkvp-model-comparison {
+  --rwkvp-fsrs-color: #d85260;
+}
+html.night-mode .rwkvp-model-comparison,
+body.night-mode .rwkvp-model-comparison {
+  --rwkvp-fsrs-color: #f07f87;
+}
+.rwkvp-calibration-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.rwkvp-calibration-legend li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.rwkvp-legend-line {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 26px;
+  border-top: 2px solid #3b82f6;
+}
+.rwkvp-legend-fsrs {
+  border-color: var(--rwkvp-fsrs-color);
+  border-top-width: 1.5px;
+}
+.rwkvp-legend-perfect {
+  border-color: #f59e0b;
+  border-top-width: 1.5px;
+}
 .rwkvp-embedded-graph {
   color: var(--rwkv-fg);
   padding: 4px 6px 2px;
@@ -465,6 +527,7 @@ _IMMEDIATE_TOOLTIP_SCRIPT = """
     }
     chart.querySelectorAll("[data-rwkv-chart-tooltip-text]").forEach((point) => {
       point.addEventListener("mouseenter", show);
+      point.addEventListener("focus", show);
       point.addEventListener("mousemove", move);
       point.addEventListener("mouseleave", hide);
       point.addEventListener("blur", hide);

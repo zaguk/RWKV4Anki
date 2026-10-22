@@ -204,37 +204,72 @@ class PackedProcessReviewRows(Sequence[Mapping[str, Any]]):
         review_count: int,
         prior_lapses: int,
     ) -> None:
+        self._append_prepared_values(
+            review_id=int(review_id), card_id=int(card_id), note_id=note_id,
+            deck_id=deck_id, preset_id=preset_id, raw_day_offset=int(raw_day_offset),
+            day_offset=float(day_offset), elapsed_days=float(elapsed_days),
+            elapsed_seconds=float(elapsed_seconds), rating=int(rating), duration=float(duration),
+            taken_millis=int(taken_millis), state=float(state), review_kind=int(review_kind),
+            interval=int(interval), last_interval=int(last_interval), ease_factor=int(ease_factor),
+            review_count=int(review_count), prior_lapses=int(prior_lapses),
+        )
+
+    def _append_prepared_values(
+        self,
+        *,
+        review_id: int,
+        card_id: int,
+        note_id: int | None,
+        deck_id: int | None,
+        preset_id: int | None,
+        raw_day_offset: int,
+        day_offset: float,
+        elapsed_days: float,
+        elapsed_seconds: float,
+        rating: int,
+        duration: float,
+        taken_millis: int,
+        state: float,
+        review_kind: int,
+        interval: int,
+        last_interval: int,
+        ease_factor: int,
+        review_count: int,
+        prior_lapses: int,
+    ) -> None:
+        """Append canonical loader scalars without converting them a second time."""
+
         if not self._appendable or len(self._segments) != 1:
             raise TypeError("Packed review history is sealed and cannot be appended.")
         segment = self._segments[0]
         segment.native.extend(
             NATIVE_PROCESS_REVIEW_RECORD.pack(
-                int(review_id),
-                int(card_id),
-                int(note_id is not None),
+                review_id,
+                card_id,
+                note_id is not None,
                 0 if note_id is None else note_id,
-                int(deck_id is not None),
+                deck_id is not None,
                 0 if deck_id is None else deck_id,
-                int(preset_id is not None),
+                preset_id is not None,
                 0 if preset_id is None else preset_id,
-                float(day_offset),
-                float(elapsed_days),
-                float(elapsed_seconds),
-                int(rating),
-                float(duration),
-                float(state),
+                day_offset,
+                elapsed_days,
+                elapsed_seconds,
+                rating,
+                duration,
+                state,
             )
         )
         segment.auxiliary.extend(
             _PROCESS_AUXILIARY_RECORD.pack(
-                int(raw_day_offset),
-                int(taken_millis),
-                int(review_kind),
-                int(interval),
-                int(last_interval),
-                int(ease_factor),
-                int(review_count),
-                int(prior_lapses),
+                raw_day_offset,
+                taken_millis,
+                review_kind,
+                interval,
+                last_interval,
+                ease_factor,
+                review_count,
+                prior_lapses,
             )
         )
         segment.count += 1
@@ -339,6 +374,20 @@ class PackedProcessReviewRows(Sequence[Mapping[str, Any]]):
                 local_index * NATIVE_PROCESS_REVIEW_RECORD.size,
             )
             yield int(native[0]), int(native[1])
+
+    def iter_answer_scalar_values(self) -> Iterator[tuple[int, int, int, int]]:
+        """Yield exact source IDs/duration/rating without per-review mappings."""
+
+        for absolute in range(self._start, self._stop):
+            segment_index, local_index = self._locate(absolute)
+            segment = self._segments[segment_index]
+            native = NATIVE_PROCESS_REVIEW_RECORD.unpack_from(
+                segment.native, local_index * NATIVE_PROCESS_REVIEW_RECORD.size,
+            )
+            auxiliary = _PROCESS_AUXILIARY_RECORD.unpack_from(
+                segment.auxiliary, local_index * _PROCESS_AUXILIARY_RECORD.size,
+            )
+            yield native[0], native[1], auxiliary[1], native[11]
 
     def iter_history_fingerprint_values(self) -> Iterator[tuple[Any, ...]]:
         """Yield values in ``HISTORY_FINGERPRINT_FIELDS`` order."""
@@ -658,27 +707,54 @@ class PackedRevlogRows(Sequence[Mapping[str, Any]]):
         ease_factor: int,
         days_elapsed: int,
     ) -> None:
+        self._append_prepared_values(
+            review_id=int(review_id), card_id=int(card_id), note_id=note_id,
+            deck_id=deck_id, preset_id=preset_id, rating=int(rating), duration=float(duration),
+            taken_millis=int(taken_millis), review_kind=int(review_kind), interval=int(interval),
+            last_interval=int(last_interval), ease_factor=int(ease_factor),
+            days_elapsed=int(days_elapsed),
+        )
+
+    def _append_prepared_values(
+        self,
+        *,
+        review_id: int,
+        card_id: int,
+        note_id: int | None,
+        deck_id: int | None,
+        preset_id: int | None,
+        rating: int,
+        duration: float,
+        taken_millis: int,
+        review_kind: int,
+        interval: int,
+        last_interval: int,
+        ease_factor: int,
+        days_elapsed: int,
+    ) -> None:
+        """Append already-normalized full-loader fields without repeat coercion."""
+
         if not self._appendable or len(self._segments) != 1:
             raise TypeError("Packed revlog history is sealed and cannot be appended.")
         segment = self._segments[0]
         segment.records.extend(
             _REVLOG_RECORD.pack(
-                int(review_id),
-                int(card_id),
-                int(note_id is not None),
+                review_id,
+                card_id,
+                note_id is not None,
                 0 if note_id is None else note_id,
-                int(deck_id is not None),
+                deck_id is not None,
                 0 if deck_id is None else deck_id,
-                int(preset_id is not None),
+                preset_id is not None,
                 0 if preset_id is None else preset_id,
-                int(rating),
-                float(duration),
-                int(taken_millis),
-                int(review_kind),
-                int(interval),
-                int(last_interval),
-                int(ease_factor),
-                int(days_elapsed),
+                rating,
+                duration,
+                taken_millis,
+                review_kind,
+                interval,
+                last_interval,
+                ease_factor,
+                days_elapsed,
             )
         )
         segment.count += 1

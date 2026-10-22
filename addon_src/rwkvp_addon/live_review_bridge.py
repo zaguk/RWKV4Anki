@@ -27,6 +27,7 @@ LIVE_FILTERED_DECK_ORDER = 0
 LIVE_FILTERED_DECK_BUFFER_SIZE = 2
 LIVE_FILTERED_DECK_MAX_REFILL_BUILDS = 5
 
+
 class LiveBridgeStatus(Enum):
     REFILLED = "refilled"
     EMPTY = "empty"
@@ -34,6 +35,10 @@ class LiveBridgeStatus(Enum):
     PAUSED_FOR_UNDO = "paused_for_undo"
     STOPPED_LIMIT = "stopped_limit"
     TRACKED_DECK_UNAVAILABLE = "tracked_deck_unavailable"
+
+
+class LiveReviewDeckUndoError(RuntimeError):
+    """A Live Session deck mutation could not be joined to Anki's undo history."""
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,6 @@ class LiveReviewBridgeSession:
         card: Any,
         *,
         fsrs_prediction: float | None = None,
-        pre_answer_undo_target: int | None = None,
     ) -> bool:
         if not self.active or self.filtered_deck_id is None:
             return False
@@ -90,12 +94,22 @@ class LiveReviewBridgeSession:
             self.current_pre_answer_undo_target = None
             self.pending_pre_answer_undo_target = None
             return False
-        self.current_card_id = _card_id(card)
-        if pre_answer_undo_target is None:
-            pre_answer_undo_target = self.pending_pre_answer_undo_target
-        self.current_pre_answer_undo_target = _positive_int_or_none(
-            pre_answer_undo_target
-        )
+        shown_card_id = _card_id(card)
+        if (
+            self.current_card_id == shown_card_id
+            and self.pending_pre_answer_undo_target is None
+        ):
+            # The GUI can explicitly capture an already-loaded card while a
+            # delayed question hook for the same display is still pending.
+            # Treat that second notification as idempotent so it cannot erase
+            # the anchor or replace the prediction observed on first display.
+            return True
+        self.current_card_id = shown_card_id
+        # The refill that placed this card in the filtered deck owns the only
+        # trustworthy pre-answer undo anchor. ``undo_status().last_step`` is an
+        # allocated operation counter, not proof that an undo entry exists:
+        # a no-op collection operation can advance it before this hook runs.
+        self.current_pre_answer_undo_target = self.pending_pre_answer_undo_target
         self.pending_pre_answer_undo_target = None
         if self.engine is not None:
             self.engine.snapshot_shown_candidate(
@@ -198,6 +212,7 @@ class LiveReviewBridgeSession:
         col,
         *,
         undo_process: Callable[[], int],
+        rollback_review: Callable[[int], bool] | None = None,
         stale_recheck: Callable[[set[int], int], bool] | None = None,
     ) -> LiveBridgeResult:
         if not self.active or self.engine is None:
@@ -213,9 +228,7 @@ class LiveReviewBridgeSession:
                 self.engine.undoable_review_rows,
                 undone_review_id,
             )
-            if not undoable_review_ids or int(undone_review_id) != int(
-                undoable_review_ids[-1]
-            ):
+            if not undoable_review_ids or int(undone_review_id) != int(undoable_review_ids[-1]):
                 self.engine.record_undo(undone_review_id)
                 self.active = False
                 result = self.empty_live_filtered_deck(col)
@@ -224,11 +237,17 @@ class LiveReviewBridgeSession:
                     deck_id=result.deck_id,
                     elapsed_ms=result.elapsed_ms,
                     reviews_done=self.reviews_done,
-                    transient_processed_review_count=(
-                        self.transient_processed_review_count
-                    ),
+                    transient_processed_review_count=(self.transient_processed_review_count),
                     undone_review_id=undone_review_id,
                     undone_card_id=undone_card_id,
+                )
+            repair_undo_target = _positive_int_or_none(
+                self.pre_answer_undo_targets_by_review_id.get(int(undone_review_id)),
+            )
+            if repair_undo_target is None:
+                raise LiveReviewDeckUndoError(
+                    "RWKV cannot safely repair its temporary filtered deck after Undo "
+                    "because the verified pre-answer undo entry is unavailable."
                 )
             undo_process()
             undo = self.engine.record_undo(undone_review_id)
@@ -240,20 +259,26 @@ class LiveReviewBridgeSession:
                     deck_id=result.deck_id,
                     elapsed_ms=result.elapsed_ms,
                     reviews_done=self.reviews_done,
-                    transient_processed_review_count=(
-                        self.transient_processed_review_count
-                    ),
+                    transient_processed_review_count=(self.transient_processed_review_count),
                     undone_review_id=undone_review_id,
                     undone_card_id=undone_card_id,
-            )
+                )
+            if (
+                undo.status == LiveUndoStatus.HANDLED_UNDOABLE
+                and rollback_review is not None
+                and not rollback_review(int(undone_review_id))
+            ):
+                raise RuntimeError(
+                    "RWKV could not remove the undone review from its live prediction history."
+                )
             self.reviews_done = int(undo.reviews_done)
             self.current_card_id = None
-            repair_undo_target = _last_undo_step(col)
+            self.current_pre_answer_undo_target = None
+            self.pending_pre_answer_undo_target = None
             restored = self._restore_pre_answer_buffer_after_undo(
                 col,
                 review_id=undone_review_id,
                 required_card_id=undone_card_id,
-                merge_undo_target=repair_undo_target,
             )
             if restored is not None:
                 return replace(
@@ -286,6 +311,9 @@ class LiveReviewBridgeSession:
                 undone_card_id=undone_card_id,
             )
 
+        if not self._tracked_deck_is_usable(col):
+            self.active = False
+            return self._result(LiveBridgeStatus.TRACKED_DECK_UNAVAILABLE)
         return self._result(LiveBridgeStatus.IGNORED)
 
     def refill_buffer(
@@ -343,7 +371,8 @@ class LiveReviewBridgeSession:
                 break
             if proposed_card_ids == self.buffered_card_ids and not force_rebuild:
                 self.refill_latencies_ms.append(elapsed_ms)
-                self._remember_pending_pre_answer_undo_target(col)
+                # No deck operation ran, so keep the last verified anchor. A
+                # fresh last_step sample could name a counter with no undo entry.
                 return self._refilled_result(skipped, elapsed_ms)
 
             started = time.perf_counter()
@@ -386,7 +415,10 @@ class LiveReviewBridgeSession:
                 or not rejected_card_ids
             ):
                 self.refill_latencies_ms.append(elapsed_ms)
-                self._remember_pending_pre_answer_undo_target(col)
+                self._remember_pending_pre_answer_undo_target(
+                    col,
+                    merged_undo_target=(merge_undo_target if merged_undo else None),
+                )
                 return self._refilled_result(
                     skipped,
                     elapsed_ms,
@@ -395,7 +427,10 @@ class LiveReviewBridgeSession:
             if rebuild_count >= LIVE_FILTERED_DECK_MAX_REFILL_BUILDS:
                 self.refill_latencies_ms.append(elapsed_ms)
                 if self.buffered_card_ids:
-                    self._remember_pending_pre_answer_undo_target(col)
+                    self._remember_pending_pre_answer_undo_target(
+                        col,
+                        merged_undo_target=(merge_undo_target if merged_undo else None),
+                    )
                     return self._refilled_result(
                         skipped,
                         elapsed_ms,
@@ -477,13 +512,15 @@ class LiveReviewBridgeSession:
         self.pre_answer_buffers_by_review_id.clear()
         self.pre_answer_buffer_review_ids.clear()
         self.pre_answer_undo_targets_by_review_id.clear()
-        if self.engine is not None:
-            self.engine.close()
         runtime_session = self.runtime_session
         self.runtime_session = None
-        close_runtime = getattr(runtime_session, "close", None)
-        if close_runtime is not None:
-            close_runtime()
+        try:
+            if self.engine is not None:
+                self.engine.close()
+        finally:
+            close_runtime = getattr(runtime_session, "close", None)
+            if close_runtime is not None:
+                close_runtime()
 
     def diagnostics(self, col=None, *, now: float | None = None) -> dict[str, Any]:
         filtered_deck_card_ids: tuple[int, ...] = ()
@@ -499,9 +536,7 @@ class LiveReviewBridgeSession:
             "deck_name": self.deck_name,
             "review_limit": self.review_limit,
             "reviews_done": int(self.reviews_done),
-            "transient_processed_review_count": int(
-                self.transient_processed_review_count
-            ),
+            "transient_processed_review_count": int(self.transient_processed_review_count),
             "current_card_id": self.current_card_id,
             "buffered_card_ids": [int(card_id) for card_id in self.buffered_card_ids],
             "pending_card_count": len(self.pending_card_ids),
@@ -509,6 +544,11 @@ class LiveReviewBridgeSession:
             "pre_answer_buffer_snapshot_count": len(
                 self.pre_answer_buffers_by_review_id,
             ),
+            "pre_answer_undo_target_count": len(
+                self.pre_answer_undo_targets_by_review_id,
+            ),
+            "pending_pre_answer_undo_target": self.pending_pre_answer_undo_target,
+            "current_pre_answer_undo_target": self.current_pre_answer_undo_target,
             "filtered_deck_card_ids": [int(card_id) for card_id in filtered_deck_card_ids],
             "last_refill_latency_ms": (
                 self.refill_latencies_ms[-1] if self.refill_latencies_ms else None
@@ -575,9 +615,7 @@ class LiveReviewBridgeSession:
     def _forget_buffered_card(self, card_id: int) -> bool:
         before = tuple(self.buffered_card_ids)
         self.buffered_card_ids = [
-            buffered_id
-            for buffered_id in self.buffered_card_ids
-            if buffered_id != int(card_id)
+            buffered_id for buffered_id in self.buffered_card_ids if buffered_id != int(card_id)
         ]
         return tuple(self.buffered_card_ids) != before
 
@@ -632,9 +670,7 @@ class LiveReviewBridgeSession:
         snapshot = self.pre_answer_buffers_by_review_id.pop(normalized, None)
         undo_target = self.pre_answer_undo_targets_by_review_id.pop(normalized, None)
         self.pre_answer_buffer_review_ids = [
-            stored_id
-            for stored_id in self.pre_answer_buffer_review_ids
-            if stored_id != normalized
+            stored_id for stored_id in self.pre_answer_buffer_review_ids if stored_id != normalized
         ]
         if snapshot is None:
             return None
@@ -646,13 +682,17 @@ class LiveReviewBridgeSession:
         *,
         review_id: int,
         required_card_id: int | None,
-        merge_undo_target: int | None = None,
     ) -> LiveBridgeResult | None:
         pre_answer = self._pop_pre_answer_buffer(review_id)
         if pre_answer is None or self.filtered_deck_id is None:
             return None
         snapshot, saved_undo_target = pre_answer
-        effective_merge_target = saved_undo_target or merge_undo_target
+        effective_merge_target = _positive_int_or_none(saved_undo_target)
+        if effective_merge_target is None:
+            raise LiveReviewDeckUndoError(
+                "RWKV cannot safely repair its temporary filtered deck after Undo "
+                "because the verified pre-answer undo entry is unavailable."
+            )
         restored = self._refill_after_undo_with_required_first(
             col,
             required_card_id=required_card_id,
@@ -777,7 +817,10 @@ class LiveReviewBridgeSession:
             )
 
         self.refill_latencies_ms.append(elapsed_ms)
-        self._remember_pending_pre_answer_undo_target(col)
+        self._remember_pending_pre_answer_undo_target(
+            col,
+            merged_undo_target=(merge_undo_target if merged_undo else None),
+        )
         return self._refilled_result([], elapsed_ms, merged_undo=merged_undo)
 
     def _rebuild_undo_deck_with_cards(
@@ -820,45 +863,70 @@ class LiveReviewBridgeSession:
         if required_card_id is None or self.engine is None:
             return None
         required = int(required_card_id)
-        if not self.engine.restore_existing_buffer([required]):
-            return None
+        original_buffered_card_ids = list(self.buffered_card_ids)
+        original_emitted_card_ids = set(self.engine.ready_queue)
+        attempted_emitted_card_ids: set[int] = set()
+        accepted = False
+        try:
+            if not self.engine.restore_existing_buffer([required]):
+                return None
+            attempted_emitted_card_ids.add(required)
 
-        proposed = _dedupe_card_ids([required, *self.buffered_card_ids])
-        while len(proposed) < LIVE_FILTERED_DECK_BUFFER_SIZE:
-            result = self.engine.next_buffer(
-                LIVE_FILTERED_DECK_BUFFER_SIZE - len(proposed)
+            proposed = _dedupe_card_ids([required, *self.buffered_card_ids])
+            while len(proposed) < LIVE_FILTERED_DECK_BUFFER_SIZE:
+                result = self.engine.next_buffer(LIVE_FILTERED_DECK_BUFFER_SIZE - len(proposed))
+                if result.status == LiveSelectionStatus.INACTIVE:
+                    self.active = False
+                    break
+                if result.status != LiveSelectionStatus.READY:
+                    break
+                attempted_emitted_card_ids.update(int(card_id) for card_id in result.card_ids)
+                previous_len = len(proposed)
+                proposed = _dedupe_card_ids([*proposed, *result.card_ids])
+                if len(proposed) == previous_len:
+                    break
+            proposed = proposed[:LIVE_FILTERED_DECK_BUFFER_SIZE]
+
+            rebuilt = self._rebuild_undo_deck_with_cards(
+                col,
+                proposed,
+                merge_undo_target=merge_undo_target,
             )
-            if result.status == LiveSelectionStatus.INACTIVE:
-                self.active = False
-                break
-            if result.status != LiveSelectionStatus.READY:
-                break
-            previous_len = len(proposed)
-            proposed = _dedupe_card_ids([*proposed, *result.card_ids])
-            if len(proposed) == previous_len:
-                break
-        proposed = proposed[:LIVE_FILTERED_DECK_BUFFER_SIZE]
+            if rebuilt is None:
+                return None
+            pulled, elapsed_ms, merged_undo = rebuilt
+            if required not in pulled:
+                return None
 
-        rebuilt = self._rebuild_undo_deck_with_cards(
-            col,
-            proposed,
-            merge_undo_target=merge_undo_target,
-        )
-        if rebuilt is None:
-            return None
-        pulled, elapsed_ms, merged_undo = rebuilt
-        if required not in pulled:
-            return None
-
-        self.buffered_card_ids = pulled[:LIVE_FILTERED_DECK_BUFFER_SIZE]
-        if not self.engine.sync_existing_buffer(self.buffered_card_ids):
-            return None
+            self.buffered_card_ids = pulled[:LIVE_FILTERED_DECK_BUFFER_SIZE]
+            if not self.engine.sync_existing_buffer(self.buffered_card_ids):
+                return None
+            accepted = True
+        finally:
+            if not accepted:
+                self.buffered_card_ids = original_buffered_card_ids
+                self.engine.release_unshown_emitted_cards(
+                    attempted_emitted_card_ids - original_emitted_card_ids
+                )
         self.refill_latencies_ms.append(elapsed_ms)
-        self._remember_pending_pre_answer_undo_target(col)
+        self._remember_pending_pre_answer_undo_target(
+            col,
+            merged_undo_target=(merge_undo_target if merged_undo else None),
+        )
         return self._refilled_result([], elapsed_ms, merged_undo=merged_undo)
 
-    def _remember_pending_pre_answer_undo_target(self, col) -> None:
-        self.pending_pre_answer_undo_target = _last_undo_step(col)
+    def _remember_pending_pre_answer_undo_target(
+        self,
+        col,
+        *,
+        merged_undo_target: int | None = None,
+    ) -> None:
+        # merge_undo_entries() resets Anki's counter to the verified target. Use
+        # the target itself so an intervening no-op counter can never replace it.
+        target = _positive_int_or_none(merged_undo_target)
+        self.pending_pre_answer_undo_target = (
+            target if target is not None else _last_undo_step(col)
+        )
 
     def _record_engine_answer(
         self,
@@ -992,9 +1060,7 @@ def update_live_filtered_deck_with_cards(
     existing_deck_id = _deck_id_for_name(col, name)
     if deck_id is None and existing_deck_id is not None:
         if not is_filtered_deck(col, existing_deck_id):
-            raise ValueError(
-                "A normal deck already exists with the RWKV live filtered deck name."
-            )
+            raise ValueError("A normal deck already exists with the RWKV live filtered deck name.")
         deck_id = existing_deck_id
 
     if deck_id is not None and not is_filtered_deck(col, int(deck_id)):
@@ -1091,8 +1157,11 @@ def _last_undo_step(col) -> int | None:
 def _merge_undo_entries(col, target: int) -> bool:
     try:
         col.merge_undo_entries(int(target))
-    except Exception:
-        return False
+    except Exception as exc:
+        raise LiveReviewDeckUndoError(
+            "RWKV could not attach its temporary filtered-deck update to the "
+            f"verified Anki undo entry {int(target)}."
+        ) from exc
     return True
 
 
@@ -1102,11 +1171,7 @@ def _merge_undo_entries_if_requested(
     target: int | None,
     merge_undo: bool,
 ) -> bool:
-    return bool(
-        merge_undo
-        and target is not None
-        and _merge_undo_entries(col, int(target))
-    )
+    return bool(merge_undo and target is not None and _merge_undo_entries(col, int(target)))
 
 
 def _first_missing_review_id(col, review_ids) -> int | None:
@@ -1138,9 +1203,7 @@ def _existing_review_ids(col, review_ids: list[int]) -> set[int]:
     existing: set[int] = set()
     for chunk in _chunks(review_ids, 500):
         try:
-            rows = col.db.list(
-                f"select id from revlog where id in {_sql_id_list(chunk)}"
-            )
+            rows = col.db.list(f"select id from revlog where id in {_sql_id_list(chunk)}")
         except Exception:
             return set(review_ids)
         existing.update(int(row) for row in rows)

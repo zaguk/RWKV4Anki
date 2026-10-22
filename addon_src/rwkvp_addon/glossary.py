@@ -89,6 +89,11 @@ GLOSSARY_TERMS: Mapping[str, GlossaryEntry] = {
         "the benchmark review data.",
         ("Underlying Model", "RWKV models", "RWKV model"),
     ),
+    "model-generation": GlossaryEntry(
+        "A version of RWKV's model architecture and input features. Each generation "
+        "uses only the models trained for it.",
+        ("RWKV generations", "RWKV generation"),
+    ),
     "deleted-history": GlossaryEntry(
         "Past reviews for cards that are no longer in your collection. They can provide "
         "context for current-card predictions but cannot be scored themselves.",
