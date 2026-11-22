@@ -240,6 +240,9 @@ def setup_menu() -> None:
 
     _rwkv_menu.addSeparator()
     settings_action = QAction("Settings", mw)
+    # On macOS, Qt's TextHeuristicRole would move an action named "Settings"
+    # into the app menu as Preferences, replacing Anki's own Preferences.
+    settings_action.setMenuRole(QAction.MenuRole.NoRole)
     qconnect(
         settings_action.triggered,
         lambda _checked=False: _show_addon_config_dialog(),
